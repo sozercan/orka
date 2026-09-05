@@ -1,0 +1,1 @@
+"use strict";(globalThis.webpackChunkorka_website=globalThis.webpackChunkorka_website||[]).push([[7089],{7089(e,a,r){r.d(a,{createArchitectureServices:()=>s.S});var s=r(5796);r(4954)}}]);
