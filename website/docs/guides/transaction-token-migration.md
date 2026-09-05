@@ -1,3 +1,7 @@
+---
+description: "Moving from the removed provider-specific transaction-token profile to the generic one."
+---
+
 # Migration: provider-specific transaction tokens to the generic profile
 
 This release intentionally removes the in-tree Kontxt profile and deployment assets.

@@ -1,0 +1,49 @@
+name: Docs Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "cmd/cli/**"
+      - "scripts/generate-cli-docs.sh"
+      - "website/docs/**"
+      - "examples/**"
+      - "README.md"
+      - "internal/admission/examples_manifests_test.go"
+      - ".github/workflows/docs-check.yml"
+  pull_request:
+    paths:
+      - "cmd/cli/**"
+      - "scripts/generate-cli-docs.sh"
+      - "website/docs/**"
+      - "examples/**"
+      - "README.md"
+      - "internal/admission/examples_manifests_test.go"
+      - ".github/workflows/docs-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cli-docs:
+    name: Docs Up To Date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - name: Check generated CLI command reference
+        run: make docs-cli-check
+
+      - name: Check documented manifests still decode
+        run: go test ./internal/admission/ -run TestDocumentedManifestsDecodeStrictly -v

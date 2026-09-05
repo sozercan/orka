@@ -1,8 +1,9 @@
 ---
 slug: /github-label-triggers
+description: "Starting agent tasks by applying a label to a GitHub issue or pull request."
 ---
 
-# GitHub Label Triggers
+# GitHub label triggers
 
 Orka can create an ACP `type: agent` Task when a GitHub issue or pull request receives a label such as `agent:implement`, `agent:update-branch`, `agent:review`, or `agent:to-issues`.
 
@@ -50,13 +51,13 @@ For pull request actions, Orka records the PR base branch, repository identity, 
 
 GitHub delivery IDs make retries safe: if the same delivery is received again, Orka returns `202 Accepted` with the existing task name instead of creating a duplicate.
 
-## Repository Monitor Events
+## Repository monitor events
 
 The same `/webhooks/github` endpoint can queue exact-head `RepositoryMonitor` runs from pull request events. This path does not require an `agent:*` label. A monitor is eligible when `spec.review.exactEventEnabled: true`, pull request monitoring is enabled, the webhook repository matches `spec.repoURL`, the PR base branch matches the monitor branch, and the monitor is not suspended.
 
 For `opened`, `reopened`, `synchronize`, `ready_for_review`, `labeled`, and `unlabeled` pull request events, Orka queues a monitor run for the exact PR head SHA and records an audit event. If the controller has a watch namespace, only monitors in that namespace are considered; otherwise monitors across all namespaces are eligible. Duplicate deliveries or already-queued runs for the same PR head are accepted without creating duplicate work. If a previous exact-event run for the same delivery failed before the queued audit event was recorded, a webhook retry can requeue that failed run.
 
-## CI Coverage
+## CI coverage
 
 `.github/workflows/live-github-label-trigger-e2e.yml` is a manual GitHub Actions workflow for the label trigger path. It runs focused Go tests for webhook and PR monitor tooling, then builds the controller image, deploys Orka into a fresh Kind cluster, creates a synthetic Agent and webhook fixture, and sends signed webhook payloads to `/webhooks/github`.
 
@@ -92,18 +93,40 @@ kubectl create secret generic github-webhook-secret \
   --from-literal=secret='<webhook-secret>'
 ```
 
-## Durable `orka:*` RepositoryMonitor Commands
+## Durable `orka:*` RepositoryMonitor commands
 
 `agent:*` labels remain the lightweight direct Task path. For durable monitor-owned workflows, configure `RepositoryMonitor.spec.triggers.github.labels.enabled: true` and use `orka:*` labels such as `orka:plan`, `orka:implement`, `orka:review`, `orka:fix`, and the optional head-bound `orka:automerge`.
 
 The `orka:*` path differs from direct `agent:*` labels:
 
 - the webhook becomes a durable command event instead of an immediate agent-owned GitHub mutation path;
-- the GitHub sender's current repository permission is checked with the monitor `gitSecretRef`;
+- the GitHub sender's current repository permission is checked with the monitor's `spec.forgeCredentialRef`;
 - protected or pause labels block the command without queueing work;
 - accepted issue commands queue exact issue monitor runs, and accepted PR review commands queue exact-head monitor runs;
 - duplicate GitHub deliveries reuse the same command event.
 
 Use `agent:*` when you explicitly want a direct one-off agent task. Use `orka:*` when the RepositoryMonitor should own durable state, policy, auditability, and follow-up workflow decisions.
+
+### Credentials the `orka:*` path needs
+
+Turning on `spec.triggers.github.labels.enabled` makes the controller call the GitHub
+API on your behalf — at minimum to look up whether the person who applied the label is
+allowed to. That call needs its own token.
+
+| What the monitor does | Required in `spec` |
+| --- | --- |
+| Any `orka:*` label handling | `forgeCredentialRef` |
+| Plus implementation or repair (a monitor that pushes branches and opens PRs) | `readCredentialRef`, `publicationReadCredentialRef`, `publicationCredentialRef`, and `forgeCredentialRef` — four **different** Secrets |
+
+:::warning[`gitSecretRef` is not enough here]
+`gitSecretRef` is the old single-Secret field. It still works, but only as a fallback for
+*reading* the source repository. It never supplies a publication or forge role. A monitor
+with `labels.enabled: true` and no `forgeCredentialRef` is rejected with
+`spec.forgeCredentialRef is required for controller-owned GitHub mutations`.
+:::
+
+Each Secret must hold a non-empty `token`, `password`, or `GITHUB_TOKEN` key. See
+[Repository monitors](repository-monitors.md#prerequisites) for what each of the four roles
+is allowed to do and why they are kept apart.
 
 RepositoryMonitor command labels are one-shot intents. For custom labels, configure them under `spec.triggers.github.labels`; Orka excludes both default `orka:*` labels and configured custom command labels from issue snapshot digests so consuming a command label does not stale the issue workflow.

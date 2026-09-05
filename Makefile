@@ -19,6 +19,7 @@ ACP_RUNTIME_PROVIDERS = codex claude copilot opencode
 ACP_RUNTIME_IMGS = $(ACP_CODEX_RUNTIME_IMG) $(ACP_CLAUDE_RUNTIME_IMG) $(ACP_COPILOT_RUNTIME_IMG) $(ACP_OPENCODE_RUNTIME_IMG)
 RUN_CONTROLLER_MODE ?= harness-v2
 RUN_WATCH_NAMESPACE ?= orka-system
+RUN_STORE_PATH ?= /data/orka.db
 RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE ?=
 RUN_EXECUTION_MODE_CONTROLLER_USERNAMES ?= $(shell "$(KUBECTL)" auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null)
 
@@ -306,6 +307,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 	POD_NAMESPACE="$(RUN_WATCH_NAMESPACE)" go run ./cmd --leader-elect=true \
 		--controller-mode="$(RUN_CONTROLLER_MODE)" \
 		--watch-namespace="$(RUN_WATCH_NAMESPACE)" \
+		--store-path="$(RUN_STORE_PATH)" \
 		--agent-execution-snapshot-key-file="$(RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE)" \
 		--enforce-namespace-isolation=true \
 		--execution-mode-controller-usernames="$(RUN_EXECUTION_MODE_CONTROLLER_USERNAMES)"

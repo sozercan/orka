@@ -1,10 +1,24 @@
 ---
 slug: /api-reference
+description: "Every Orka CRD field and HTTP endpoint, with types and defaults."
 ---
 
-# API Reference
+# API reference
 
-The controller exposes a REST API for programmatic access. All `/api/v1/*` endpoints require authentication. By default Orka accepts Kubernetes ServiceAccount bearer tokens; when configured, external callers can use a valid OIDC JWT or generic context token instead.
+The controller exposes a REST API for programmatic access. Almost every `/api/v1/*`
+endpoint requires authentication. Kubernetes ServiceAccount tokens are the default;
+operators can also enable OIDC or context-token authentication. The header requirements
+for each mode are listed below.
+
+Four routes are deliberately outside that middleware, because they authenticate a different
+way:
+
+| Route | How it authenticates instead |
+| --- | --- |
+| `GET /healthz`, `GET /readyz` | Not authenticated. Kubernetes probes them. |
+| `POST /api/v1/gateways/:namespace/:name/events` | The Gateway's own inbound bearer Secret, not a user token. |
+| `POST /webhooks/github` | HMAC over the request body (`X-Hub-Signature-256`). |
+| `/internal/v2/acp/*` | Pool-scoped bearer credentials checked by the ACP handlers themselves. Not for client use. |
 
 ## Authentication
 
@@ -84,9 +98,15 @@ copied to Task status or delivered to the ACP process tree.
 
 The durable ACP attempt is exposed in `status.execution`. Workspace validation and publication use `status.delivery`, including publication ID, repository identities, branch, starting/remote/tree/commit SHAs, artifact digest, and optional PR receipt. A Task is not delivered merely because the model reports success; require a terminal verified delivery outcome.
 
-`Task.spec.execution.workspace` is not supported by the current ACP core runtime. Upstream agent-sandbox and Substrate integration is deferred behind the v2 RuntimeSession seam.
+`Task.spec.execution.workspace` runs the agent inside an external sandbox provider instead of a
+plain runtime Pod. It is off unless the operator turns it on: `--acp-workspace-dispatch-enabled`
+plus the flag for the provider you want (`--agent-sandbox-enabled` or `--substrate-enabled`).
+Without them the field is rejected rather than ignored. See
+[Agent Sandbox](../concepts/agent-sandbox.md) or [Agent Substrate](../concepts/substrate.md) for
+the two supported providers, and [Configuration](configuration.md#workspace-providers)
+for the flags and the class-based lifecycle.
 
-### Get Task Plan
+### Get Task plan
 
 Retrieve the autonomous plan state for a task.
 
@@ -124,7 +144,7 @@ Retrieve the autonomous plan state for a task.
 
 Memory endpoints manage namespace-scoped durable memories and reviewable memory proposals. See [Memory](../concepts/memory.md) for the full lifecycle, worker behavior, and examples.
 
-### Durable Memories
+### Durable memories
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -138,7 +158,7 @@ Memory endpoints manage namespace-scoped durable memories and reviewable memory 
 
 Common list query parameters: `namespace`, `query`/`q`, `sessionName`, `agentName`, `taskName`, `parentTask`, `source`, `tags`, `ids`, `includeDisabled`, `includeDeleted`, and `limit`.
 
-### Memory Proposals
+### Memory proposals
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -198,7 +218,7 @@ See [Generic Gateway API](gateway-api.md) for the adapter contract, Kubernetes r
 | `/api/v1/tools` | GET | List tools (built-in + CRDs) |
 | `/api/v1/tools/:name` | GET | Get tool details |
 
-### Tool CRD Schema
+### Tool CRD schema
 
 `GET /api/v1/tools/:name` returns built-in tool metadata or the full `Tool` CRD. Custom Tool CRDs can call plain HTTP endpoints or MCP servers hosted in durable Substrate actors.
 
@@ -342,7 +362,7 @@ Common query parameters:
 - `reason` — exact dropped-finding reason filter; use `reason=contains=<text>` for substring matching.
 - `recommended=true` — filters findings to recommended remediation candidates.
 
-### Create Repository Scan
+### Create repository scan
 
 **Endpoint:** `POST /api/v1/security/repositories`
 
@@ -374,7 +394,7 @@ Required fields are `name`, `spec.repoURL`, and `spec.analysisAgentRef.name`. Th
 
 The request accepts the same `RepositoryScan` spec fields as the CRD, including automatic validation tuning (`validationMaxFindingsPerRun`, `validationMinSeverity`, `validationMinConfidence`) and ConfigMap-backed scanner policy refs (`customScanInstructionsRef`, `falsePositivePolicyRef`). Policy ConfigMaps must be in the same namespace and opt in with `orka.ai/security-policy: "true"` as a label or annotation.
 
-### Security Findings Workflow
+### Security findings workflow
 
 A typical remediation workflow is:
 
@@ -391,7 +411,7 @@ Review slice and dropped-output inspection:
 2. Inspect one slice with `GET /api/v1/security/repositories/:name/slices/:sliceID?namespace=default`.
 3. List rejected v2 model output with `GET /api/v1/security/repositories/:name/dropped-findings?namespace=default&scanRunID=scan_...&layer=filter&reason=contains=rate-limit`.
 
-## Repository Monitors
+## Repository monitors
 
 Repository monitor endpoints manage `RepositoryMonitor` configurations and their durable monitor runs, issue/PR inventory, command events, workflow actions, typed action records, implementation jobs, GitHub mutation audit records, review/repair state, readiness state, and audit events.
 
@@ -406,17 +426,17 @@ Repository monitor endpoints manage `RepositoryMonitor` configurations and their
 | `/api/v1/monitors/repositories/:name/runs` | GET | List monitor runs |
 | `/api/v1/monitors/repositories/:name/items` | GET | List current monitor items |
 | `/api/v1/monitors/repositories/:name/commands` | POST | Create an explicit issue/PR workflow command |
-| `/api/v1/monitors/commands` | GET | List durable command events |
+| `/api/v1/monitors/commands?name=` | GET | List durable command events. **`name` is required.** |
 | `/api/v1/monitors/commands/:id` | GET | Get a command event |
-| `/api/v1/monitors/work-actions` | GET | List durable workflow actions and leases |
+| `/api/v1/monitors/work-actions?name=` | GET | List durable workflow actions and leases. **`name` is required.** |
 | `/api/v1/monitors/work-actions/:id` | GET | Get a workflow action |
-| `/api/v1/monitors/actions` | GET | List typed action records |
+| `/api/v1/monitors/actions?name=` | GET | List typed action records. **`name` is required.** |
 | `/api/v1/monitors/actions/:id` | GET | Get a typed action record |
-| `/api/v1/monitors/implementation-jobs` | GET | List issue implementation jobs |
+| `/api/v1/monitors/implementation-jobs?name=` | GET | List issue implementation jobs. **`name` is required.** |
 | `/api/v1/monitors/implementation-jobs/:id` | GET | Get an issue implementation job |
-| `/api/v1/monitors/mutations` | GET | List controller-owned GitHub mutation audit records |
+| `/api/v1/monitors/mutations?name=` | GET | List controller-owned GitHub mutation audit records. **`name` is required.** |
 | `/api/v1/monitors/mutations/:id` | GET | Get a GitHub mutation audit record |
-| `/api/v1/monitors/events` | GET | List monitor audit events |
+| `/api/v1/monitors/events?name=` | GET | List monitor audit events. **`name` is required.** |
 
 Common query parameters:
 
@@ -424,11 +444,19 @@ Common query parameters:
 - `limit` - page size for list endpoints.
 - `continue` or `cursor` - pagination cursor for store-backed list endpoints.
 - `kind`, `number`, `state`, `verdict`, `repairState`, and `automergeState` - filters for `GET /api/v1/monitors/repositories/:name/items`.
-- `name`, `runID`, `itemKind`, `itemNumber`, and `eventType` - filters for `GET /api/v1/monitors/events`; `name` is required.
+- `name`, `runID`, `itemKind`, `itemNumber`, and `eventType` — filters for `GET /api/v1/monitors/events`.
+
+:::warning[Six list endpoints require `?name=`]
+`/monitors/events`, `/monitors/commands`, `/monitors/actions`, `/monitors/work-actions`,
+`/monitors/implementation-jobs`, and `/monitors/mutations` take the monitor name as a
+**query parameter**, not a path segment. Omitting it returns `400` with
+`name query parameter is required`. The `/monitors/repositories/:name/...` routes are the
+ones that use a path segment.
+:::
 
 Context-token authorization scopes are `orka:monitors:read` for list/get endpoints, `orka:monitors:write` for create/update/delete, and `orka:monitors:operate` for manual run creation.
 
-### Create Repository Monitor
+### Create repository monitor
 
 **Endpoint:** `POST /api/v1/monitors/repositories`
 
@@ -475,9 +503,17 @@ Required fields are `name`, `spec.repoURL`, and `spec.agents.reviewer.name` when
 
 `spec.validation.image` optionally configures isolated pull request validation. The image must use an immutable `@sha256:` digest. The reviewer chooses one offline shell command after inspecting the repository. Orka runs it in the configured image against the exact read-only PR head, releases it only after a deny-all NetworkPolicy exists, and independently verifies the child Task before accepting a `passed` verdict. The image must contain `/bin/sh`, every required tool such as `golangci-lint`, Terraform, or Azure CLI, and any dependencies the command needs. Commands, args, credentials, and network access are not configured on the monitor.
 
-GitHub pull request and issue targets are supported. Commit targets are rejected. `review.requireGreenCI` is supported for gating review selection on green CI. Pull request monitoring requires `spec.agents.reviewer.name`; the reviewer Agent must use `runtime.type: claude`, must reference a Secret in the monitor namespace, and that Secret must contain a non-empty `ANTHROPIC_API_KEY` or `ANTHROPIC_FOUNDRY_API_KEY` key. Issue-only monitors can set `targets.pullRequests.enabled: false` and `targets.issues.enabled: true`. When `gitSecretRef` is set, the Git Secret must exist in the monitor namespace and contain a non-empty `token`, `password`, or `GITHUB_TOKEN` key.
+GitHub pull request and issue targets are supported. Commit targets are rejected.
+`review.requireGreenCI` is supported for gating review selection on green CI.
+Pull request monitoring requires `spec.agents.reviewer.name`. The reviewer Agent must
+use a built-in `claude`, `codex`, or `opencode` runtime and omit `spec.secretRef`;
+the runtime proxy supplies provider credentials. External `runtimeRef` reviewers
+are rejected. Issue-only monitors can set `targets.pullRequests.enabled: false`
+and `targets.issues.enabled: true`. When `gitSecretRef` is set, the Git Secret must
+exist in the monitor namespace and contain a non-empty `token`, `password`, or
+`GITHUB_TOKEN` key.
 
-### Trigger Manual Monitor Run
+### Trigger manual monitor run
 
 **Endpoint:** `POST /api/v1/monitors/repositories/{name}/runs`
 
@@ -492,7 +528,7 @@ GitHub pull request and issue targets are supported. Commit targets are rejected
 
 The request body can be omitted to run a full inventory pass. `targetKind` may be empty, `pull_request`, or `issue`; `targetNumber` and `targetSHA` narrow the run to one issue, one PR, or an exact PR head. When `targetNumber` is set, the controller fetches that target directly from GitHub and does not retire unrelated monitor items. The API returns `409` when the monitor already has a queued or running run.
 
-### Create Monitor Command
+### Create monitor command
 
 **Endpoint:** `POST /api/v1/monitors/repositories/{name}/commands`
 
@@ -508,7 +544,7 @@ The request body can be omitted to run a full inventory pass. `targetKind` may b
 
 Supported issue intents are `triage`, `research`, `plan`, `approve_plan`, `implement`, `decompose`, `stop`, and `resume`. Supported pull request intents are `review`, `fix`, `fix_ci`, `update_branch`, `automerge`, `stop`, and `resume`. Head-bound pull request commands (`review`, `fix`, `fix_ci`, `update_branch`, and `automerge`) must include `targetSHA`; `stop` and `resume` can omit it. The command creation endpoint always requires `orka:monitors:operate`. Mutating intents (including approve, implement, repair, update-branch, automerge, stop, and resume) additionally require `orka:monitors:write`; `review` also requires monitor-write when review publishing is enabled. The endpoint validates that the target kind is enabled, records a durable command event, and queues a targeted monitor run.
 
-### List Monitor Commands, Actions, Implementations, and Mutations
+### List monitor commands, actions, implementations, and mutations
 
 **Endpoints:**
 
@@ -550,7 +586,7 @@ See [Repository Monitors](../guides/repository-monitors.md) for the full workflo
 
 See [Interactive Chat](../guides/chat.md) for full chat documentation.
 
-## OpenAI-Compatible API
+## OpenAI-compatible API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -559,7 +595,7 @@ See [Interactive Chat](../guides/chat.md) for full chat documentation.
 
 See [OpenAI Compatibility](openai-compat.md) for details.
 
-## Anthropic-Compatible API
+## Anthropic-compatible API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -568,7 +604,7 @@ See [OpenAI Compatibility](openai-compat.md) for details.
 
 The `/anthropic/v1/messages` endpoint injects built-in tools and runs server-side tool execution by default. Set `X-Orka-Tools: disabled` header to use as a transparent proxy instead. See [Anthropic Compatibility](anthropic-compat.md) for details.
 
-## Internal API (Worker Communication)
+## Internal API (worker communication)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -580,7 +616,7 @@ The `/anthropic/v1/messages` endpoint injects built-in tools and runs server-sid
 | `/internal/v1/messages/:namespace` | POST | Send inter-agent message |
 | `/internal/v1/messages/:namespace/:taskName` | GET | Get messages for a task |
 
-### Save Plan State
+### Save plan state
 
 Workers call this to persist autonomous plan state.
 
@@ -598,7 +634,7 @@ Workers call this to persist autonomous plan state.
 
 **Response:** `204 No Content`
 
-### Get Plan State
+### Get plan state
 
 Workers call this to load the current plan state at startup.
 
@@ -609,7 +645,7 @@ Workers call this to load the current plan state at startup.
 **Errors:**
 - `404` — No plan found
 
-### Send Message
+### Send message
 
 Workers call this to send messages to sibling tasks (same parent coordinator).
 
@@ -629,7 +665,7 @@ Use `"toTask": "*"` to broadcast to all siblings.
 
 **Response:** `204 No Content`
 
-### Get Messages
+### Get messages
 
 Workers call this to check for unread messages.
 
@@ -662,7 +698,7 @@ Workers call this to check for unread messages.
 | `/healthz` | GET | Health check |
 | `/readyz` | GET | Readiness check |
 
-## Example Usage
+## Example usage
 
 ```bash
 # Create a task

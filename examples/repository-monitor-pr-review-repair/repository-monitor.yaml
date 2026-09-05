@@ -6,8 +6,16 @@ spec:
   provider: github
   repoURL: https://github.com/example-org/example-repo
   branch: main
-  gitSecretRef:
-    name: git-credentials
+  # Four distinct Secrets. Orka rejects the monitor if any is missing or if two
+  # of them name the same Secret. See website/docs/guides/repository-monitors.md.
+  readCredentialRef:            # clone/read the source repository
+    name: orka-monitor-source-read
+  publicationReadCredentialRef: # preflight + independent verification of the target
+    name: orka-monitor-publication-read
+  publicationCredentialRef:     # push the branch (compare-and-swap only)
+    name: orka-monitor-publication
+  forgeCredentialRef:           # GitHub API calls the controller makes itself
+    name: orka-monitor-forge
   targets:
     pullRequests:
       enabled: true

@@ -6,8 +6,12 @@ spec:
   provider: github
   repoURL: https://github.com/example-org/example-repo
   branch: main
-  gitSecretRef:
-    name: git-credentials
+  # Read-only monitor: no branch is pushed, so only these two roles are needed.
+  readCredentialRef:  # clone/read the source repository
+    name: orka-monitor-source-read
+  forgeCredentialRef: # GitHub API calls the controller makes itself, including
+                      # the label sender's permission check
+    name: orka-monitor-forge
   targets:
     pullRequests:
       enabled: false

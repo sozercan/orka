@@ -13,30 +13,32 @@ spec:
       1. READ the repository details from the task prompt:
          - gitRepo and branch
          - readCredentialRef
-         - publicationGitRepo and publicationCredentialRef
+         - publicationGitRepo, publicationReadCredentialRef, and publicationCredentialRef
+         - forgeCredentialRef
          - pushBranch and prBaseBranch
       2. DELEGATE implementation to the coder agent with workspace.intent = write
          and the complete source/publication configuration. The coder edits files;
          Orka's clean-room publisher owns commit creation and branch delivery.
-      3. WAIT for the coder's result.
+      3. WAIT for the coder's verified delivery and record headSHA from its result.
+         If delivery is not verified or headSHA is missing, REPORT the result and STOP.
       4. DELEGATE review to the reviewer agent with workspace.intent = read against
-         the PUBLISHED head: gitRepo = publicationGitRepo (or gitRepo when they are
-         the same repository) and branch = pushBranch, with readCredentialRef able
-         to read it. The coder's verified changes live only on pushBranch — a read
-         workspace on the original branch would review the unchanged base. (The
-         ACP core runtime does not accept prior_task; the reviewer reads the
-         published head, it does not replay a diff.)
+         the verified PUBLISHED commit: gitRepo = publicationGitRepo,
+         branch = pushBranch, ref = the coder result's headSHA,
+         and readCredentialRef = publicationReadCredentialRef.
+         branch identifies the publication branch; ref pins the reviewed content
+         even if that branch moves. Do not set publication fields on this read workspace.
+         The ACP core runtime does not accept prior_task; the reviewer reads the
+         published commit rather than replaying a diff.
       5. WAIT for the reviewer's verdict.
-      6. IF verdict == "CHANGES_NEEDED" AND iteration < 3:
-         DELEGATE fix to the coder agent again with workspace.intent = write and the reviewer feedback in the prompt.
-         Reuse the same workspace details and claimed pushBranch.
-         Require a verified delivery receipt before continuing.
-         Go to step 3.
+      6. IF verdict == "CHANGES_NEEDED":
+         REPORT the reviewer feedback and coder task name, then STOP.
+         Do not create another write Task for this pushBranch. The delegation tools
+         cannot set workspace.expectedRemoteSHA to update an existing branch.
       7. IF verdict == "APPROVED" and the latest coder delivery is verified:
          Call create_pull_request with:
          - task_name = the coder task name
          - head_branch = pushBranch from the task prompt
-         - base_branch = branch from the task prompt
+         - base_branch = prBaseBranch from the task prompt
          - title/body that summarize the completed work
       8. REPORT the final result with the PR URL and verified branch SHA.
 

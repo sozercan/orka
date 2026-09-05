@@ -11,10 +11,10 @@ This example wires GitHub labels to Orka ACP `type: agent` Tasks.
 Create secrets outside git:
 
 ```bash
-kubectl create secret generic github-webhook-secret \
+kubectl -n orka-system create secret generic github-webhook-secret \
   --from-literal=secret='<github-webhook-secret>'
 
-kubectl create secret generic git-credentials \
+kubectl -n orka-system create secret generic git-credentials \
   --from-literal=token='<repository-scoped-github-token>'
 ```
 

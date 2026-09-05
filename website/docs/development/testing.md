@@ -1,12 +1,16 @@
 ---
 slug: /testing
+description: "The test suites Orka runs, what each one covers, and how to run them."
 ---
 
 # Testing
 
-Orka has comprehensive test coverage across all packages, including unit tests, integration tests (envtest), end-to-end tests (Kind cluster), and frontend tests.
+Orka has four kinds of tests: Go unit tests, controller integration tests against a real
+API server (envtest), end-to-end tests against a throwaway Kind cluster, and frontend tests
+in the browser-like Vitest environment. This page describes what each covers and how to run
+it.
 
-## Running Tests
+## Running tests
 
 ```bash
 # Run test pipeline (manifests, generate, fmt, vet, then Go tests)
@@ -39,7 +43,7 @@ make lint-fix
 make ui-lint
 ```
 
-### Local Environment Notes
+### Local environment notes
 
 - **Script test suites need bash >= 4.** The suites under `scripts/tests/`
   rely on `set -e` stopping on failed `(( ))` arithmetic, which macOS's stock
@@ -55,9 +59,9 @@ make ui-lint
   on packages that start an envtest API server, export it first:
   `KUBEBUILDER_ASSETS="$(bin/setup-envtest use -p path)"`.
 
-## Test Structure
+## Test structure
 
-### Go Tests
+### Go tests
 
 Tests use **Ginkgo + Gomega** (BDD style) for controller/integration tests and standard Go `testing` for unit tests.
 
@@ -78,7 +82,7 @@ Tests use **Ginkgo + Gomega** (BDD style) for controller/integration tests and s
 | `workers/general/` | `main_test.go` | General worker functions |
 | `internal/harness/v2/`, `internal/acp/`, `workers/acp/` | ACP contract, client, supervisor, and conformance tests | RuntimeSession lifecycle, exact fences, duplicate handling, event bounds, cancellation, workspace deltas, process cleanup, and redaction |
 
-### E2E Tests
+### E2E tests
 
 End-to-end tests run against a dedicated Kind cluster:
 
@@ -125,7 +129,7 @@ incremental scan behavior, invalid v2 evidence being dropped and visible through
 validation task persistence, successful verified patch proposals, and patch proposals with
 missing or mismatched artifacts staying not ready.
 
-### E2E Key Requirements
+### E2E key requirements
 
 - `scripts/live-acp-runtime-e2e.sh --context <context>` is the canonical ACP
   deployed-cluster validator. Its default mode is a smoke test; set
@@ -181,8 +185,11 @@ missing or mismatched artifacts staying not ready.
   Provider test infrastructure. The canonical live ACP workflow is the
   provider-execution evidence for the built-in RuntimePool profiles.
 - Structural e2e tests for native worker Jobs run without external model keys.
-- The live agent-sandbox and Agent Substrate workflows are archived/deferred
-  execution-workspace evaluations, not ACP v2 release gates.
+- `Live Agent Sandbox E2E` and `Agent Substrate E2E` do run workspace-backed ACP Tasks
+  end to end against a local model fixture, but they are not the full release gate:
+  external-provider execution and clean-room publication stay with the live ACP workflows.
+  The Substrate suspend/resume lane is off by default (`SUBSTRATE_E2E_SUSPEND_RESUME=0`)
+  because the pinned Substrate release cannot express the data-only snapshot contract.
 - Security Scan E2E is secret-free and model-free, but requires Docker plus the
   local Go, Kind, kubectl, curl, and jq toolchain.
 
@@ -300,17 +307,25 @@ KEEP_CLUSTER=1 \
 bash scripts/agent-substrate-e2e.sh
 ```
 
-### Frontend Tests
+### Frontend tests
 
-Frontend tests use **Vitest + Testing Library + MSW**. Coverage thresholds are enforced in `vite.config.ts`.
+Frontend tests use **Vitest + Testing Library + MSW**.
 
 ```bash
-cd ui && bun run test:coverage
+cd ui && bun run test           # what CI runs
+cd ui && bun run test:coverage  # adds the coverage report and threshold check
 ```
 
-## Testing Patterns
+:::warning[The UI coverage thresholds are a local target, not a merge gate]
+`ui/vite.config.ts` declares thresholds of 95% statements, 80% branches, 90% functions, and
+95% lines. Those only apply to `bun run test:coverage`. The `ui-test` job in
+`.github/workflows/test.yml` runs plain `bun run test`, so a pull request that drops coverage
+still passes CI. Run the coverage command yourself before assuming a number.
+:::
 
-### Table-Driven Tests
+## Testing patterns
+
+### Table-driven tests
 
 ```go
 tests := []struct {
@@ -329,7 +344,7 @@ for _, tt := range tests {
 }
 ```
 
-### Fake Kubernetes Client
+### Fake Kubernetes client
 
 ```go
 scheme := runtime.NewScheme()
@@ -338,7 +353,7 @@ corev1.AddToScheme(scheme)
 client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 ```
 
-### HTTP Mocking
+### HTTP mocking
 
 ```go
 server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -348,7 +363,7 @@ server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *htt
 defer server.Close()
 ```
 
-### Fiber Test App
+### Fiber test app
 
 ```go
 app := fiber.New()
@@ -357,7 +372,7 @@ req := httptest.NewRequest(http.MethodGet, "/test", nil)
 resp, _ := app.Test(req)
 ```
 
-### Frontend Test Mocking
+### Frontend test mocking
 
 ```typescript
 // Mock zustand persist middleware
@@ -367,7 +382,7 @@ vi.mock('zustand/middleware', () => ({ persist: (fn: unknown) => fn }))
 import { render } from '@/test/test-utils'
 ```
 
-## Testing with Chat
+## Testing with chat
 
 When testing features via the chat endpoint, use **natural prompts** — the kind a human would actually type. Never reference internal concepts like agent names, tool names, or implementation details. Describe what you want done, not how the system should do it. The chat should infer the right agents, tools, delegation patterns, and cancellation logic on its own.
 

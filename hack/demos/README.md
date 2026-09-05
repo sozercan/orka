@@ -6,7 +6,6 @@ This directory contains a small `demo-magic` kit for showing Orka in six ways:
 - `20-manual-workflow.sh`: explicit coordinator Task CR for a focused Vekil metrics first-PR workflow
 - `30-cron-workflow.sh`: scheduled runtime task with recurring child runs
 - `40-security-scanning.sh`: repository scan -> findings -> patch -> PR
-- `50-kontxt.sh`: workload SA token -> in-cluster TTS -> request-scoped TxToken -> Orka API call (one identity, two outcomes)
 - `60-agent-sandbox.sh`: archived execution-workspace prototype; not a current ACP v2 path
 - `70-agent-substrate.sh`: archived Substrate prototype; requires an Actor-backed v2 supervisor before it is supported again
 

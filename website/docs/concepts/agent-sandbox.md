@@ -1,8 +1,9 @@
 ---
 slug: /agent-sandbox
+description: "Running an agent's workspace in a kubernetes-sigs Agent Sandbox, behind Orka's ACP lifecycle."
 ---
 
-# Agent Sandbox Workspaces
+# Agent Sandbox workspaces
 
 Upstream `agent-sandbox` is an externally installed and operated
 execution-workspace provider. Orka can host a built-in agent Task's ACP

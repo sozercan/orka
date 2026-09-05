@@ -1,3 +1,7 @@
+---
+description: "The orka.harness.v2 contract an external agent runtime must implement to work with Orka."
+---
+
 # AgentRuntime adapter contract
 
 `orka.harness.v2` is the only supported Orka-facing contract for ACP runtime supervisors. It is session-centric, uses `/v2/...` paths, and fails closed on controller/runtime version skew. The old turn-oriented adapter surface is not supported.
@@ -33,7 +37,14 @@ External runtimes advertise whether they implement the drain extension. All stat
 - `PUT /v2/runtime-sessions/{sessionID}/prompts/{promptID}/permissions/{requestID}` — resolve one ACP permission request;
 - `PUT /v2/runtime-sessions/{sessionID}/prompts/{promptID}/cancel` — cancellation barrier that waits for settlement or forced termination;
 - `PUT /v2/runtime-sessions/{sessionID}/workspace-deltas/{deltaID}` — after prompt settlement, freeze mutations and produce one durable validated workspace delta;
+- `PUT /v2/runtime-sessions/{sessionID}/publication-finalization` — record what Orka did with that delta, moving the session from `PublicationPrepared` to `Finalizing`;
 - `DELETE /v2/runtime-sessions/{sessionID}` — cancel, prove descendant cleanup, remove session state, and return idempotently.
+
+Publication finalization closes the loop on a write Task. The runtime produces the delta but
+never pushes it; the Workspace/Publisher does that, and this call is how the runtime is told
+the resulting publication identity, generation, version, and terminal receipt digest. It is
+duplicate-safe: replaying the same receipt returns the recorded one, and a *different* receipt
+for a session already finalizing is a `digest_conflict`, not an overwrite.
 
 Do not add prompt replay, stream reconnect, provider-session load, transparent recovery, or workspace checkpoint endpoints.
 

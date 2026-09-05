@@ -4,13 +4,13 @@
 const sidebars = {
   tutorialSidebar: [
     'getting-started',
+    'reference/glossary',
     {
       type: 'category',
-      label: 'Core Concepts',
+      label: 'Core concepts',
       collapsed: false,
       items: [
         'concepts/architecture',
-        'concepts/configuration',
         'concepts/agent-runtimes',
         'concepts/agent-sandbox',
         'concepts/substrate',
@@ -26,8 +26,8 @@ const sidebars = {
       collapsed: false,
       items: [
         'guides/chat',
+        'guides/container-tasks',
         'guides/bring-your-own-agent-runtime',
-        'guides/multi-agent-coordination',
         'guides/autonomous-tasks',
         'guides/scheduled-tasks',
         'guides/transaction-token-migration',
@@ -45,23 +45,29 @@ const sidebars = {
       collapsed: false,
       items: [
         'operations/harness-modes',
+        'operations/provider-proxy',
         'operations/agent-runtime-security',
         'operations/gateways',
+        'operations/upgrading',
+        'operations/troubleshooting',
         'operations/runbook',
       ],
     },
     {
       type: 'category',
-      label: 'API Reference',
+      label: 'Reference',
       collapsed: false,
       items: [
+        'reference/configuration',
         'reference/api-reference',
         'reference/cli',
         'reference/cli-commands',
         'reference/execution-events',
+        'reference/multi-agent-coordination',
         'reference/gateway-api',
         'reference/openai-compat',
         'reference/anthropic-compat',
+        'reference/release-status',
       ],
     },
     {

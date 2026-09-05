@@ -1,12 +1,20 @@
 ---
 slug: /multi-agent-coordination
+description: "How one agent delegates to another: tool schemas, controller guardrails, and the child task lifecycle."
 ---
 
-# Multi-Agent Coordination
+# Multi-agent coordination
 
-Enable coordinator agents to dynamically delegate subtasks to specialist agents at runtime. The LLM decides what to delegate, to whom, and how to synthesize results. The controller enforces guardrails (allowed agents, max depth, max concurrency). Each child task is a real Kubernetes Job with full isolation.
+Coordinator agents delegate subtasks to specialist agents at runtime. The LLM decides
+what to delegate and how to combine results. The controller enforces allowed agents,
+depth, and concurrency limits. Each delegation creates a child Task. Native AI children
+run in worker Jobs; children targeting built-in ACP runtimes use RuntimeSessions and
+RuntimePools.
 
 ## Workflow
+
+This example uses a native `type: ai` coordinator. Its children can target native AI
+Agents or built-in ACP runtime Agents.
 
 ```
 User creates Task (agentRef: coordinator-agent, prompt: "Refactor auth")
@@ -30,10 +38,10 @@ Worker creates child Tasks via K8s API with:
   │
   ▼
 Controller reconciles child Tasks:
-  - Validates agent is in parent's allowedAgents
-  - Validates depth < maxDepth
-  - Validates active children < maxConcurrentChildren
-  - Creates Jobs for children → children run in parallel
+  - Checks allowedAgents, maxDepth, and maxConcurrentChildren
+  - Native AI Agent → type: ai → worker Job
+  - Built-in runtime Agent → type: agent → RuntimeSession on a RuntimePool
+  - Children run in parallel within the configured limits
   - Updates parent's status.childTasks[]
   │
   ▼
@@ -102,7 +110,8 @@ Implementation (`internal/tools/delegate_task.go`):
    - `Labels: orka.ai/parent-task, orka.ai/coordinator, orka.ai/delegated-agent`
    - `Annotations: orka.ai/coordination-depth`
    - `OwnerReferences` pointing to parent Task
-   - `Spec.Type: ai`, `Spec.AgentRef.Name: <agent>`, `Spec.Prompt: <prompt>`
+   - `Spec.AgentRef.Name: <agent>`, `Spec.Prompt: <prompt>`
+   - `Spec.Type: agent` when the target Agent has `spec.runtime`, otherwise `ai`
 5. If `auto_retry: true`, stores retry config as annotations: `orka.ai/auto-retry`, `orka.ai/max-retries`, `orka.ai/retry-count`, `orka.ai/original-prompt`
 6. Inherits safe transaction metadata from the parent Task. When `ORKA_CONTEXT_TOKEN_TTS_ENDPOINT`, `ORKA_CONTEXT_TOKEN_SUBJECT_TOKEN_FILE`, and `ORKA_CONTEXT_TOKEN_CHILD_SCOPE` are set in the worker, exchanges the mounted subject token for a child TxToken whose scope must be a subset of the parent transaction scopes. The raw child token is stored only in an owner-referenced Secret and mounted into the child worker.
 7. Returns `{"taskName": "<name>", "status": "created"}` to LLM
@@ -139,8 +148,8 @@ Implementation (`internal/tools/wait_for_tasks.go`):
 1. Parses timeout (default 10m)
 2. Poll loop (5s interval):
    - Gets each child Task by name via K8s API
-   - Checks if all are in terminal phase (Succeeded/Failed)
-   - **Auto-retry**: If a failed task has `orka.ai/auto-retry=true` and retry count < max retries, automatically creates a new child task with the error context prepended to the original prompt, and continues polling the retry task
+   - Checks if all are in a terminal phase (Succeeded, Failed, or Cancelled)
+   - Returns failed children with retry metadata when `orka.ai/auto-retry=true`; the coordinator decides whether to submit another Task
    - If timeout exceeded, returns partial results with timeout flag
    - Respects context cancellation
 3. For each completed child, reads result via the controller's result API
@@ -215,7 +224,7 @@ Implementation (`internal/tools/check_messages.go`):
 3. Returns all unread messages addressed to this task or broadcast to all siblings (same parent)
 4. Messages are marked as read by default to avoid re-delivery
 
-### Inter-Agent Messaging
+### Inter-agent messaging
 
 Sibling tasks (children of the same coordinator) can exchange messages to coordinate work, share findings, and avoid duplicated effort. Messages flow through the controller's internal API — no direct pod-to-pod communication.
 
@@ -230,13 +239,13 @@ Sibling tasks (children of the same coordinator) can exchange messages to coordi
 - `ORKA_PARENT_TASK`: Set automatically by the job builder for child tasks (from `orka.ai/parent-task` label)
 - `ORKA_CONTROLLER_URL`, `ORKA_TASK_NAME`, `ORKA_TASK_NAMESPACE`: Already available for all workers
 
-### Controller Enforcement
+### Controller enforcement
 
 Located in `internal/controller/task_controller.go`.
 
-#### `handlePending` — Coordination Validation
+#### `handlePending` — coordination validation
 
-After agent resolution, before Job creation, the controller validates coordination constraints for child tasks (identified by `orka.ai/coordination-depth` annotation):
+After agent resolution, before dispatch, the controller validates coordination constraints for child tasks (identified by `orka.ai/coordination-depth` annotation):
 
 ```go
 if depthStr := task.Annotations["orka.ai/coordination-depth"]; depthStr != "" {
@@ -288,7 +297,7 @@ if depthStr := task.Annotations["orka.ai/coordination-depth"]; depthStr != "" {
 }
 ```
 
-#### `handleRunning` — ChildTaskStatus Population
+#### `handleRunning` — ChildTaskStatus population
 
 For coordinator tasks (those without a `orka.ai/parent-task` label), the controller lists child tasks and populates `status.childTasks[]` with name, agent, phase, and truncated result (max 500 chars):
 
@@ -324,7 +333,7 @@ if _, hasChildren := task.Labels["orka.ai/parent-task"]; !hasChildren {
 }
 ```
 
-### Job Builder — Coordination Config
+### Job builder — coordination config
 
 Located in `internal/controller/job_builder.go`. In `addAIEnvVars`, when an agent has coordination enabled, the following env vars are injected:
 
@@ -360,7 +369,7 @@ if agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Ena
 
 Coordination, memory, PR, dynamic-agent, and plan tools are automatically injected into the tools list when coordination is enabled. This includes `delegate_task`, `wait_for_tasks`, `create_container_task`, sibling messaging tools, memory tools (`recall_memory`, `remember`, `propose_memory`, `search_transcript`), PR workflow tools, dynamic agent management, and `update_plan`.
 
-### AI Worker Wiring
+### AI worker wiring
 
 Located in `workers/ai/main.go`. When `ORKA_COORDINATION_ENABLED=true`:
 
@@ -478,7 +487,7 @@ spec:
   priority: 800
 ```
 
-### Expected Task Status (while running)
+### Expected Task status (while running)
 ```yaml
 status:
   phase: Running
@@ -494,7 +503,7 @@ status:
       result: "Updated 12 components to use new auth context..."
 ```
 
-## File Summary
+## File summary
 
 | File | Description |
 |---|---|
@@ -532,33 +541,16 @@ status:
 2. **Controller tests** for coordination validation (depth, allowedAgents, concurrency) using envtest
 3. **Job builder tests** verifying coordination env vars and auto-injected memory tools are set correctly
 
-## Self-Healing Coordination
+## Retry decisions
 
-When `auto_retry` is enabled on a delegated task, `wait_for_tasks` automatically re-creates failed child tasks with the error context prepended to the original prompt.
+`auto_retry: true` enables structured failure metadata. `wait_for_tasks` returns the
+failed child with `phase: Failed`; it does not create a replacement Task or advance
+the retry count.
 
-### How It Works
-
-1. Coordinator calls `delegate_task` with `auto_retry: true` (and optional `max_retries`, default 2)
-2. `delegate_task` stores retry config as annotations on the child task:
-   - `orka.ai/auto-retry: "true"`
-   - `orka.ai/max-retries: "2"`
-   - `orka.ai/retry-count: "0"`
-   - `orka.ai/original-prompt: "<original prompt>"`
-3. If the child task fails, `wait_for_tasks` detects the failure and:
-   - Checks `retry-count < max-retries`
-   - Creates a new child task with the error message prepended:
-     ```
-     PREVIOUS ATTEMPT FAILED (attempt 1 of 2):
-     <error message>
-
-     Please retry the original task, avoiding the previous error:
-     <original prompt>
-     ```
-   - Sets `orka.ai/retried-from` annotation on the retry task
-   - Increments `retry-count`
-   - Continues polling the retry task
-4. The original failed task result includes `failureDetails` with message, retryCount, and maxRetries
-5. If retries are exhausted, the task is reported as failed with full failure details
+The coordinator must explicitly call `delegate_task` again to retry, choosing any
+prompt changes and tracking its attempt budget. `max_retries` defaults to 2 and is
+metadata for that decision; the tools do not enforce an automatic retry loop. Each
+new delegation with `auto_retry: true` starts with `retry-count: "0"`.
 
 ### Example
 
@@ -571,15 +563,13 @@ When `auto_retry` is enabled on a delegated task, `wait_for_tasks` automatically
 }
 ```
 
-### Result Format
+### Result format
 
-When a task is retried, its result includes:
+For the request above, a failed child's result includes:
 ```json
 {
   "task": "parent-task-child-abc",
-  "phase": "Retried",
-  "retried": true,
-  "retryTaskName": "parent-task-child-abc-retry-xyz",
+  "phase": "Failed",
   "failureDetails": {
     "message": "out of memory",
     "retryCount": 0,
@@ -588,7 +578,7 @@ When a task is retried, its result includes:
 }
 ```
 
-## Iterative Code Review Workflows
+## Iterative code review workflows
 
 Orka supports iterative multi-agent workflows where a coordinator orchestrates coding, review, and feedback loops until code is approved.
 
@@ -649,7 +639,7 @@ COORDINATOR (AI worker)
   └── COMPLETE with merged PR
 ```
 
-### delegate_task Iteration Parameters
+### delegate_task iteration parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -662,7 +652,7 @@ When `prior_task` is set:
 - Workspace config is copied from the prior task if not explicitly provided
 - Iteration labels are tracked: `orka.ai/iteration` (incremented) and `orka.ai/iteration-group` (shared ID)
 
-### Structured Result Format
+### Structured result format
 
 Workers with git workspaces produce structured results:
 
@@ -685,14 +675,14 @@ Workers with git workspaces produce structured results:
 - `wait_for_tasks` **strips the diff** from results returned to the coordinator to prevent context bloat
 - Plain-text results remain backward compatible
 
-### Iteration Labels
+### Iteration labels
 
 | Label | Description |
 |-------|-------------|
 | `orka.ai/iteration` | Iteration number (1, 2, 3...) |
 | `orka.ai/iteration-group` | Shared ID grouping all iterations of the same logical task |
 
-### Recommended Coordinator System Prompt
+### Recommended coordinator system prompt
 
 ```
 You are a coordinator agent. Follow this protocol:
@@ -975,7 +965,7 @@ Updates the autonomous execution plan state. Must be called at least once per it
 | `goal_complete` | boolean | no | Set to `true` when the overall goal has been fully achieved |
 | `plan_document` | string | yes | Full markdown plan document. Replaces the previous plan document entirely |
 
-### Recommended Coordinator System Prompt (with PR Workflow)
+### Recommended coordinator system prompt (with PR workflow)
 
 ```
 You are a coordinator agent. Follow this protocol:
@@ -1006,9 +996,9 @@ You are a coordinator agent. Follow this protocol:
 7. Report final result with the PR URL, review result, and CI status.
 ```
 
-## Autonomous Mode
+## Autonomous mode
 
-For long-running goals that require multiple planning and execution cycles, enable autonomous mode on the coordinator agent. See [Autonomous Task Execution](autonomous-tasks.md) for details.
+For long-running goals that require multiple planning and execution cycles, enable autonomous mode on the coordinator agent. See [Autonomous Task execution](../guides/autonomous-tasks.md) for details.
 
 When `coordination.autonomous: true` is set, the controller runs the coordinator in a loop — each iteration gets the accumulated plan state, delegates sub-tasks, and updates the plan. The loop continues until the goal is complete, max iterations are reached, or the task is suspended.
 

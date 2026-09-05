@@ -1,8 +1,71 @@
 ---
 slug: /security
+description: "Credential and network boundaries for ACP runtimes, native workers, and publication."
 ---
 
 # Security
+
+## The boundaries at a glance
+
+On the ACP runtime and Workspace/Publisher path, the agent has no Git credentials and the
+Publisher has no model credentials. The controller brokers credentials for specific operations.
+The diagram below covers this path; native worker Pods have their own RBAC permissions.
+
+```mermaid
+flowchart LR
+    subgraph cluster["Kubernetes cluster"]
+        subgraph ctrl["Controller"]
+            direction TB
+            API["Task API + dispatcher"]
+            Brokers["credential broker<br/>artifact broker<br/>prompt MCP broker"]
+            Store[("SQLite<br/>transcripts, outbox,<br/>artifacts")]
+        end
+
+        subgraph runtime["ACP runtime Pod — thinks, cannot push"]
+            direction TB
+            Sup["supervisor"]
+            Sess["private RuntimeSessions<br/>distinct UIDs, private HOME"]
+        end
+
+        subgraph pub["Workspace/Publisher — pushes, cannot think"]
+            direction TB
+            Clone["clean-room clone<br/>deterministic commit<br/>exact-ref push + verify"]
+        end
+
+        Proxy["provider auth proxy"]
+        SCM["SCM egress proxy<br/>HTTPS 443, exact hostnames"]
+    end
+
+    Vekil["Vekil → LLM provider"]
+    Forge["GitHub / forge"]
+
+    API --> runtime
+    Brokers -.->|"one operation,<br/>short-lived"| pub
+    runtime -->|"bearer token"| Proxy
+    runtime -->|"loopback MCP,<br/>revalidated per call"| Brokers
+    Proxy --> Vekil
+    runtime -->|"validated<br/>workspace delta"| API
+    API --> pub
+    pub --> SCM
+    SCM --> Forge
+    API --- Store
+
+    style runtime fill:#fff4e6,stroke:#d9822b
+    style pub fill:#eaf4ff,stroke:#2b7bd9
+    style ctrl fill:#f3f0ff,stroke:#7048e8
+```
+
+What the picture is telling you:
+
+| Component | Can reach | Cannot reach |
+| --- | --- | --- |
+| ACP runtime Pod | the provider auth proxy, and the controller's loopback MCP broker | the Kubernetes API, Git remotes, any other host — egress is default-deny |
+| Workspace/Publisher | DNS, the controller API, the SCM egress proxy | LLM providers, the MCP broker, arbitrary internet hosts |
+| Controller | everything above, plus the Kubernetes API | — it is the trusted core, so protect it accordingly |
+
+The runtime Pod never holds a Git credential, and the Publisher never holds a model credential.
+That is deliberate: a prompt injection that fully captures the agent still cannot push code, and
+a compromised publisher still cannot exfiltrate through your model provider.
 
 ## Execution workloads
 
@@ -15,6 +78,10 @@ Container and native `ai` Tasks run in per-Task worker Pods with a hardened secu
 - all Linux capabilities dropped;
 - `RuntimeDefault` seccomp;
 - optional `RuntimeClass`, node selector, tolerations, and affinity through `spec.execution`.
+
+These workers use dedicated ServiceAccounts bound to `orka-ai-worker-role`,
+`orka-vendor-worker-role`, or `orka-container-worker-role`. Include these identities when
+auditing Kubernetes access.
 
 ### ACP RuntimePool Pods
 
@@ -30,7 +97,12 @@ Built-in `type: agent` Tasks run as private RuntimeSessions inside one controlle
 
 A shared pool is a same-administrative-trust-domain density boundary, not a hard tenant sandbox. Users who can mutate or exec into the runtime Pod, namespace administrators, node administrators, and sibling sessions in the same pool are trusted relative to that boundary.
 
-Per-Task `spec.execution`, custom resources, and `spec.execution.workspace` are not supported by the current ACP path. Runtime isolation and resources are selected by reviewed RuntimePool profiles.
+Per-Task `spec.execution` container settings and custom resource requests are not honoured on
+the ACP path: runtime isolation and resources come from the reviewed RuntimePool profile, not
+from the Task. `spec.execution.workspace` is the one exception — it moves the agent into an
+external sandbox provider, and only when the operator has enabled it
+(`--acp-workspace-dispatch-enabled` plus `--agent-sandbox-enabled` or `--substrate-enabled`).
+Everything else in `spec.execution` fails closed.
 
 ### Workspace/Publisher
 
@@ -53,11 +125,11 @@ The runtime child's `.git` directory, remotes, hooks, filters, refs, and history
 
 ### Provider and prompt brokers
 
-Built-in RuntimePools reach Vekil only through the central authenticated
-provider proxy. The proxy validates the RuntimePool bearer, enforces the
-configured provider/model path, and supports bounded current/previous-token
-overlap during rotation. `config/acp-production` applies the cross-namespace
-Vekil ingress policy required to prevent direct runtime access.
+Built-in RuntimePools reach Vekil through the central authenticated provider proxy.
+The supervisor's per-session loopback proxy validates provider routes and the model
+against the immutable session profile. The central proxy checks the shared current or
+previous bearer credential and forwards requests to Vekil. `config/acp-production`
+applies the cross-namespace Vekil ingress policy required to prevent direct runtime access.
 
 Every RuntimeSession also exposes a credential-protected loopback MCP proxy.
 The controller broker revalidates Task, attempt, prompt, lease generation and
@@ -95,11 +167,11 @@ The controller runs with:
 - See [Transaction Token integration](transaction-tokens.md) for deployment examples, scope vocabulary, transaction metadata, TTS exchange, admission hardening, metrics, and rollout guidance
 - Provider-backed `Task.spec.execution.workspace` dispatch is fail-closed behind `--acp-workspace-dispatch-enabled` plus the selected provider flag. Agent Sandbox uses only controller-rendered templates; Substrate accepts only an operator-owned infrastructure `templateRef` and derives the credential-free runtime template. Both providers bind one dedicated RuntimeSession workspace, bootstrap the exact attested instance with one-time credentials, keep provider-native identifiers out of Task status, and delete the physical workspace only after authenticated drain. Raw transaction tokens are never staged into retained workspaces or provider child environments.
 - OIDC- and context-token-authenticated Task creation stamps the verified identity into immutable `spec.requestedBy`; context-token-authenticated Task creation also stamps immutable `spec.transaction` metadata for audit correlation. Client-supplied `requestedBy` and `transaction` fields are rejected
-- Optional Task provenance admission (`--task-provenance-admission-enabled`) rejects untrusted direct Kubernetes Task creates/updates that set or modify Orka-managed provenance fields, including `spec.requestedBy`, `spec.transaction`, and transaction metadata labels/annotations. The opt-in manifest defaults to `failurePolicy: Ignore`; switch it to `Fail` only after webhook TLS, CA bundle injection, and availability are configured
+- Task provenance admission rejects untrusted direct Kubernetes Task creates/updates that set or modify Orka-managed provenance fields, including `spec.requestedBy`, `spec.transaction`, and transaction metadata labels/annotations. Helm enables it automatically. The opt-in Kustomize webhook bundle already uses `failurePolicy: Fail`; apply it only after completing the readiness, TLS, CA injection, and trusted-identity checks in [Task provenance admission hardening](../reference/configuration.md#task-provenance-admission-hardening)
 - The `orka` CLI extracts tokens from kubeconfig for browser-based login
 - **Token caching**: Validated ServiceAccount tokens are cached for 60 seconds using SHA256 hashes to avoid repeated TokenReview API calls. Token revocation has up to 60s propagation delay. The cache is in-memory only — not persistent across pod restarts
 
-## Secret Management
+## Secret management
 
 - Provider-proxy, source-read, publication-read, publication-write, forge,
   prompt-broker, publisher-auth, artifact, and operation-capability roles are
@@ -112,7 +184,7 @@ The controller runs with:
 - Git credentials are resolved by the clean-room boundary and are never mounted into ACP runtime Pods.
 - Known Orka-supplied secret values are redacted before logs, events, results, transcripts, and traces; raw prompt/repository content still requires RBAC, encryption, retention, and content-capture policy.
 
-## Namespace Scoping
+## Namespace scoping
 
 - Every controller requires one non-empty `--watch-namespace` and one static
   `--controller-mode` (`harness-v1` or `harness-v2`)
@@ -123,11 +195,11 @@ The controller runs with:
 - Chat endpoint blocks operations in `kube-system` and `kube-public` namespaces
 - The embedded UI is served over the same port as the API (no separate attack surface)
 
-## Multi-Tenancy
+## Multi-tenancy
 
 Orka supports soft multi-tenancy using Kubernetes namespaces as tenant boundaries.
 
-### Namespace Isolation
+### Namespace isolation
 
 Enable `--enforce-namespace-isolation` to restrict users to their ServiceAccount's namespace:
 
@@ -136,7 +208,7 @@ Enable `--enforce-namespace-isolation` to restrict users to their ServiceAccount
 - Workers cannot submit results to namespaces other than their own
 - All access denials are logged with caller identity and IP address
 
-### External OIDC Callers
+### External OIDC callers
 
 When OIDC API authentication is enabled, configure an explicit subject allowlist and namespace binding. For GitHub Actions, allow only the trusted repository, branch, environment, or workflow subjects that should call Orka; issuer and audience validation alone is not an authorization policy. Authorized OIDC callers are assigned `--oidc-namespace` (default `default`) so `--enforce-namespace-isolation=true` prevents them from selecting arbitrary tenant namespaces.
 
@@ -148,11 +220,11 @@ When OIDC API authentication is enabled, configure an explicit subject allowlist
 --enforce-namespace-isolation=true
 ```
 
-### Per-Namespace Task Limits
+### Per-namespace Task limits
 
 Use `--max-tasks-per-namespace` to cap the number of active (Pending/Running) tasks per namespace. Tasks exceeding the limit are requeued with backoff. Set to `0` (default) for unlimited.
 
-### Recommended Production Configuration
+### Recommended production configuration
 
 For multi-tenant deployments, enable both isolation and limits:
 
@@ -163,7 +235,7 @@ For multi-tenant deployments, enable both isolation and limits:
 --watch-namespace=team-v2
 ```
 
-### Data Isolation
+### Data isolation
 
 Most ACP control CRDs are namespace-scoped, and their status transitions use
 Kubernetes `resourceVersion` compare-and-swap. Controller-epoch and Session
@@ -175,7 +247,7 @@ boundaries at their respective layers. CRD schemas remain cluster-scoped and
 have one platform lifecycle owner; schema sharing does not grant either
 controller access to the other installation's resources.
 
-### Audit Logging
+### Audit logging
 
 Security-relevant events are logged at the API layer:
 

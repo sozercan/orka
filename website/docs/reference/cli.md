@@ -1,8 +1,9 @@
 ---
 slug: /cli-reference
+description: "The orka CLI: installing it, pointing it at a controller, and what it can do."
 ---
 
-# CLI Reference
+# CLI reference
 
 The `orka` CLI talks to the Orka controller REST API and is intended for day-to-day task inspection, resource CRUD, and operator workflows. It uses the same authentication and namespace rules as the API.
 

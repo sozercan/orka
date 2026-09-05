@@ -1,3 +1,7 @@
+---
+description: "The trust boundary around an external agent runtime, and what it is never allowed to do."
+---
+
 # AgentRuntime security operations
 
 AgentRuntime integrations preserve one invariant: runtimes may request work,

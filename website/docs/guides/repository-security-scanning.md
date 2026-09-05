@@ -1,8 +1,9 @@
 ---
 slug: /repository-security-scanning
+description: "Scanning a repository for security findings and turning them into remediation pull requests."
 ---
 
-# Repository Security Scanning
+# Repository security scanning
 
 Repository security scanning provides a human-in-the-loop workflow: register a GitHub
 repository, generate an editable threat model, scan history and new commits for likely
@@ -13,11 +14,11 @@ The feature is GitHub-first and built on Orka's existing task, agent runtime, ar
 scheduling, and PR plumbing. Remediation (patch generation and PR creation) always requires
 an explicit user action.
 
-- For the CRD field reference, see [Configuration → RepositoryScan](../concepts/configuration.md#repositoryscan).
+- For the CRD field reference, see [Configuration → RepositoryScan](../reference/configuration.md#repositoryscan).
 - For the REST endpoints, see [API Reference → Security](../reference/api-reference.md#security).
 - For the internal design and storage model, see [Repository Security Scanning Design](../development/security-scanning-design.md).
 
-## How It Works
+## How it works
 
 ```text
 Register repository (UI or RepositoryScan CRD)
@@ -33,7 +34,7 @@ JSON, validation evidence, patch summaries, and patch diffs) that the
 `RepositoryScan` controller ingests into the security store and surfaces through the
 `/api/v1/security/*` API and the **Security** area of the dashboard.
 
-## Quick Start (Dashboard)
+## Quick start (dashboard)
 
 1. Create or choose an Agent that can run repository security analysis (a `type: agent`
    runtime Agent with a git workspace, e.g. a Claude or Codex runtime agent).
@@ -47,17 +48,21 @@ JSON, validation evidence, patch summaries, and patch diffs) that the
 6. From a finding detail page, optionally validate/reproduce the finding, generate a patch
    proposal, review the patch artifacts, and create a remediation pull request.
 
-## Quick Start (GitOps / API)
+## Quick start (GitOps / API)
 
 You can drive the same workflow declaratively with the `RepositoryScan` CRD or the
 `/api/v1/security/*` endpoints.
+
+These examples use `orka-system`, the namespace watched by the standard installation.
+Create the referenced Agents and Secrets there, or adapt the namespace references to
+your installation.
 
 ```yaml
 apiVersion: core.orka.ai/v1alpha1
 kind: RepositoryScan
 metadata:
   name: example-repo
-  namespace: default
+  namespace: orka-system
 spec:
   provider: github
   repoURL: "https://github.com/example/app"
@@ -86,12 +91,12 @@ spec:
 
 For patch Tasks, the Workspace/Publisher—not the ACP child—prepares and publishes the branch.
 
-See [Configuration → RepositoryScan](../concepts/configuration.md#repositoryscan) for every
+See [Configuration → RepositoryScan](../reference/configuration.md#repositoryscan) for every
 spec and status field, and [API Reference → Security](../reference/api-reference.md#security)
 for the endpoint and query-parameter reference, including the typical findings → validate →
 patch → pull-request remediation flow.
 
-## Scan Phases
+## Scan phases
 
 | Phase | What happens |
 |-------|--------------|
@@ -102,7 +107,7 @@ patch → pull-request remediation flow.
 | **Patch generation** | From a finding, Orka creates a dedicated write-intent patch task. The agent edits the workspace and returns an identity-bound `orka.security.patch.v1` result envelope (summary, changed files, tests run, risk); it never writes artifact files into the workspace. The clean-room Workspace/Publisher commits the delta and opens the pull request, and the controller derives the reviewable diff from that published commit (read with `forgeCredentialRef`) and stores the diff and summary artifacts. The proposal is marked ready only when the envelope's changed files exactly match the published commit. |
 | **PR receipt** | The pull request already exists at this point — the clean-room publisher opened it during patch generation as part of the same governed, verified publication. The pull-request endpoint is idempotent: it records and returns the verified PR receipt (number and URL) from the proposal rather than opening a second PR, and the controller re-titles the publisher's generic PR with the finding (`fix(security): …`). |
 
-## Validation Modes
+## Validation modes
 
 | Mode | Behavior |
 |------|----------|
@@ -115,7 +120,7 @@ validation can be tuned with `validationMaxFindingsPerRun`, `validationMinSeveri
 `validationMinConfidence`; failed validations are excluded from recommended patch candidates,
 while validated findings rank above unvalidated findings of the same severity.
 
-## Custom Scan Policy ConfigMaps
+## Custom scan policy ConfigMaps
 
 Teams can attach additive policy text from same-namespace ConfigMaps instead of putting long
 instructions directly in the `RepositoryScan` spec. The ConfigMap must opt in with
@@ -130,6 +135,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: repo-security-policy
+  namespace: orka-system
   labels:
     orka.ai/security-policy: "true"
 data:
@@ -144,7 +150,13 @@ data:
 ---
 apiVersion: core.orka.ai/v1alpha1
 kind: RepositoryScan
+metadata:
+  name: example-repo
+  namespace: orka-system
 spec:
+  repoURL: "https://github.com/example/app"
+  analysisAgentRef:
+    name: security-reviewer
   customScanInstructionsRef:
     name: repo-security-policy
     key: scan
@@ -152,6 +164,10 @@ spec:
     name: repo-security-policy
     key: false-positives
 ```
+
+The ConfigMap and the `RepositoryScan` must live in the same namespace. `repoURL` and
+`analysisAgentRef` are the only two required fields on a `RepositoryScan`; everything else
+above is what the two policy references add.
 
 Suggested custom policy themes:
 
@@ -164,7 +180,7 @@ Suggested custom policy themes:
 - Monorepos: subpath-specific trust boundaries, generated runtime config, shared CI/CD
   scripts, and cross-package credential flows.
 
-## Dropped Findings and Filtering
+## Dropped findings and filtering
 
 The scanner favors precision before persistence. Review prompts ask for concrete exploit
 paths and exclude common noise. The controller also applies a deterministic filter before
@@ -197,9 +213,9 @@ old repository-wide findings by itself.
 - Dropped-finding diagnostics contain compact reasons and samples only; they must not
   include raw tokens, credentials, full transcripts, or sensitive request context.
 
-## See Also
+## See also
 
 - [Repository Security Scanning Design](../development/security-scanning-design.md) — CRD,
   storage schema, controller ingestion, artifact contract, and prompt contracts.
-- [Configuration → RepositoryScan](../concepts/configuration.md#repositoryscan)
+- [Configuration → RepositoryScan](../reference/configuration.md#repositoryscan)
 - [API Reference → Security](../reference/api-reference.md#security)
