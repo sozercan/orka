@@ -9,10 +9,11 @@ slug: /agent-runtimes
 Orka owns the durable Task attempt, RuntimeSession identity, queueing, workspace validation, delivery receipt, transcript, and result projection. The runtime Pod owns only the short-lived provider process and ACP session for a fenced RuntimeSession.
 
 The supported built-in set is intentionally closed: `codex`, `claude`,
-`copilot`, and `opencode`. Operators can register and conformance-test an
-external `orka.harness.v2` `AgentRuntime`, but Task dispatch through
-`runtimeRef` remains fail-closed until the external v2 dispatcher support
-boundary is enabled.
+`copilot`, and `opencode`. Operators can also register and conformance-test an
+external `orka.harness.v2` `AgentRuntime`. A ready strict-governed registration
+selected through `runtimeRef` uses the same durable Task and RuntimeSession
+state machines, while the operator remains responsible for the external
+service lifecycle and capacity.
 
 ## Supported runtime profiles
 
@@ -23,19 +24,21 @@ boundary is enabled.
 | Copilot | `copilot` | Immutable Copilot ACP image definition is included. Configure a digest-pinned image. |
 | OpenCode | `opencode` | Immutable OpenCode ACP image definition is included. Configure a digest-pinned image. |
 
-External runtimes use an `AgentRuntime` registration with `contractVersion: orka.harness.v2`. Current-generation conformance proves the exact instance, profile, cancellation, duplicate, and workspace-governance claims, but readiness does not yet enable `runtimeRef` Task dispatch. See [Bring your own AgentRuntime](../guides/bring-your-own-agent-runtime.md) and the [adapter contract](../development/agent-runtime-adapter-contract.md).
+External runtimes use an `AgentRuntime` registration with `contractVersion: orka.harness.v2`. Current-generation conformance proves the exact instance, profile, cancellation, duplicate, and workspace-governance claims. Dispatch revalidates the frozen registration, authentication authority, and observed runtime identity before every mutation. See [Bring your own AgentRuntime](../guides/bring-your-own-agent-runtime.md) and the [adapter contract](../development/agent-runtime-adapter-contract.md).
 
 ## Architecture
 
 ```text
 Task (type: agent)
   -> durable ACP attempt and queue reservation
-  -> central authenticated provider proxy -> Vekil/model backend
-  -> controller-owned RuntimePool for one trust domain/profile
-     -> one exact runtime Pod (0 or 1 replica)
-        -> RuntimeSession A: private HOME/workspace/UID + provider process
-        -> RuntimeSession B: private HOME/workspace/UID + provider process
-        -> per-session loopback MCP proxy -> controller prompt broker
+  -> built-in path: central authenticated provider proxy -> Vekil/model backend
+     -> controller-owned RuntimePool for one trust domain/profile
+        -> one exact runtime Pod (0 or 1 replica)
+           -> private RuntimeSession HOME/workspace/UID + provider process
+           -> per-session loopback MCP proxy -> controller prompt broker
+  -> external path: authenticated operator-owned AgentRuntime endpoint
+     -> exact fenced RuntimeSession + non-reconnectable prompt stream
+     -> registered provider, MCP, and workspace-governance profile
   -> workspace delta validation
   -> artifact + credential brokers -> separate Workspace/Publisher identity
   -> clean-room clone, prepare, push, verify, and optional PR reconciliation
@@ -160,7 +163,7 @@ read-intent workspaces, Orka also disables Bash and OpenCode Grep because Grep
 cannot carry the secret-file exclusions applied to OpenCode Read; Read and Glob
 remain available when allowed by policy.
 
-Task-level `spec.agentRuntime` contains only runtime overrides such as `maxTurns`, `allowedTools`, `disallowedTools`, and `allowBash`. Repository configuration belongs at top-level `spec.workspace`.
+For built-in RuntimePools, Task-level `spec.agentRuntime` contains runtime overrides such as `maxTurns`, `allowedTools`, `disallowedTools`, and `allowBash`. For `runtimeRef`, the registered external profile owns provider, model, prompt, skill, tool, and runtime defaults. Its `capabilities.mcpPolicy` stores the exact tool and approval policy represented by the profile digests, and Orka uses that same policy for conformance and dispatch. The Agent must omit `spec.model`, `spec.systemPrompt`, `spec.skills`, enabled `spec.tools`, `defaultMaxTurns`, `defaultAllowedTools`, `defaultAllowBash`, and `defaultReasoningEffort`. Disabled Agent tool entries are inert and accepted. Task-level `allowedTools` must equal the registered allowlist when brokered tools are exposed. Orka rejects `maxTurns`, `disallowedTools`, and `allowBash` because those values are fixed by the registration. Repository configuration belongs at top-level `spec.workspace`.
 
 ## Read-only workspace Task
 
@@ -354,10 +357,10 @@ cross-namespace Vekil ingress boundary.
 
 ## Troubleshooting
 
-- **Task fails before queueing**: verify the Agent has `runtime.type: codex`, `claude`, `copilot`, or `opencode`, ACP is enabled, and the matching digest-pinned built-in image is configured. `runtimeRef` Task dispatch is intentionally rejected at the current support boundary.
+- **Task fails before queueing**: for a built-in runtime, verify the Agent has `runtime.type: codex`, `claude`, `copilot`, or `opencode`, ACP is enabled, and the matching digest-pinned image is configured. For `runtimeRef`, verify the registration is current-generation, ready, strict-governed, and matches the Task workspace intent.
 - **Task remains queued**: inspect the selected RuntimePool lifecycle/admission/capacity and the runtime Pod scheduling conditions.
 - **Task reports `OutcomeUnknown`**: do not retry the same attempt automatically. Inspect the recorded attempt, controller epoch, runtime instance, and event timeline.
 - **Read Task fails validation**: inspect `status.delivery` for `ReadOnlyWorkspaceModified` and treat the session as poisoned.
 - **Write Task is blocked**: verify all required source-read, target-read, target-write, and forge credential references, the publication repository/branch, and the Workspace/Publisher broker configuration. Require a terminal verified delivery receipt before claiming success.
-- **`runtimeRef` Task is rejected**: this is the expected fail-closed behavior until the external v2 dispatcher support boundary is enabled. Registration readiness and conformance do not currently admit Task execution.
+- **`runtimeRef` Task is rejected**: inspect `AgentRuntime.status` for current-generation conformance, exact profile and instance identity, strict workspace governance, and valid authentication Secret bindings. Remove unsupported Task overrides such as `maxTurns`, `disallowedTools`, or `allowBash`.
 - **`spec.execution.workspace` Task is rejected**: workspace-provider-backed RuntimeSession dispatch is fail-closed unless `--acp-workspace-dispatch-enabled` is set together with the matching provider flag: `--agent-sandbox-enabled` for `provider: agent-sandbox` (which must omit `templateRef`), or `--substrate-enabled` for `provider: substrate` (which requires an infrastructure `templateRef`). Other options (`retain`, boot/pool/snapshot/hibernation, `onDetach`) stay fail-closed. The rejection reason is projected to `Task.status.executionWorkspace`. Repository access always uses top-level `spec.workspace`; see [Agent Sandbox](agent-sandbox.md) and [Substrate](substrate.md).

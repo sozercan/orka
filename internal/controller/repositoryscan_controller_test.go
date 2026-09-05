@@ -48,6 +48,66 @@ const (
 	testPatchFullDiff = testPatchDiffHeader + "\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n"
 )
 
+func repositoryScanTestAgent(name string) *corev1alpha1.Agent {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	return &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: defaultNS},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			Type: corev1alpha1.AgentRuntimeCodex, ContractVersion: &contract,
+		}},
+	}
+}
+
+func repositoryScanExternalRuntimeFixtures(agentName string, allowedTools []string) (*corev1alpha1.Agent, *corev1alpha1.AgentRuntime) {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	runtimeName := agentName + "-runtime"
+	return &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: agentName, Namespace: defaultNS},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: runtimeName},
+		}},
+	}, &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: runtimeName, Namespace: defaultNS},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "codex", Model: "gpt-5.6", WorkspaceIntent: corev1alpha1.WorkspaceIntentRead,
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          append([]string{}, allowedTools...),
+					DisallowedTools:       []string{},
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+}
+
+func repositoryScanExternalRuntimePolicySkew(
+	scheme *runtime.Scheme,
+	agentName string,
+	currentAllowedTools []string,
+) (*corev1alpha1.Agent, *corev1alpha1.AgentRuntime, client.Reader) {
+	agent, cachedRuntime := repositoryScanExternalRuntimeFixtures(agentName, []string{"revoked_tool"})
+	_, currentRuntime := repositoryScanExternalRuntimeFixtures(agentName, currentAllowedTools)
+	apiReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent.DeepCopy(), currentRuntime).
+		Build()
+	return agent, cachedRuntime, apiReader
+}
+
+func requireExplicitTaskAllowedTools(t *testing.T, task *corev1alpha1.Task, want []string) {
+	t.Helper()
+	if task.Spec.AgentRuntime == nil || task.Spec.AgentRuntime.AllowedTools == nil {
+		t.Fatalf("task AgentRuntime = %#v, want explicit allowedTools %#v", task.Spec.AgentRuntime, want)
+	}
+	if !reflect.DeepEqual(task.Spec.AgentRuntime.AllowedTools, want) {
+		t.Fatalf("task allowedTools = %#v, want %#v", task.Spec.AgentRuntime.AllowedTools, want)
+	}
+}
+
 func TestRepositoryScanConditionMessageUsesFallback(t *testing.T) {
 	got := repositoryScanConditionMessage("  \n\t ", "scan completed successfully")
 	if got != "scan completed successfully" {
@@ -622,10 +682,11 @@ func newReviewResultRetryFixture(t *testing.T) *reviewResultRetryFixture {
 	if err := securityStore.SaveResult(ctx, sourceTask.Namespace, sourceTask.Name, []byte(`{"not":"the required findings envelope"}`)); err != nil {
 		t.Fatalf("SaveResult(malformed) error = %v", err)
 	}
+	analysisAgent, analysisRuntime := repositoryScanExternalRuntimeFixtures(scan.Spec.AnalysisAgentRef.Name, []string{"read_evidence"})
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
-		WithObjects(scan, sourceTask).
+		WithObjects(scan, sourceTask, analysisAgent, analysisRuntime).
 		Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore, ResultStore: securityStore}
 
@@ -670,6 +731,7 @@ func TestIngestReviewTaskCreatesOneControllerRebuiltRetry(t *testing.T) {
 	if retryTask.Spec.AgentRef == nil || retryTask.Spec.AgentRef.Name != fixture.scan.Spec.AnalysisAgentRef.Name {
 		t.Fatalf("retry AgentRef = %#v, want controller-rebuilt %q", retryTask.Spec.AgentRef, fixture.scan.Spec.AnalysisAgentRef.Name)
 	}
+	requireExplicitTaskAllowedTools(t, retryTask, []string{"read_evidence"})
 	if strings.Contains(retryTask.Spec.Prompt, "POISON SOURCE PROMPT") ||
 		!strings.Contains(retryTask.Spec.Prompt, "Trusted mapper review context for slice_api") ||
 		!strings.Contains(retryTask.Spec.Prompt, "only automatic result retry") {
@@ -1349,8 +1411,11 @@ func TestRepositoryScanCustomPolicyIncludedInReviewPrompt(t *testing.T) {
 			"fp":   "Suppress intentionally public demo endpoint noise.",
 		},
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, policyConfig).Build()
-	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: store}
+	analysisAgent, cachedRuntime, apiReader := repositoryScanExternalRuntimePolicySkew(
+		scheme, scan.Spec.AnalysisAgentRef.Name, []string{"read_evidence", "search_findings"},
+	)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, policyConfig, analysisAgent, cachedRuntime).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, APIReader: apiReader, Scheme: scheme, SecurityStore: store}
 	run := &storepkg.ScanRun{ID: "scan_policy", Namespace: defaultNS, RepositoryScan: "kaset", Mode: "initial", Phase: scanRunPhaseRunning}
 	reviewSlice := storepkg.ReviewSlice{ID: "slice_api", RepositoryScan: "kaset", Source: "deterministic", Title: "API", Kind: "package", Status: reviewSliceStatusPending}
 	manifest := bindReviewSliceContext(t, &reviewSlice)
@@ -1364,6 +1429,7 @@ func TestRepositoryScanCustomPolicyIncludedInReviewPrompt(t *testing.T) {
 	if len(tasks.Items) != 1 {
 		t.Fatalf("len(tasks) = %d, want 1", len(tasks.Items))
 	}
+	requireExplicitTaskAllowedTools(t, &tasks.Items[0], []string{"read_evidence", "search_findings"})
 	prompt := tasks.Items[0].Spec.Prompt
 	for _, want := range []string{"Focus on operator RBAC drift", "public demo endpoint", "Default Orka security policy"} {
 		if !strings.Contains(prompt, want) {
@@ -1476,8 +1542,11 @@ func TestRepositoryScanIdempotencyMarksOrphanedRunFailedAndStartsReplacement(t *
 	if err := store.CreateScanRun(ctx, &storepkg.ScanRun{ID: "scan_orphaned", Namespace: defaultNS, RepositoryScan: "kaset", TaskName: "missing", Mode: scanModeIncremental, Phase: scanRunPhaseRunning, IdempotencyKey: key, PolicyDigest: policyDigest, StartedAt: time.Now().Add(-2 * scanRunAdmissionGrace)}); err != nil {
 		t.Fatalf("CreateScanRun() error = %v", err)
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(scan).Build()
-	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: store}
+	analysisAgent, cachedRuntime, apiReader := repositoryScanExternalRuntimePolicySkew(
+		scheme, scan.Spec.AnalysisAgentRef.Name, []string{"read_evidence"},
+	)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(scan, analysisAgent, cachedRuntime).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, APIReader: apiReader, Scheme: scheme, SecurityStore: store}
 	if err := reconciler.createScanRun(ctx, scan, scanModeIncremental, "base", ""); err != nil {
 		t.Fatalf("createScanRun() error = %v", err)
 	}
@@ -1495,6 +1564,7 @@ func TestRepositoryScanIdempotencyMarksOrphanedRunFailedAndStartsReplacement(t *
 	if len(tasks.Items) != 1 || taskSecurityStage(&tasks.Items[0]) != security.StageThreatModel {
 		t.Fatalf("tasks = %#v, want replacement threat-model task", tasks.Items)
 	}
+	requireExplicitTaskAllowedTools(t, &tasks.Items[0], []string{"read_evidence"})
 }
 
 func TestCreateScanRunConcurrentReconcilesCreateOnePipeline(t *testing.T) {
@@ -1512,7 +1582,8 @@ func TestCreateScanRunConcurrentReconcilesCreateOnePipeline(t *testing.T) {
 			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "scan-reviewer"},
 		},
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(scan).Build()
+	analysisAgent := repositoryScanTestAgent(scan.Spec.AnalysisAgentRef.Name)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.RepositoryScan{}).WithObjects(scan, analysisAgent).Build()
 	reconciler := &RepositoryScanReconciler{Client: cl, Scheme: scheme, SecurityStore: securityStore}
 
 	start := make(chan struct{})
@@ -1569,10 +1640,11 @@ func TestProgressLatestScanRunStartsReviewTasksForPendingSlices(t *testing.T) {
 	}
 	threatTask := newSucceededSecurityTask("kaset-initial-threat", "scan_review", security.StageThreatModel, metav1.Now())
 	mapperTask := newSucceededSecurityTask("kaset-initial-mapper", "scan_review", security.StageMapper, metav1.Now())
+	analysisAgent := repositoryScanTestAgent(scan.Spec.AnalysisAgentRef.Name)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
-		WithObjects(scan, threatTask, mapperTask).
+		WithObjects(scan, threatTask, mapperTask, analysisAgent).
 		Build()
 	reconciler := &RepositoryScanReconciler{
 		Client:        cl,
@@ -1750,10 +1822,11 @@ func TestProgressLatestScanRunRetriesPendingSlicesWithoutTasks(t *testing.T) {
 	mapperTask := newSucceededSecurityTask("kaset-partial-mapper", "scan_partial_review", security.StageMapper, metav1.Now())
 	reviewTask := newSucceededSecurityTask("kaset-review-slice-api", "scan_partial_review", security.StageReview, metav1.Now())
 	reviewTask.Labels[labels.LabelSecuritySliceID] = sliceAPI
+	analysisAgent := repositoryScanTestAgent(scan.Spec.AnalysisAgentRef.Name)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
-		WithObjects(scan, threatTask, mapperTask, reviewTask).
+		WithObjects(scan, threatTask, mapperTask, reviewTask, analysisAgent).
 		Build()
 	reconciler := &RepositoryScanReconciler{
 		Client:        cl,
@@ -2992,7 +3065,7 @@ func TestCreateScanRunIsIdempotentWhenTaskAlreadyExists(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
-		WithObjects(scan, existingTask).
+		WithObjects(scan, existingTask, repositoryScanTestAgent(scan.Spec.AnalysisAgentRef.Name)).
 		Build()
 
 	reconciler := &RepositoryScanReconciler{
@@ -4094,6 +4167,51 @@ func TestRepositoryScanPolicyDigestDriftFailsValidationTaskCreationWithoutRequeu
 	}
 	if len(tasks.Items) != 0 {
 		t.Fatalf("validation tasks = %d, want none on policy drift", len(tasks.Items))
+	}
+}
+
+func TestRepositoryScanValidationTaskMaterializesRuntimeRefAllowedTools(t *testing.T) {
+	ctx := context.Background()
+	securityStore := setupControllerSQLiteStore(t)
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	scan := &corev1alpha1.RepositoryScan{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RepositoryScan"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "validation-runtime", Namespace: defaultNS, UID: types.UID("validation-runtime-uid"),
+		},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: "https://github.com/example/repo", AnalysisAgentRef: corev1alpha1.AgentReference{Name: "scan-reviewer"},
+		},
+	}
+	analysisAgent, cachedRuntime, apiReader := repositoryScanExternalRuntimePolicySkew(
+		scheme, scan.Spec.AnalysisAgentRef.Name, []string{},
+	)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, analysisAgent, cachedRuntime).Build()
+	reconciler := &RepositoryScanReconciler{Client: cl, APIReader: apiReader, Scheme: scheme, SecurityStore: securityStore}
+	finding := &storepkg.Finding{
+		ID: "finding-runtime", Namespace: defaultNS, RepositoryScan: scan.Name, Severity: "high", Confidence: "high",
+	}
+
+	if err := reconciler.createValidationTask(ctx, scan, finding); err != nil {
+		t.Fatalf("createValidationTask() error = %v", err)
+	}
+	var tasks corev1alpha1.TaskList
+	if err := cl.List(ctx, &tasks, client.InNamespace(defaultNS)); err != nil {
+		t.Fatalf("List(Task) error = %v", err)
+	}
+	if len(tasks.Items) != 1 {
+		t.Fatalf("validation tasks = %d, want 1", len(tasks.Items))
+	}
+	requireExplicitTaskAllowedTools(t, &tasks.Items[0], []string{})
+	storedFinding, err := securityStore.GetFinding(ctx, defaultNS, finding.ID)
+	if err != nil {
+		t.Fatalf("GetFinding() error = %v", err)
+	}
+	if storedFinding.ValidationStatus != findingValidationStatusPending {
+		t.Fatalf("validation status = %q, want %q", storedFinding.ValidationStatus, findingValidationStatusPending)
 	}
 }
 

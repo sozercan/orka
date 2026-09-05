@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,18 +18,29 @@ import (
 )
 
 type Config struct {
-	ControllerBearerToken           string
-	OperationCapabilitySecret       []byte
-	RuntimeInstanceID               harnessv2.RuntimeInstanceID
-	SupervisorBootID                harnessv2.SupervisorBootID
-	RuntimePoolUID                  harnessv2.RuntimePoolUID
-	Profile                         harnessv2.RuntimeProfile
-	Limits                          harnessv2.ProtocolLimits
-	SupportsDrain                   bool
-	SupportsPublicationFinalization bool
-	WorkspaceGovernance             conformance.WorkspaceGovernanceClaims
-	AllowUnauthenticatedStatus      bool
-	DisconnectPromptAfterAccepted   bool
+	ListenAddress                     string
+	ControllerBearerToken             string
+	OperationCapabilitySecret         []byte
+	ControllerEpoch                   uint64
+	RuntimeInstanceID                 harnessv2.RuntimeInstanceID
+	SupervisorBootID                  harnessv2.SupervisorBootID
+	RuntimePoolUID                    harnessv2.RuntimePoolUID
+	Profile                           harnessv2.RuntimeProfile
+	ProviderKinds                     []string
+	Models                            []string
+	Limits                            harnessv2.ProtocolLimits
+	SupportsDrain                     bool
+	SupportsPublicationFinalization   bool
+	SupportsAgentSessionConfiguration bool
+	SupportsPermissions               *bool
+	WorkspaceGovernance               conformance.WorkspaceGovernanceClaims
+	AllowUnauthenticatedStatus        bool
+	OmitStatusControllerEpoch         bool
+	DisconnectPromptAfterAccepted     bool
+	CompleteNonConformancePrompts     bool
+	PromptResultText                  string
+	CompletePromptBeforeReplay        bool
+	CompletePromptBeforeConflict      bool
 
 	// These test-only faults prove that the conformance cycle rejects runtimes
 	// which advertise duplicate-safe mutations without honoring replay semantics.
@@ -68,12 +80,14 @@ type Server struct {
 
 	mu                    sync.Mutex
 	fence                 harnessv2.Fence
+	drain                 harnessv2.DrainStatus
 	operations            map[harnessv2.OperationID]harnessv2.OperationRecord
 	sessions              map[harnessv2.RuntimeSessionID]sessionState
 	prompts               map[harnessv2.PromptID]*promptState
 	workspaceResponses    map[harnessv2.OperationID]harnessv2.CreateWorkspaceDeltaResponse
 	finalizationResponses map[harnessv2.OperationID]harnessv2.FinalizeRuntimeSessionPublicationResponse
 	deleteResponses       map[harnessv2.OperationID]harnessv2.DeleteRuntimeSessionResponse
+	drainResponses        map[harnessv2.OperationID]harnessv2.DrainResponse
 }
 
 type sessionState struct {
@@ -84,13 +98,15 @@ type sessionState struct {
 }
 
 type promptState struct {
-	request    harnessv2.StartPromptRequest
-	acceptedAt time.Time
-	cancelled  chan struct{}
-	settled    chan struct{}
-	cancelOnce sync.Once
-	settleOnce sync.Once
-	settlement *harnessv2.PromptSettlement
+	request      harnessv2.StartPromptRequest
+	acceptedAt   time.Time
+	cancelled    chan struct{}
+	complete     chan struct{}
+	settled      chan struct{}
+	cancelOnce   sync.Once
+	completeOnce sync.Once
+	settleOnce   sync.Once
+	settlement   *harnessv2.PromptSettlement
 }
 
 func NewServer(config Config) (*Server, error) {
@@ -99,6 +115,9 @@ func NewServer(config Config) (*Server, error) {
 	}
 	if len(config.OperationCapabilitySecret) == 0 {
 		config.OperationCapabilitySecret = []byte("capability-secret-0123456789abcdef")
+	}
+	if config.ControllerEpoch == 0 {
+		config.ControllerEpoch = 1
 	}
 	if config.RuntimeInstanceID == "" {
 		config.RuntimeInstanceID = "runtime-instance-1"
@@ -124,18 +143,20 @@ func NewServer(config Config) (*Server, error) {
 		fence: harnessv2.Fence{
 			RuntimeInstanceID:          config.RuntimeInstanceID,
 			SupervisorBootID:           config.SupervisorBootID,
-			ControllerEpoch:            1,
+			ControllerEpoch:            config.ControllerEpoch,
 			RuntimePoolUID:             config.RuntimePoolUID,
 			RuntimePoolGeneration:      1,
 			RuntimeProfileDigest:       profileDigest,
 			ProfileDigestSchemaVersion: harnessv2.ProfileDigestSchemaVersion,
 		},
+		drain:                 harnessv2.DrainStatus{AcceptingNewSessions: true},
 		operations:            map[harnessv2.OperationID]harnessv2.OperationRecord{},
 		sessions:              map[harnessv2.RuntimeSessionID]sessionState{},
 		prompts:               map[harnessv2.PromptID]*promptState{},
 		workspaceResponses:    map[harnessv2.OperationID]harnessv2.CreateWorkspaceDeltaResponse{},
 		finalizationResponses: map[harnessv2.OperationID]harnessv2.FinalizeRuntimeSessionPublicationResponse{},
 		deleteResponses:       map[harnessv2.OperationID]harnessv2.DeleteRuntimeSessionResponse{},
+		drainResponses:        map[harnessv2.OperationID]harnessv2.DrainResponse{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+harnessv2.HealthPath, s.handleHealth)
@@ -147,7 +168,20 @@ func NewServer(config Config) (*Server, error) {
 	mux.HandleFunc("PUT /v2/runtime-sessions/{sessionID}/workspace-deltas/{deltaID}", s.handleWorkspaceDelta)
 	mux.HandleFunc("PUT /v2/runtime-sessions/{sessionID}/publication-finalization", s.handlePublicationFinalization)
 	mux.HandleFunc("DELETE /v2/runtime-sessions/{sessionID}", s.handleDeleteSession)
-	s.server = httptest.NewServer(mux)
+	if config.SupportsDrain {
+		mux.HandleFunc("PUT "+harnessv2.DrainPath, s.handleDrain)
+	}
+	server := httptest.NewUnstartedServer(mux)
+	if address := strings.TrimSpace(config.ListenAddress); address != "" {
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			return nil, fmt.Errorf("listen on %q: %w", address, err)
+		}
+		_ = server.Listener.Close()
+		server.Listener = listener
+	}
+	server.Start()
+	s.server = server
 	return s, nil
 }
 
@@ -192,6 +226,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	fence := s.Fence()
+	providerKinds := s.config.ProviderKinds
+	if providerKinds == nil {
+		providerKinds = []string{s.config.Profile.ProviderKind}
+	}
+	models := s.config.Models
+	if models == nil {
+		models = []string{s.config.Profile.Model}
+	}
+	supportsPermissions := true
+	if s.config.SupportsPermissions != nil {
+		supportsPermissions = *s.config.SupportsPermissions
+	}
 	writeJSON(w, http.StatusOK, conformance.CapabilitiesResponse{
 		CapabilitiesResponse: harnessv2.CapabilitiesResponse{
 			Protocol:                   harnessv2.ProtocolVersion,
@@ -202,15 +248,16 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 			AdapterDigests:             s.config.Profile.AdapterDigests,
 			Limits:                     s.config.Limits,
 			Provider: harnessv2.ProviderCapabilities{
-				ProviderKinds:       []string{s.config.Profile.ProviderKind},
-				Models:              []string{s.config.Profile.Model},
-				SupportsPermissions: true,
+				ProviderKinds:       providerKinds,
+				Models:              models,
+				SupportsPermissions: supportsPermissions,
 				SupportsCancel:      true,
 				SupportsTools:       true,
 			},
-			WorkspaceGovernance:             s.config.WorkspaceGovernance,
-			SupportsDrain:                   s.config.SupportsDrain,
-			SupportsPublicationFinalization: s.config.SupportsPublicationFinalization,
+			WorkspaceGovernance:               s.config.WorkspaceGovernance,
+			SupportsDrain:                     s.config.SupportsDrain,
+			SupportsPublicationFinalization:   s.config.SupportsPublicationFinalization,
+			SupportsAgentSessionConfiguration: s.config.SupportsAgentSessionConfiguration,
 		},
 	})
 }
@@ -231,17 +278,84 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.mu.Lock()
+	fence := s.fence
+	drain := s.drain
+	s.mu.Unlock()
+	if s.config.OmitStatusControllerEpoch {
+		fence.ControllerEpoch = 0
+	}
+	lifecycle := harnessv2.SupervisorLifecycleReady
+	if drain.Requested {
+		lifecycle = harnessv2.SupervisorLifecycleDraining
+	}
 	writeJSON(w, http.StatusOK, harnessv2.StatusResponse{
 		Protocol:           harnessv2.ProtocolVersion,
-		Fence:              s.Fence(),
-		Lifecycle:          harnessv2.SupervisorLifecycleReady,
-		Drain:              harnessv2.DrainStatus{AcceptingNewSessions: true},
+		Fence:              fence,
+		Lifecycle:          lifecycle,
+		Drain:              drain,
 		Sessions:           []harnessv2.RuntimeSessionStatus{},
 		ActivePrompts:      []harnessv2.ActivePromptStatus{},
 		PendingPermissions: []harnessv2.PendingPermissionStatus{},
 		Pressure:           harnessv2.PressureMetadata{},
 		Timestamp:          time.Now().UTC(),
 	})
+}
+
+func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeMutationHeaders(w, r) {
+		return
+	}
+	var request harnessv2.DrainRequest
+	if !decodeJSON(w, r, &request) || !s.verifyPoolCapability(w, r, request.Metadata) {
+		return
+	}
+	now := time.Now().UTC()
+	if err := request.ValidateAt(now); err != nil {
+		writeError(w, http.StatusBadRequest, harnessv2.ErrorCodeInvalidRequest, err.Error(), nil)
+		return
+	}
+
+	s.mu.Lock()
+	existing := operationPtr(s.operations, request.Metadata.OperationID)
+	classification, err := s.classifyPoolOperation(s.fence, request.Metadata, existing, now)
+	if err != nil {
+		s.mu.Unlock()
+		writeError(w, http.StatusBadRequest, harnessv2.ErrorCodeInvalidRequest, err.Error(), nil)
+		return
+	}
+	if existing != nil {
+		response, ok := s.drainResponses[request.Metadata.OperationID]
+		s.mu.Unlock()
+		if classification.Class == harnessv2.RequestClassificationDuplicate && ok {
+			response.Classification = classification
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+		writeClassificationError(w, classification)
+		return
+	}
+	if classification.Class != harnessv2.RequestClassificationFresh {
+		s.mu.Unlock()
+		writeClassificationError(w, classification)
+		return
+	}
+	drain := harnessv2.DrainStatus{
+		AcceptingNewSessions: false,
+		Requested:            true,
+		RequestedAt:          now,
+		Reason:               request.Reason,
+	}
+	response := harnessv2.DrainResponse{
+		Protocol:       harnessv2.ProtocolVersion,
+		Classification: classification,
+		Drain:          drain,
+	}
+	s.operations[request.Metadata.OperationID] = operationRecord(request.Metadata, harnessv2.OperationPhaseApplied, "", now)
+	s.drainResponses[request.Metadata.OperationID] = response
+	s.drain = drain
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -344,6 +458,22 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	expected.RuntimeSessionUID = request.Metadata.Fence.RuntimeSessionUID
 	expected.RuntimeSessionGeneration = request.Metadata.Fence.RuntimeSessionGeneration
 	existing := operationPtr(s.operations, request.Metadata.OperationID)
+	if existing != nil && existing.Phase == harnessv2.OperationPhaseAccepted {
+		state := s.prompts[request.Metadata.PromptID]
+		duplicate := existing.RequestDigest == request.Metadata.RequestDigest
+		if state != nil && state.request.Input.Metadata["orka.conformance"] == "cancel-after-accept" &&
+			((duplicate && s.config.CompletePromptBeforeReplay) || (!duplicate && s.config.CompletePromptBeforeConflict)) {
+			state.completeOnce.Do(func() { close(state.complete) })
+			s.mu.Unlock()
+			select {
+			case <-state.settled:
+			case <-r.Context().Done():
+				return
+			}
+			s.mu.Lock()
+			existing = operationPtr(s.operations, request.Metadata.OperationID)
+		}
+	}
 	classification, err := s.classifyOperation(expected, request.Metadata, existing, now)
 	if err != nil {
 		s.mu.Unlock()
@@ -381,7 +511,7 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	state := &promptState{
 		request: request, acceptedAt: now,
-		cancelled: make(chan struct{}), settled: make(chan struct{}),
+		cancelled: make(chan struct{}), complete: make(chan struct{}), settled: make(chan struct{}),
 	}
 	s.prompts[request.Metadata.PromptID] = state
 	s.operations[request.Metadata.OperationID] = operationRecord(request.Metadata, harnessv2.OperationPhaseAccepted, "", now)
@@ -413,11 +543,52 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	if s.config.DisconnectPromptAfterAccepted {
 		return
 	}
-	select {
-	case <-state.cancelled:
-	case <-r.Context().Done():
-		return
-	case <-time.After(20 * time.Second):
+	complete := request.Input.Metadata["orka.conformance"] == "complete-for-workspace" ||
+		(s.config.CompleteNonConformancePrompts && request.Input.Metadata["orka.conformance"] != "cancel-after-accept")
+	if !complete {
+		select {
+		case <-state.complete:
+			complete = true
+		case <-state.cancelled:
+		case <-r.Context().Done():
+			return
+		case <-time.After(20 * time.Second):
+			return
+		}
+	}
+	if complete {
+		settledAt := time.Now().UTC()
+		resultText := strings.TrimSpace(s.config.PromptResultText)
+		if resultText == "" {
+			resultText = "deterministic external runtime result"
+		}
+		settlement := harnessv2.PromptSettlement{
+			TerminalEvent: harnessv2.EventCompleted,
+			Outcome:       harnessv2.PromptOutcomeSucceeded,
+			StopReason:    harnessv2.ACPStopReasonEndTurn,
+			SettledAt:     settledAt,
+		}
+		s.mu.Lock()
+		state.settlement = &settlement
+		s.operations[request.Metadata.OperationID] = operationRecord(request.Metadata, harnessv2.OperationPhaseSettled, settlement.TerminalEvent, settledAt)
+		s.mu.Unlock()
+		_ = encoder.Encode(harnessv2.Event{
+			Protocol: harnessv2.ProtocolVersion,
+			Type:     harnessv2.EventCompleted,
+			Identity: eventIdentity(request.Metadata, 2, settledAt),
+			Completed: &harnessv2.CompletedEvent{
+				StopReason: harnessv2.ACPStopReasonEndTurn,
+				Result: harnessv2.PromptResult{
+					Content: []harnessv2.ContentBlock{{Type: harnessv2.ContentBlockText, Text: resultText}},
+					Model:   s.config.Profile.Model,
+				},
+			},
+		})
+		_ = encoder.Close()
+		if flusher != nil {
+			flusher.Flush()
+		}
+		state.settleOnce.Do(func() { close(state.settled) })
 		return
 	}
 	settledAt := time.Now().UTC()
@@ -573,6 +744,18 @@ func (s *Server) handleWorkspaceDelta(w http.ResponseWriter, r *http.Request) {
 	if classification.Class != harnessv2.RequestClassificationFresh {
 		s.mu.Unlock()
 		writeClassificationError(w, classification)
+		return
+	}
+	prompt := s.prompts[request.Metadata.PromptID]
+	if prompt == nil || prompt.settlement == nil || prompt.settlement.TerminalEvent != harnessv2.EventCompleted {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace validation requires a successfully completed prompt", nil)
+		return
+	}
+	settlementDigest, err := harnessv2.CanonicalPromptSettlementDigest(*prompt.settlement)
+	if err != nil || request.PromptSettlementDigest != settlementDigest {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, harnessv2.ErrorCodeDigestConflict, "prompt settlement digest does not match", nil)
 		return
 	}
 	s.workspaceDeltas.Add(1)
@@ -782,7 +965,14 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, harnessv2.ErrorCodeInvalidRequest, "runtime session not found", nil)
 		return
 	}
-	if s.config.SupportsPublicationFinalization && s.config.Profile.WorkspaceIntent == harnessv2.WorkspaceIntentWrite &&
+	publicationPrepared := false
+	for _, delta := range state.deltas {
+		if delta.State == harnessv2.WorkspaceDeltaPrepared {
+			publicationPrepared = true
+			break
+		}
+	}
+	if publicationPrepared &&
 		(state.descriptor.State != harnessv2.RuntimeSessionStateFinalizing || state.finalization == nil) {
 		s.mu.Unlock()
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "write session publication is not finalized", nil)
@@ -817,7 +1007,26 @@ func (s *Server) classifyOperation(
 	existing *harnessv2.OperationRecord,
 	now time.Time,
 ) (harnessv2.Classification, error) {
-	classification, err := harnessv2.ClassifyOperation(expected, incoming, existing, true, now)
+	return s.classifyOperationForScope(expected, incoming, existing, true, now)
+}
+
+func (s *Server) classifyPoolOperation(
+	expected harnessv2.Fence,
+	incoming harnessv2.MutationMetadata,
+	existing *harnessv2.OperationRecord,
+	now time.Time,
+) (harnessv2.Classification, error) {
+	return s.classifyOperationForScope(expected, incoming, existing, false, now)
+}
+
+func (s *Server) classifyOperationForScope(
+	expected harnessv2.Fence,
+	incoming harnessv2.MutationMetadata,
+	existing *harnessv2.OperationRecord,
+	requireSession bool,
+	now time.Time,
+) (harnessv2.Classification, error) {
+	classification, err := harnessv2.ClassifyOperation(expected, incoming, existing, requireSession, now)
 	if err != nil {
 		return harnessv2.Classification{}, err
 	}
@@ -859,6 +1068,14 @@ func (s *Server) authorizeMutationHeaders(w http.ResponseWriter, r *http.Request
 
 func (s *Server) verifyCapability(w http.ResponseWriter, r *http.Request, metadata harnessv2.MutationMetadata) bool {
 	if err := harnessv2.VerifyOperationCapability(s.config.OperationCapabilitySecret, r.Header.Get(harnessv2.OperationCapabilityHeader), metadata, true, time.Now().UTC()); err != nil {
+		writeError(w, http.StatusForbidden, harnessv2.ErrorCodeForbidden, "invalid operation capability", nil)
+		return false
+	}
+	return true
+}
+
+func (s *Server) verifyPoolCapability(w http.ResponseWriter, r *http.Request, metadata harnessv2.MutationMetadata) bool {
+	if err := harnessv2.VerifyOperationCapability(s.config.OperationCapabilitySecret, r.Header.Get(harnessv2.OperationCapabilityHeader), metadata, false, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusForbidden, harnessv2.ErrorCodeForbidden, "invalid operation capability", nil)
 		return false
 	}

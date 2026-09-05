@@ -43,6 +43,65 @@ func TestClientPromptNDJSONStreamCompletesWithoutReconnect(t *testing.T) {
 	}
 }
 
+func TestClientStartPromptPreMutationFailureReportsZeroWriteEvidence(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	request := clientTestStartPromptRequest(t, now, "preflight-zero-write-op")
+	transportCalled := false
+	client := clientTestClient(t, "http://runtime.invalid",
+		WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			transportCalled = true
+			return nil, errors.New("prompt transport must not be called")
+		})}),
+		WithBeforeMutation(func(context.Context, string) error {
+			return errors.New("external runtime capabilities unavailable")
+		}),
+	)
+
+	_, err := client.StartPrompt(context.Background(), "runtime-session-1", request)
+	var clientErr *ClientError
+	if !errors.As(err, &clientErr) || !errors.Is(err, ErrClientValidation) {
+		t.Fatalf("StartPrompt() error = %v, want validation *ClientError", err)
+	}
+	if clientErr.WriteEvidence.State != RequestWriteZeroBytes || !clientErr.WriteEvidence.SafeToResendSameIdentity() {
+		t.Fatalf("write evidence = %#v, want zero bytes written", clientErr.WriteEvidence)
+	}
+	if transportCalled {
+		t.Fatal("prompt transport was called after pre-mutation validation failed")
+	}
+}
+
+func TestClientStreamPromptPreservesPreMutationWriteEvidence(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	request := clientTestStartPromptRequest(t, now, "stream-preflight-zero-write-op")
+	emitCalled := false
+	client := clientTestClient(t, "http://runtime.invalid",
+		WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("prompt transport must not be called")
+		})}),
+		WithBeforeMutation(func(context.Context, string) error {
+			return errors.New("external runtime status unavailable")
+		}),
+	)
+
+	summary, err := client.StreamPrompt(context.Background(), "runtime-session-1", request, func(Event) error {
+		emitCalled = true
+		return nil
+	})
+	var clientErr *ClientError
+	if !errors.As(err, &clientErr) {
+		t.Fatalf("StreamPrompt() error = %v, want *ClientError", err)
+	}
+	if clientErr.WriteEvidence.State != RequestWriteZeroBytes {
+		t.Fatalf("error write evidence = %#v, want zero bytes written", clientErr.WriteEvidence)
+	}
+	if summary.WriteEvidence.State != RequestWriteZeroBytes || !summary.WriteEvidence.SafeToResendSameIdentity() {
+		t.Fatalf("summary write evidence = %#v, want zero bytes written", summary.WriteEvidence)
+	}
+	if emitCalled {
+		t.Fatal("StreamPrompt() called emit after pre-mutation validation failed")
+	}
+}
+
 func TestClientRejectsMalformedAndOversizedPromptStreams(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	request := clientTestStartPromptRequest(t, now, "hostile-stream-op")

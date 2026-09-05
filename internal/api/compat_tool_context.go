@@ -49,6 +49,7 @@ var anthropicCompatProxyToolContextProfile = compatProxyToolContextProfile{
 
 type compatProxyToolContextConfig struct {
 	Client                    client.Client
+	AuthorizationReader       client.Reader
 	KubeClient                kubernetes.Interface
 	Namespace                 string
 	Provider                  ProviderResolutionInfo
@@ -64,8 +65,13 @@ type compatProxyToolContextConfig struct {
 
 func newCompatProxyToolContext(cfg compatProxyToolContextConfig) *tools.ToolContext {
 	tasksCreated := 0
+	authorizationReader := cfg.AuthorizationReader
+	if authorizationReader == nil {
+		authorizationReader = cfg.Client
+	}
 	toolCtx := &tools.ToolContext{
 		Client:                    cfg.Client,
+		PolicyReader:              authorizationReader,
 		KubeClient:                cfg.KubeClient,
 		Namespace:                 cfg.Namespace,
 		Tenant:                    cfg.Namespace,
@@ -87,7 +93,7 @@ func newCompatProxyToolContext(cfg compatProxyToolContextConfig) *tools.ToolCont
 	if cfg.Profile.TaskCreateAction != "" {
 		toolCtx.AuthorizeTaskCreate = func(ctx context.Context, task *corev1alpha1.Task) *tools.ChatToolError {
 			authorize := func(ctx context.Context, task *corev1alpha1.Task) error {
-				return authorizeAndStampToolTaskCreate(ctx, cfg.Client, cfg.KubeClient, cfg.AuthContext, cfg.AuthorizationConfig, cfg.Profile.TaskCreateAction, cfg.UserInfo, task)
+				return authorizeAndStampToolTaskCreate(ctx, authorizationReader, cfg.KubeClient, cfg.AuthContext, cfg.AuthorizationConfig, cfg.Profile.TaskCreateAction, cfg.UserInfo, task)
 			}
 			return chatToolAuthorizationError(authorize, ctx, task, "Use a task configuration authorized by the context token")
 		}
@@ -95,7 +101,7 @@ func newCompatProxyToolContext(cfg compatProxyToolContextConfig) *tools.ToolCont
 	if cfg.Profile.TaskDeleteAction != "" {
 		toolCtx.AuthorizeTaskDelete = func(ctx context.Context, task *corev1alpha1.Task) *tools.ChatToolError {
 			authorize := func(ctx context.Context, task *corev1alpha1.Task) error {
-				return authorizeContextTokenTaskDeleteObject(ctx, cfg.Client, cfg.AuthContext, cfg.AuthorizationConfig, cfg.Profile.TaskDeleteAction, task)
+				return authorizeContextTokenTaskDeleteObject(ctx, authorizationReader, cfg.AuthContext, cfg.AuthorizationConfig, cfg.Profile.TaskDeleteAction, task)
 			}
 			return chatToolAuthorizationError(authorize, ctx, task, "Use a task authorized by the context token")
 		}
@@ -103,7 +109,7 @@ func newCompatProxyToolContext(cfg compatProxyToolContextConfig) *tools.ToolCont
 	if cfg.Profile.AgentCreateAction != "" {
 		toolCtx.AuthorizeAgentCreate = func(ctx context.Context, agent *corev1alpha1.Agent) *tools.ChatToolError {
 			authorize := func(ctx context.Context, agent *corev1alpha1.Agent) error {
-				return authorizeContextTokenToolAgentCreate(ctx, cfg.Client, cfg.AuthContext, cfg.AuthorizationConfig, cfg.Profile.AgentCreateAction, agent)
+				return authorizeContextTokenToolAgentCreate(ctx, authorizationReader, cfg.AuthContext, cfg.AuthorizationConfig, cfg.Profile.AgentCreateAction, agent)
 			}
 			return chatToolAuthorizationError(authorize, ctx, agent, "Use an agent configuration authorized by the context token")
 		}
@@ -111,7 +117,7 @@ func newCompatProxyToolContext(cfg compatProxyToolContextConfig) *tools.ToolCont
 	if cfg.Profile.AgentUpdateAction != "" {
 		toolCtx.AuthorizeAgentUpdate = func(ctx context.Context, agent *corev1alpha1.Agent) *tools.ChatToolError {
 			authorize := func(ctx context.Context, agent *corev1alpha1.Agent) error {
-				return authorizeContextTokenToolAgentUpdate(ctx, cfg.Client, cfg.AuthContext, cfg.AuthorizationConfig, cfg.Profile.AgentUpdateAction, agent)
+				return authorizeContextTokenToolAgentUpdate(ctx, authorizationReader, cfg.AuthContext, cfg.AuthorizationConfig, cfg.Profile.AgentUpdateAction, agent)
 			}
 			return chatToolAuthorizationError(authorize, ctx, agent, "Use an agent update authorized by the context token")
 		}

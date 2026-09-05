@@ -71,6 +71,31 @@ func newFakeClientWithTools(tools []*corev1alpha1.Tool) client.Client {
 	return newFakeClient(objs...)
 }
 
+func externalRuntimePolicyFixtures(allowedTools []string) (*corev1alpha1.Agent, *corev1alpha1.AgentRuntime) {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	return &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-agent", Namespace: defaultNamespace},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-runtime"},
+		}},
+	}, &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-runtime", Namespace: defaultNamespace},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "codex", Model: "gpt-5.6", WorkspaceIntent: corev1alpha1.WorkspaceIntentRead,
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          append([]string{}, allowedTools...),
+					DisallowedTools:       []string{},
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+}
+
 func githubRepoTaskWithSecret(repoURL string) (*corev1alpha1.Task, *corev1.Secret) {
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: testCoderTaskName, Namespace: defaultNamespace},

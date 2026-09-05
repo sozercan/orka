@@ -31,6 +31,7 @@ import (
 
 	gatewayv1alpha1 "github.com/orka-agents/orka/api/gateway/v1alpha1"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/agentruntimepolicy"
 	"github.com/orka-agents/orka/internal/events"
 	gatewayruntime "github.com/orka-agents/orka/internal/gateway"
 	gatewayconformance "github.com/orka-agents/orka/internal/gateway/conformance"
@@ -284,6 +285,7 @@ type GatewayBindingReconciler struct {
 // +kubebuilder:rbac:groups=gateway.orka.ai,resources=gatewaybindings/finalizers,verbs=update
 // +kubebuilder:rbac:groups=gateway.orka.ai,resources=gateways,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core.orka.ai,resources=agents,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core.orka.ai,resources=agentruntimes,verbs=get;list;watch
 
 // Reconcile validates one semantic GatewayBinding.
 func (r *GatewayBindingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -322,7 +324,13 @@ func (r *GatewayBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				resolved = true
 				copy := gatewayObject.Status.ObservedCapabilities.Capabilities
 				capabilities = &copy
-				if err := validateBindingCapabilities(object, copy); err != nil {
+				runtimeMessage, err := r.validateBindingAgentRuntimeDefaults(ctx, object, agent)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if runtimeMessage != "" {
+					message = runtimeMessage
+				} else if err := validateBindingCapabilities(object, copy); err != nil {
 					message = err.Error()
 				} else if conflict, err := r.findAmbiguousGatewayBinding(ctx, object, copy); err != nil {
 					return ctrl.Result{}, err
@@ -365,6 +373,7 @@ func (r *GatewayBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Watches(&gatewayv1alpha1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.bindingsForGateway)).
 		Watches(&corev1alpha1.Agent{}, handler.EnqueueRequestsFromMapFunc(r.bindingsForAgent)).
+		Watches(&corev1alpha1.AgentRuntime{}, handler.EnqueueRequestsFromMapFunc(r.bindingsForAgentRuntime)).
 		Named("gatewaybinding").
 		Complete(r)
 }
@@ -392,14 +401,40 @@ func (r *GatewayBindingReconciler) bindingsForAgent(ctx context.Context, object 
 	if !ok {
 		return nil
 	}
+	return r.bindingsForAgentNames(ctx, agent.Namespace, map[string]struct{}{agent.Name: {}})
+}
+
+func (r *GatewayBindingReconciler) bindingsForAgentRuntime(ctx context.Context, object client.Object) []reconcile.Request {
+	runtimeObject, ok := object.(*corev1alpha1.AgentRuntime)
+	if !ok {
+		return nil
+	}
+	agents := &corev1alpha1.AgentList{}
+	if err := r.List(ctx, agents, client.InNamespace(runtimeObject.Namespace)); err != nil {
+		return nil
+	}
+	names := make(map[string]struct{})
+	for i := range agents.Items {
+		agent := &agents.Items[i]
+		if agent.Spec.Runtime != nil && agent.Spec.Runtime.RuntimeRef != nil && strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name) == runtimeObject.Name {
+			names[agent.Name] = struct{}{}
+		}
+	}
+	return r.bindingsForAgentNames(ctx, runtimeObject.Namespace, names)
+}
+
+func (r *GatewayBindingReconciler) bindingsForAgentNames(ctx context.Context, namespace string, agentNames map[string]struct{}) []reconcile.Request {
+	if len(agentNames) == 0 {
+		return nil
+	}
 	list := &gatewayv1alpha1.GatewayBindingList{}
-	if err := r.List(ctx, list, client.InNamespace(agent.Namespace)); err != nil {
+	if err := r.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return nil
 	}
 	references := make([]*gatewayv1alpha1.GatewayBinding, 0)
 	for i := range list.Items {
 		binding := &list.Items[i]
-		if binding.Spec.AgentRef.Name == agent.Name {
+		if _, ok := agentNames[binding.Spec.AgentRef.Name]; ok {
 			references = append(references, binding)
 		}
 	}
@@ -478,7 +513,56 @@ func (r *GatewayBindingReconciler) gatewayBindingCanBeProgrammed(
 		}
 		return false, err
 	}
+	message, err := r.validateBindingAgentRuntimeDefaults(ctx, binding, agent)
+	if err != nil {
+		return false, err
+	}
+	if message != "" {
+		return false, nil
+	}
 	return true, nil
+}
+
+func (r *GatewayBindingReconciler) validateBindingAgentRuntimeDefaults(
+	ctx context.Context,
+	binding *gatewayv1alpha1.GatewayBinding,
+	agent *corev1alpha1.Agent,
+) (string, error) {
+	if binding == nil || agent == nil || agent.Spec.Runtime == nil || agent.Spec.Runtime.RuntimeRef == nil {
+		return "", nil
+	}
+	runtimeName := strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name)
+	if runtimeName == "" {
+		return fmt.Sprintf("Agent %q runtimeRef.name is required", agent.Name), nil
+	}
+	runtimeObject := &corev1alpha1.AgentRuntime{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: runtimeName}, runtimeObject); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Sprintf("AgentRuntime %q referenced by Agent %q not found", runtimeName, agent.Name), nil
+		}
+		return "", err
+	}
+	switch runtimeObject.RegisteredContractVersion() {
+	case corev1alpha1.AgentRuntimeContractHarnessV1:
+		return "", nil
+	case corev1alpha1.AgentRuntimeContractHarnessV2:
+		if binding.Spec.TaskDefaults.AgentRuntimeMaxTurns != nil {
+			return fmt.Sprintf("taskDefaults.agentRuntimeMaxTurns is not supported by external %s AgentRuntime %q", corev1alpha1.AgentRuntimeContractHarnessV2, runtimeName), nil
+		}
+		if retry := binding.Spec.TaskDefaults.RetryPolicy; retry != nil && retry.MaxRetries > 0 {
+			return fmt.Sprintf("taskDefaults.retryPolicy.maxRetries must be 0 for external %s AgentRuntime %q", corev1alpha1.AgentRuntimeContractHarnessV2, runtimeName), nil
+		}
+		policy, err := agentruntimepolicy.PolicyForRuntime(runtimeObject)
+		if err != nil {
+			return err.Error(), nil
+		}
+		if policy.WorkspaceIntent != corev1alpha1.WorkspaceIntentRead {
+			return fmt.Sprintf("external %s AgentRuntime %q profile workspace intent %q does not match Gateway Task intent %q", corev1alpha1.AgentRuntimeContractHarnessV2, runtimeName, policy.WorkspaceIntent, corev1alpha1.WorkspaceIntentRead), nil
+		}
+		return "", nil
+	default:
+		return fmt.Sprintf("AgentRuntime %q referenced by Agent %q has no supported contractVersion", runtimeName, agent.Name), nil
+	}
 }
 
 func validateGatewayClass(object *gatewayv1alpha1.GatewayClass) error {

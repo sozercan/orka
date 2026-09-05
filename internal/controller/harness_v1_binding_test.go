@@ -198,6 +198,23 @@ func TestResolveHarnessV1ExecutionCandidateRejectsTransactionOutsideBrokeredMode
 	}
 }
 
+func TestResolveHarnessV1ExecutionCandidateDefaultsMaxTurnsTo50(t *testing.T) {
+	fixture := newHarnessV1CandidateFixture(t)
+	candidate, err := fixture.reconciler.resolveHarnessV1ExecutionCandidate(
+		context.Background(), fixture.task.DeepCopy(), fixture.agent,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body agentExecutionSnapshotBody
+	if err := json.Unmarshal(candidate.snapshotBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Configuration.MaxTurns != 50 {
+		t.Fatalf("MaxTurns = %d, want built-in harness v1 default 50", body.Configuration.MaxTurns)
+	}
+}
+
 func TestEnsureHarnessV1ExecutionBindingRequeuesTransientCandidateErrors(t *testing.T) {
 	tests := []struct {
 		name      string

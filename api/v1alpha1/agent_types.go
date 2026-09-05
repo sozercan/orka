@@ -95,7 +95,6 @@ type AgentCLIRuntime struct {
 	// DefaultMaxTurns is the default maximum agent loop iterations for tasks using this Agent
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
-	// +kubebuilder:default=50
 	// +optional
 	DefaultMaxTurns *int32 `json:"defaultMaxTurns,omitempty"`
 

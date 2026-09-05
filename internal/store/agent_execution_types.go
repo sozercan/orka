@@ -203,8 +203,8 @@ type ClaimSessionLineageRequest struct {
 	ConfigDigest      string
 
 	// EstablishIfAbsent permits creating the lineage row. It must be true only
-	// when the caller has proven the Session is genuinely fresh: a non-empty
-	// pre-existing Session is never silently treated as unclaimed.
+	// when the caller has proven the Session is fresh or is a controller-owned
+	// Gateway Session whose first message was admitted atomically.
 	EstablishIfAbsent bool
 }
 

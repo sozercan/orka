@@ -777,8 +777,8 @@ func sqlitePromptAttemptReclaimNotReady(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", store.ErrNotReady, fmt.Sprintf(format, args...))
 }
 
-// RecoverPromptAttemptPreSubmission returns an old-epoch pre-submission
-// attempt to Reserved without inventing a new attempt or replaying a prompt.
+// RecoverPromptAttemptPreSubmission returns a pre-acceptance attempt to
+// Reserved without inventing a new attempt or replaying an accepted prompt.
 func (s *Store) RecoverPromptAttemptPreSubmission(ctx context.Context, recovery store.PromptAttemptPreSubmissionRecovery) (*store.PromptAttempt, error) {
 	recovery.ID = strings.TrimSpace(recovery.ID)
 	if err := store.ValidateControlIdentifier("prompt attempt ID", recovery.ID); err != nil {
@@ -792,9 +792,18 @@ func (s *Store) RecoverPromptAttemptPreSubmission(ctx context.Context, recovery 
 	if recovery.ExpectedVersion < 1 {
 		return nil, store.ValidationErrorf("prompt attempt expected version must be at least 1")
 	}
-	if recovery.ExpectedState != store.PromptExecutionReserved &&
+	if recovery.ExpectedState == store.PromptExecutionSubmitting {
+		if !recovery.ProvenNotAccepted {
+			return nil, store.ValidationErrorf("Submitting attempts require proof that the prompt was not accepted")
+		}
+	} else if recovery.ExpectedState != store.PromptExecutionReserved &&
 		recovery.ExpectedState != store.PromptExecutionSessionStarting && recovery.ExpectedState != store.PromptExecutionPlanned {
-		return nil, store.ValidationErrorf("only Reserved, SessionStarting, or Planned attempts may be recovered before submission")
+		return nil, store.ValidationErrorf("only Reserved, SessionStarting, Planned, or proven-unaccepted Submitting attempts may be recovered before acceptance")
+	} else if recovery.ProvenNotAccepted {
+		return nil, store.ValidationErrorf("provenNotAccepted is valid only for Submitting attempts")
+	}
+	if recovery.PreserveBindings && (recovery.ExpectedState != store.PromptExecutionSubmitting || !recovery.ProvenNotAccepted) {
+		return nil, store.ValidationErrorf("preserveBindings requires a proven-unaccepted Submitting attempt")
 	}
 	recovery.OperationID = strings.TrimSpace(recovery.OperationID)
 	if err := store.ValidateControlIdentifier("prompt attempt recovery operation ID", recovery.OperationID); err != nil {
@@ -829,12 +838,18 @@ func (s *Store) RecoverPromptAttemptPreSubmission(ctx context.Context, recovery 
 	if attempt.Version != recovery.ExpectedVersion || attempt.ExecutionState != recovery.ExpectedState {
 		return nil, store.ConflictErrorf("prompt attempt %q no longer matches pre-submission recovery version/state", attempt.ID)
 	}
-	result, err := tx.ExecContext(ctx,
-		`UPDATE prompt_attempts
+	query := `UPDATE prompt_attempts
 		 SET execution_state = 'Reserved', runtime_instance_id = '', session_uid = '', session_lease_generation = 0,
 		     controller_epoch_name = ?, controller_epoch = ?, last_operation_id = ?, last_operation_digest = ?,
 		     version = version + 1, updated_at = ?
-		 WHERE id = ? AND version = ? AND execution_state = ?`,
+		 WHERE id = ? AND version = ? AND execution_state = ?`
+	if recovery.PreserveBindings {
+		query = `UPDATE prompt_attempts
+			 SET execution_state = 'Reserved', controller_epoch_name = ?, controller_epoch = ?,
+			     last_operation_id = ?, last_operation_digest = ?, version = version + 1, updated_at = ?
+			 WHERE id = ? AND version = ? AND execution_state = ?`
+	}
+	result, err := tx.ExecContext(ctx, query,
 		recovery.Fence.Name, recovery.Fence.Epoch, recovery.OperationID, recovery.OperationDigest,
 		recovery.RecoveredAt, recovery.ID, recovery.ExpectedVersion, string(recovery.ExpectedState),
 	)
@@ -845,9 +860,11 @@ func (s *Store) RecoverPromptAttemptPreSubmission(ctx context.Context, recovery 
 		return nil, err
 	}
 	attempt.ExecutionState = store.PromptExecutionReserved
-	attempt.RuntimeInstanceID = ""
-	attempt.SessionUID = ""
-	attempt.SessionLeaseGeneration = 0
+	if !recovery.PreserveBindings {
+		attempt.RuntimeInstanceID = ""
+		attempt.SessionUID = ""
+		attempt.SessionLeaseGeneration = 0
+	}
 	attempt.ControllerEpochName = recovery.Fence.Name
 	attempt.ControllerEpoch = recovery.Fence.Epoch
 	attempt.LastOperationID = recovery.OperationID

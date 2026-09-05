@@ -142,6 +142,50 @@ spec:
                     - maxWorkspaceDeltaBytes
                     - minPromptLeaseMillis
                     type: object
+                  mcpPolicy:
+                    description: |-
+                      MCPPolicy materializes the exact policy represented by the profile's MCP
+                      digests so readiness conformance and Task dispatch use identical inputs.
+                    properties:
+                      allowBash:
+                        description: AllowBash controls whether an allowed tool named
+                          Bash may execute.
+                        type: boolean
+                      allowedTools:
+                        description: |-
+                          AllowedTools is the canonical sorted allowlist exposed through the
+                          prompt-scoped MCP broker.
+                        items:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                        maxItems: 128
+                        type: array
+                      approvalRequiredTools:
+                        description: |-
+                          ApprovalRequiredTools must remain an explicit empty list until the
+                          controller owns external-runtime permission review.
+                        items:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                        maxItems: 0
+                        type: array
+                      disallowedTools:
+                        description: DisallowedTools is the canonical sorted deny
+                          list applied after the allowlist.
+                        items:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                        maxItems: 128
+                        type: array
+                    required:
+                    - allowBash
+                    - allowedTools
+                    - approvalRequiredTools
+                    - disallowedTools
+                    type: object
                   profile:
                     description: Profile is the exact immutable profile accepted by
                       v2 session creation.
@@ -480,20 +524,20 @@ spec:
             - message: orka.harness.v1 capabilities must not carry v2 capability fields
               rule: '!has(self.contractVersion) || self.contractVersion != ''orka.harness.v1''
                 || !has(self.capabilities) || (!has(self.capabilities.runtimeInstanceID)
-                && !has(self.capabilities.profile) && !has(self.capabilities.limits)
-                && !has(self.capabilities.workspaceGovernance) && !has(self.capabilities.supportsDrain)
-                && !has(self.capabilities.supportsPublicationFinalization))'
+                && !has(self.capabilities.profile) && !has(self.capabilities.mcpPolicy)
+                && !has(self.capabilities.limits) && !has(self.capabilities.workspaceGovernance)
+                && !has(self.capabilities.supportsDrain) && !has(self.capabilities.supportsPublicationFinalization))'
             - message: orka.harness.v2 requires the v2 controller bearer and operation
                 capability client auth shape
               rule: '!has(self.contractVersion) || self.contractVersion != ''orka.harness.v2''
                 || (has(self.clientAuth.controllerBearerTokenSecretRef) && has(self.clientAuth.operationCapabilitySecretRef)
                 && !has(self.clientAuth.bearerTokenSecretRef))'
-            - message: orka.harness.v2 requires pinned instance, profile, limits,
-                and workspace governance capabilities
+            - message: orka.harness.v2 requires pinned instance, profile, MCP policy,
+                limits, and workspace governance capabilities
               rule: '!has(self.contractVersion) || self.contractVersion != ''orka.harness.v2''
                 || (has(self.capabilities) && has(self.capabilities.runtimeInstanceID)
-                && has(self.capabilities.profile) && has(self.capabilities.limits)
-                && has(self.capabilities.workspaceGovernance))'
+                && has(self.capabilities.profile) && has(self.capabilities.mcpPolicy)
+                && has(self.capabilities.limits) && has(self.capabilities.workspaceGovernance))'
             - message: orka.harness.v2 capabilities must not carry v1 capability fields
               rule: '!has(self.contractVersion) || self.contractVersion != ''orka.harness.v2''
                 || !has(self.capabilities) || (!has(self.capabilities.toolExecutionModes)
@@ -673,6 +717,11 @@ spec:
                     type: integer
                   maxTurnSeconds:
                     type: integer
+                  mcpToolDescriptorDigest:
+                    description: |-
+                      MCPToolDescriptorDigest records the exact derived descriptor set sent by
+                      the controller during the most recent v2 conformance probe.
+                    type: string
                   model:
                     type: string
                   profileDigestSchemaVersion:

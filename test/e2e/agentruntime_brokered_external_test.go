@@ -22,15 +22,22 @@ import (
 
 var _ = Describe("AgentRuntime v2 broker boundary", func() {
 	const (
-		agentName = "e2e-external-broker-agent"
-		taskName  = "e2e-external-broker-task"
+		runtimeName    = "external-v2-broker-runtime"
+		deploymentName = "external-v2-broker-runtime"
+		serviceName    = "external-v2-broker-runtime"
+		authSecretName = "external-v2-broker-runtime-auth"
+		agentName      = "e2e-external-broker-agent"
+		taskName       = "e2e-external-broker-task"
 	)
 
 	AfterEach(func() {
 		for _, resource := range []struct{ kind, name string }{
 			{"task", taskName},
 			{"agent", agentName},
-			{"agentruntime", externalV2RuntimeName},
+			{"agentruntime", runtimeName},
+			{"service", serviceName},
+			{"deployment", deploymentName},
+			{"secret", authSecretName},
 		} {
 			cmd := exec.Command("kubectl", "delete", resource.kind, resource.name,
 				"-n", namespace, "--ignore-not-found")
@@ -39,16 +46,14 @@ var _ = Describe("AgentRuntime v2 broker boundary", func() {
 	})
 
 	It("rejects strict read tasks before any external v2 tool or prompt dispatch", func() {
-		runtimeManifest, manifestErr := externalV2RuntimeManifest()
-		Expect(manifestErr).NotTo(HaveOccurred())
-		Expect(applyManifestJSON(runtimeManifest)).To(Succeed())
+		Expect(deployHarnessV2Fixture(runtimeName, deploymentName, serviceName, authSecretName)).To(Succeed())
 
 		agentManifest := fmt.Sprintf(`{
 			"apiVersion": "core.orka.ai/v1alpha1",
 			"kind": "Agent",
 			"metadata": {"name": %q, "namespace": %q},
 			"spec": {"runtime": {"runtimeRef": {"name": %q}}}
-		}`, agentName, namespace, externalV2RuntimeName)
+		}`, agentName, namespace, runtimeName)
 		cmd := exec.Command("kubectl", "apply", "-f", "-")
 		cmd.Stdin = stringReader(agentManifest)
 		_, err := utils.Run(cmd)
@@ -76,7 +81,7 @@ var _ = Describe("AgentRuntime v2 broker boundary", func() {
 				"-o", "jsonpath={.status.message}")
 			output, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(output).To(ContainSubstring(fmt.Sprintf("external AgentRuntime %q Task dispatch is not supported", externalV2RuntimeName)))
+			g.Expect(output).To(ContainSubstring("task allowedTools do not exactly match the registered external AgentRuntime MCP policy"))
 		}, 2*time.Minute, time.Second).Should(Succeed())
 		waitForTaskPhase(taskName, "Failed", 2*time.Minute)
 		verifyNoJobForTask(taskName, 5*time.Second)

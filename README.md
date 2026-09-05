@@ -51,7 +51,7 @@ One `helm install`, one LLM secret, and you're chatting with an orchestrator tha
 ## Features
 
 - 🤖 **AI Agents** — Anthropic, OpenAI, or Azure OpenAI with tools, skills, and session persistence
-- 🛠️ **ACP Agent Runtimes** — Run Codex, Claude, Copilot, and OpenCode through digest-pinned RuntimePools; external `orka.harness.v2` registration and conformance are available while `runtimeRef` Task dispatch remains fail-closed
+- 🛠️ **ACP Agent Runtimes** — Run Codex, Claude, Copilot, and OpenCode through digest-pinned RuntimePools, or dispatch to strict-governed external `orka.harness.v2` runtimes through `runtimeRef`
 - 🔁 **Autonomous Task Loops** — Coordinators can iterate on long-running goals until complete, canceled, or at an iteration limit
 - 🔀 **Multi-Agent Coordination** — Coordinators delegate to specialists with depth and concurrency controls
 - 💬 **Interactive Chat** — Agentic orchestrator with SSE streaming that creates and manages agents and tasks for you

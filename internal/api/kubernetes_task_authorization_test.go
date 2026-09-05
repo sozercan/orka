@@ -239,10 +239,11 @@ func TestCreateManualSecurityScanRequiresKubernetesRBACForTaskCreate(t *testing.
 			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
 		},
 	}
+	analysisAgent := securityRuntimeTestAgent(scan.Spec.AnalysisAgentRef.Name)
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&corev1alpha1.RepositoryScan{}).
-		WithRuntimeObjects(scan).
+		WithRuntimeObjects(scan, analysisAgent).
 		Build()
 	db, err := sqlite.NewDB(":memory:")
 	require.NoError(t, err)

@@ -18,6 +18,7 @@ import (
 
 	"time"
 
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/cli/client"
 )
 
@@ -265,6 +266,153 @@ func TestNewTaskCreateCmd_WithAgent(t *testing.T) {
 
 	if err := root.Execute(); err != nil {
 		t.Fatalf("Execute() error: %v", err)
+	}
+}
+
+func TestTaskCreateMaterializesExternalRuntimeAllowedTools(t *testing.T) {
+	tests := []struct {
+		name            string
+		contractVersion corev1alpha1.AgentRuntimeContractVersion
+		allowedTools    []string
+		explicitType    bool
+	}{
+		{
+			name:            "harness v2 registered allowlist",
+			contractVersion: corev1alpha1.AgentRuntimeContractHarnessV2,
+			allowedTools:    []string{"read_file", "search_code"},
+		},
+		{
+			name:            "harness v2 registered deny-all",
+			contractVersion: corev1alpha1.AgentRuntimeContractHarnessV2,
+			allowedTools:    []string{},
+			explicitType:    true,
+		},
+		{
+			name:            "harness v1 required deny-all",
+			contractVersion: corev1alpha1.AgentRuntimeContractHarnessV1,
+			allowedTools:    []string{},
+			explicitType:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+
+			var created struct {
+				AgentRuntime *struct {
+					AllowedTools *[]string `json:"allowedTools"`
+				} `json:"agentRuntime"`
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents/external-agent":
+					fmt.Fprint(w, `{"metadata":{"name":"external-agent"},"spec":{"runtime":{"runtimeRef":{"name":"external-runtime"}}}}`) //nolint:errcheck
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agent-runtimes/external-runtime":
+					runtimeSpec := map[string]any{"contractVersion": tt.contractVersion}
+					if tt.contractVersion == corev1alpha1.AgentRuntimeContractHarnessV2 {
+						runtimeSpec["capabilities"] = map[string]any{
+							"mcpPolicy": map[string]any{"allowedTools": tt.allowedTools},
+							"profile":   map[string]any{"workspaceIntent": "read"},
+						}
+					}
+					json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+						"metadata": map[string]any{"name": "external-runtime"},
+						"spec":     runtimeSpec,
+					})
+				case r.Method == http.MethodPost && r.URL.Path == tasksAPIPath:
+					if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+						t.Errorf("decode create request: %v", err)
+					}
+					w.WriteHeader(http.StatusCreated)
+					fmt.Fprint(w, `{"metadata":{"name":"task-external"}}`) //nolint:errcheck
+				default:
+					w.WriteHeader(http.StatusNotFound)
+					fmt.Fprintf(w, "not found: %s %s", r.Method, r.URL.Path) //nolint:errcheck
+				}
+			}))
+			defer srv.Close()
+
+			args := []string{"task", "create", "--server", srv.URL, "--agent", "external-agent"}
+			if tt.explicitType {
+				args = append(args, "--type", "agent")
+			}
+			args = append(args, "do stuff")
+			root := newRootCmd()
+			root.SetArgs(args)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("Execute() error: %v", err)
+			}
+			if created.AgentRuntime == nil || created.AgentRuntime.AllowedTools == nil {
+				t.Fatalf("agentRuntime = %#v, want explicit allowedTools", created.AgentRuntime)
+			}
+			if !slices.Equal(*created.AgentRuntime.AllowedTools, tt.allowedTools) {
+				t.Fatalf("allowedTools = %#v, want %#v", *created.AgentRuntime.AllowedTools, tt.allowedTools)
+			}
+		})
+	}
+}
+
+func TestTaskCreateRejectsExternalRuntimeWorkspaceIntentMismatch(t *testing.T) {
+	tests := []struct {
+		name          string
+		taskIntent    corev1alpha1.WorkspaceIntent
+		profileIntent corev1alpha1.WorkspaceIntent
+	}{
+		{name: "read Task with write profile", taskIntent: corev1alpha1.WorkspaceIntentRead, profileIntent: corev1alpha1.WorkspaceIntentWrite},
+		{name: "write Task with read profile", taskIntent: corev1alpha1.WorkspaceIntentWrite, profileIntent: corev1alpha1.WorkspaceIntentRead},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			postCount := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents/external-agent":
+					fmt.Fprint(w, `{"metadata":{"name":"external-agent"},"spec":{"runtime":{"runtimeRef":{"name":"external-runtime"}}}}`) //nolint:errcheck
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agent-runtimes/external-runtime":
+					json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+						"metadata": map[string]any{"name": "external-runtime"},
+						"spec": map[string]any{
+							"contractVersion": "orka.harness.v2",
+							"capabilities": map[string]any{
+								"mcpPolicy": map[string]any{"allowedTools": []string{}},
+								"profile":   map[string]any{"workspaceIntent": tt.profileIntent},
+							},
+						},
+					})
+				case r.Method == http.MethodPost && r.URL.Path == tasksAPIPath:
+					postCount++
+					w.WriteHeader(http.StatusCreated)
+					fmt.Fprint(w, `{"metadata":{"name":"unexpected-task"}}`) //nolint:errcheck
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			args := []string{"task", "create", "--server", srv.URL, "--agent", "external-agent", "--type", "agent"}
+			if tt.taskIntent == corev1alpha1.WorkspaceIntentWrite {
+				args = append(args,
+					"--workspace-intent", "write",
+					"--git-repo", "https://github.com/source/repo",
+					"--publication-credential", "repo-write",
+				)
+			}
+			args = append(args, "do stuff")
+			root := newRootCmd()
+			root.SetArgs(args)
+			err := root.Execute()
+			want := fmt.Sprintf("profile workspace intent %q does not match Task intent %q", tt.profileIntent, tt.taskIntent)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("Execute() error = %v, want %q", err, want)
+			}
+			if postCount != 0 {
+				t.Fatalf("Task POST count = %d, want 0", postCount)
+			}
+		})
 	}
 }
 
@@ -848,6 +996,35 @@ func TestTaskCreateAgentTypeSurfacesForbiddenLookup(t *testing.T) {
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "pass --type") {
 		t.Fatalf("Execute() error = %v, want explicit --type guidance", err)
+	}
+}
+
+func TestTaskCreateExplicitAgentTypeSurfacesForbiddenPolicyLookup(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	postCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents/guarded":
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"error":"forbidden"}`) //nolint:errcheck
+		case r.Method == http.MethodPost && r.URL.Path == tasksAPIPath:
+			postCount++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"metadata":{"name":"unexpected-task"}}`) //nolint:errcheck
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	root := newRootCmd()
+	root.SetArgs([]string{"task", "create", "--server", srv.URL, "--agent", "guarded", "--type", "agent", "do stuff"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "resolve AgentRuntime policy") || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("Execute() error = %v, want forbidden AgentRuntime policy lookup", err)
+	}
+	if postCount != 0 {
+		t.Fatalf("Task POST count = %d, want 0", postCount)
 	}
 }
 

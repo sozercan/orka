@@ -17,7 +17,7 @@ but Orka owns authorization, durable effects, and delivery.
 - Keep credentials out of `AgentRuntime.spec.deployment.endpoint`.
 - Bind runtime bearer Secrets with `orka.ai/agent-runtime-auth=true`, optional `orka.ai/agent-runtime-name`, and required `orka.ai/agent-runtime-endpoint`.
 - Use namespace-local facades unless and until a tenant runtime catalog is intentionally designed.
-- Expose tools with explicit `Task.spec.agentRuntime.allowedTools`; brokered mode does not imply access to all Tools.
+- Materialize the exact brokered policy in `AgentRuntime.spec.capabilities.mcpPolicy`, and make `Task.spec.agentRuntime.allowedTools` equal its allowlist. Brokered mode does not imply access to all Tools.
 - Classify remote-exposed Tools with `spec.brokeredToolClass`.
 - Use write-class Tools for consequential actions so approval and exact-argument digest checks run before execution.
 - Require the per-session loopback MCP proxy to present the active Task,

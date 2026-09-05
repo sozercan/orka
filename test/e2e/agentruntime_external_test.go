@@ -12,15 +12,23 @@ package e2e
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/orka-agents/orka/internal/harness/v2/conformance/conformancetest"
 	"github.com/orka-agents/orka/test/utils"
 )
 
-const externalV2RuntimeName = "external-v2-runtime"
+const (
+	externalV2RuntimeName           = "external-v2-runtime"
+	externalV2RuntimeDeploymentName = "external-v2-runtime"
+	externalV2RuntimeServiceName    = "external-v2-runtime"
+	externalV2RuntimeAuthName       = "external-v2-runtime-auth"
+	externalV2ResultAPIPort         = 18121
+)
 
 var _ = Describe("AgentRuntime external dispatch", func() {
 	const (
@@ -33,6 +41,9 @@ var _ = Describe("AgentRuntime external dispatch", func() {
 			{"task", taskName},
 			{"agent", agentName},
 			{"agentruntime", externalV2RuntimeName},
+			{"service", externalV2RuntimeServiceName},
+			{"deployment", externalV2RuntimeDeploymentName},
+			{"secret", externalV2RuntimeAuthName},
 		} {
 			cmd := exec.Command("kubectl", "delete", resource.kind, resource.name,
 				"-n", namespace, "--ignore-not-found")
@@ -62,10 +73,13 @@ var _ = Describe("AgentRuntime external dispatch", func() {
 		))
 	})
 
-	It("fails closed at the external Task dispatch support boundary", func() {
-		runtimeManifest, manifestErr := externalV2RuntimeManifest()
-		Expect(manifestErr).NotTo(HaveOccurred())
-		Expect(applyManifestJSON(runtimeManifest)).To(Succeed())
+	It("dispatches a Task through a conformant external v2 runtime", func() {
+		Expect(deployHarnessV2Fixture(
+			externalV2RuntimeName,
+			externalV2RuntimeDeploymentName,
+			externalV2RuntimeServiceName,
+			externalV2RuntimeAuthName,
+		)).To(Succeed())
 
 		agentManifest := fmt.Sprintf(`{
 			"apiVersion": "core.orka.ai/v1alpha1",
@@ -87,12 +101,9 @@ var _ = Describe("AgentRuntime external dispatch", func() {
 			"spec": {
 				"type": "agent",
 				"agentRef": {"name": %q},
+				"agentRuntime": {"allowedTools": []},
 				"prompt": "Prepare a governed change.",
-				"workspace": {
-					"intent": "write",
-					"gitRepo": "https://github.com/example/repo",
-					"publicationGitRepo": "https://github.com/example/repo"
-				}
+				"workspace": {"intent": "read"}
 			}
 		}`, taskName, namespace, agentName)
 		cmd = exec.Command("kubectl", "apply", "-f", "-")
@@ -100,24 +111,26 @@ var _ = Describe("AgentRuntime external dispatch", func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred())
 
+		waitForTaskPhase(taskName, "Succeeded", 3*time.Minute)
+		verifyNoJobForTask(taskName, 5*time.Second)
+
+		By("verifying the frozen external execution identity")
 		Eventually(func(g Gomega) {
 			cmd := exec.Command("kubectl", "get", "task", taskName, "-n", namespace,
-				"-o", "jsonpath={.status.phase}{\"/\"}{.status.message}")
+				"-o", "jsonpath={.status.execution.agentRuntimeName}{\"/\"}{.status.execution.runtimePoolName}{\"/\"}{.status.execution.runtimeInstanceID}")
 			output, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(output).To(HavePrefix("Failed/"))
-			g.Expect(output).To(ContainSubstring(fmt.Sprintf("external AgentRuntime %q Task dispatch is not supported until the v2 dispatcher is wired", externalV2RuntimeName)))
-		}, 2*time.Minute, time.Second).Should(Succeed())
+			g.Expect(output).To(Equal(externalV2RuntimeName + "//" + externalV2RuntimeName))
+		}, time.Minute, time.Second).Should(Succeed())
 
-		verifyNoJobForTask(taskName, 5*time.Second)
+		By("verifying the deterministic external result")
+		verifyResultAvailable(taskName)
+		apiBaseURL, cancelPortForward, portForwardCmd, err := startControllerAPIPortForward(externalV2ResultAPIPort)
+		Expect(err).NotTo(HaveOccurred())
+		defer stopPortForward(cancelPortForward, portForwardCmd)
+		apiToken, err := serviceAccountToken()
+		Expect(err).NotTo(HaveOccurred())
+		result := fetchTaskResultViaAPI(apiBaseURL, apiToken, taskName)
+		Expect(strings.TrimSpace(result)).To(Equal(conformancetest.DeterministicPromptResult))
 	})
 })
-
-func externalV2RuntimeManifest() (map[string]any, error) {
-	manifest, err := gatewayE2ERuntimeManifest()
-	if err != nil {
-		return nil, err
-	}
-	manifest["metadata"].(map[string]any)["name"] = externalV2RuntimeName
-	return manifest, nil
-}

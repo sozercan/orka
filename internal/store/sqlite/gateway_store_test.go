@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -337,6 +339,69 @@ func TestGatewayDispatchProjectionAndDeliveryLifecycle(t *testing.T) {
 	stored, err := s.GetGatewayDelivery(ctx, delivery.Namespace, delivery.ID)
 	if err != nil || stored.State != store.GatewayDeliveryDelivered || stored.ProviderMessageID != providerMessageID {
 		t.Fatalf("stored delivery = (%+v, %v)", stored, err)
+	}
+}
+
+func TestFreezeGatewayEventTaskRuntimeAllowedToolsIsClaimFencedAndFirstWriteWins(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		allowedTools []string
+	}{
+		{name: "registered tools", allowedTools: []string{"read_evidence"}},
+		{name: "explicit deny all", allowedTools: []string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := setupTestStore(t)
+			ctx := context.Background()
+			now := time.Now().UTC().Truncate(time.Second)
+			event := testGatewayEvent(now, "freeze-policy-"+strings.ReplaceAll(test.name, " ", "-"))
+			if _, _, err := s.AdmitGatewayEvent(ctx, store.GatewayEventAdmission{
+				Event: event, AppendUserMessage: true, PendingLimit: 100,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.FreezeGatewayEventTaskRuntimeAllowedTools(
+				ctx, event.Namespace, event.ID, "owner-a", test.allowedTools, now,
+			); !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("unclaimed freeze error = %v, want ErrConflict", err)
+			}
+			if _, err := s.ClaimNextGatewayEvent(ctx, event.Namespace, "owner-a", now, time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			frozen, err := s.FreezeGatewayEventTaskRuntimeAllowedTools(
+				ctx, event.Namespace, event.ID, "owner-a", test.allowedTools, now,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !frozen.TaskPolicyFrozen || frozen.TaskAllowedTools == nil ||
+				!slices.Equal(frozen.TaskAllowedTools, test.allowedTools) {
+				t.Fatalf("frozen allowedTools = %#v, frozen=%v", frozen.TaskAllowedTools, frozen.TaskPolicyFrozen)
+			}
+			if _, err := s.FreezeGatewayEventTaskRuntimeAllowedTools(
+				ctx, event.Namespace, event.ID, "owner-a", test.allowedTools, now.Add(time.Second),
+			); err != nil {
+				t.Fatalf("idempotent freeze error = %v", err)
+			}
+			if _, err := s.FreezeGatewayEventTaskRuntimeAllowedTools(
+				ctx, event.Namespace, event.ID, "owner-a", []string{"different_tool"}, now.Add(2*time.Second),
+			); !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("overwrite error = %v, want ErrConflict", err)
+			}
+			if _, err := s.FreezeGatewayEventTaskRuntimeAllowedTools(
+				ctx, event.Namespace, event.ID, "owner-b", test.allowedTools, now.Add(2*time.Second),
+			); !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("stale-owner freeze error = %v, want ErrConflict", err)
+			}
+			stored, err := s.GetGatewayEvent(ctx, event.Namespace, event.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !stored.TaskPolicyFrozen || stored.TaskAllowedTools == nil ||
+				!slices.Equal(stored.TaskAllowedTools, test.allowedTools) {
+				t.Fatalf("stored allowedTools = %#v, frozen=%v", stored.TaskAllowedTools, stored.TaskPolicyFrozen)
+			}
+		})
 	}
 }
 

@@ -29,6 +29,7 @@ const (
 type ACPSessionContinuityConfig struct {
 	SessionControls store.SessionControlStore
 	Transcripts     store.SessionStore
+	GatewayEvents   store.GatewayEventStore
 	Publications    store.PublicationStore
 	BranchClaims    store.BranchClaimStore
 	BootstrapLimits ACPBootstrapLimits
@@ -45,6 +46,7 @@ type ACPSessionContinuityConfig struct {
 type HarnessV1SessionContinuityConfig struct {
 	SessionControls store.SessionControlStore
 	Transcripts     store.SessionStore
+	GatewayEvents   store.GatewayEventStore
 	BootstrapLimits ACPBootstrapLimits
 	NewSessionUID   func() (string, error)
 	Lineages        store.SessionLineageStore
@@ -56,6 +58,7 @@ type HarnessV1SessionContinuityConfig struct {
 type ACPSessionContinuity struct {
 	controls        store.SessionControlStore
 	transcripts     store.SessionStore
+	gatewayEvents   store.GatewayEventStore
 	publications    store.PublicationStore
 	branchClaims    store.BranchClaimStore
 	bootstrapLimits ACPBootstrapLimits
@@ -88,6 +91,7 @@ func NewHarnessV1SessionContinuity(config HarnessV1SessionContinuityConfig) (*AC
 	return newSessionContinuity(ACPSessionContinuityConfig{
 		SessionControls: config.SessionControls,
 		Transcripts:     config.Transcripts,
+		GatewayEvents:   config.GatewayEvents,
 		BootstrapLimits: config.BootstrapLimits,
 		NewSessionUID:   config.NewSessionUID,
 		Lineages:        config.Lineages,
@@ -106,6 +110,7 @@ func newSessionContinuity(config ACPSessionContinuityConfig) (*ACPSessionContinu
 	return &ACPSessionContinuity{
 		controls:        config.SessionControls,
 		transcripts:     config.Transcripts,
+		gatewayEvents:   config.GatewayEvents,
 		publications:    config.Publications,
 		branchClaims:    config.BranchClaims,
 		lineages:        config.Lineages,
@@ -285,6 +290,7 @@ func validateTranscriptSession(session *store.SessionRecord, expectedType string
 type ACPAcquireSessionLeaseRequest struct {
 	Session             store.SessionControl
 	Fence               store.ControllerEpochFence
+	TaskName            string
 	TaskUID             string
 	Attempt             int64
 	PromptID            string
@@ -317,6 +323,7 @@ type ACPReleaseSessionLeaseRequest struct {
 
 // AcquireMutationLease acquires one monotonic, non-reusable Session lease.
 func (c *ACPSessionContinuity) AcquireMutationLease(ctx context.Context, request ACPAcquireSessionLeaseRequest) (*ACPSessionLease, error) {
+	request.TaskName = strings.TrimSpace(request.TaskName)
 	request.TaskUID = strings.TrimSpace(request.TaskUID)
 	request.PromptID = strings.TrimSpace(request.PromptID)
 	if request.Session.Availability != store.SessionAvailable {
@@ -449,14 +456,41 @@ func (c *ACPSessionContinuity) prepareSessionLineageClaim(ctx context.Context, r
 		if err != nil {
 			return nil, fmt.Errorf("read session transcript for lineage classification: %w", err)
 		}
-		// A nonempty unclassified Session is never adopted implicitly. Static
-		// mode installations require it to be recreated with fresh lineage.
-		claim.EstablishIfAbsent = record.MessageCount == 0
+		if record.SessionType == store.SessionTypeGateway {
+			if err := c.verifyGatewayLineageOwner(ctx, request); err != nil {
+				return nil, err
+			}
+			claim.EstablishIfAbsent = true
+		} else {
+			// Non-Gateway lineage can be established only before the transcript
+			// contains messages. Existing unclassified transcripts fail closed.
+			claim.EstablishIfAbsent = record.MessageCount == 0
+		}
 	}
 	if err := claim.Validate(); err != nil {
 		return nil, err
 	}
 	return claim, nil
+}
+
+func (c *ACPSessionContinuity) verifyGatewayLineageOwner(ctx context.Context, request ACPAcquireSessionLeaseRequest) error {
+	if c.gatewayEvents == nil {
+		return fmt.Errorf("%w: Gateway Task ownership store is unavailable", store.ErrNotReady)
+	}
+	event, err := c.gatewayEvents.GetGatewayEventForTask(
+		ctx, request.Session.Namespace, request.TaskName, request.TaskUID,
+	)
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrValidation) {
+		return fmt.Errorf("%w: Gateway Task ownership linkage is pending", store.ErrNotReady)
+	}
+	if err != nil {
+		return fmt.Errorf("verify Gateway Task ownership linkage: %w", err)
+	}
+	if event.Namespace != request.Session.Namespace || event.SessionName != request.Session.SessionName ||
+		event.NamespaceUID != request.NamespaceUID {
+		return fmt.Errorf("%w: linked Gateway event does not match Session lineage identity", store.ErrConflict)
+	}
+	return nil
 }
 
 func (c *ACPSessionContinuity) ReleaseMutationLease(ctx context.Context, request ACPReleaseSessionLeaseRequest) (*store.SessionControl, error) {

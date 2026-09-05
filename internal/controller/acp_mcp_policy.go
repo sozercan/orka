@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -108,12 +109,140 @@ func buildRuntimeSessionMCPConfigurationWithRegistry(
 	allowed, disallowed, allowBash = normalizeACPRuntimeToolPolicy(
 		profile.ProviderKind, corev1alpha1.WorkspaceIntent(profile.WorkspaceIntent), allowed, disallowed, allowBash,
 	)
+	approval := harnessv2.MCPApprovalPolicy{}
+	if agent.Spec.Coordination != nil {
+		approval.RequiredTools = sortedUnique(agent.Spec.Coordination.ApprovalRequiredTools)
+	}
+	return buildMCPPolicyConfigurationWithRegistry(
+		ctx, reader, task.Namespace, profile, allowed, disallowed, allowBash, approval, registry,
+	)
+}
+
+func buildExternalRuntimeSessionMCPConfigurationWithRegistry(
+	ctx context.Context,
+	reader client.Reader,
+	task *corev1alpha1.Task,
+	agent *corev1alpha1.Agent,
+	runtime *corev1alpha1.AgentRuntime,
+	profile harnessv2.RuntimeProfile,
+	registry *tools.Registry,
+) (harnessv2.MCPPolicyConfiguration, error) {
+	if task == nil || agent == nil || runtime == nil || runtime.Spec.Capabilities == nil {
+		return harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("task, Agent, and external AgentRuntime policy are required")
+	}
+	policy := runtime.Spec.Capabilities.MCPPolicy
+	if err := validateAgentRuntimeMCPPolicyClaims(policy, profile); err != nil {
+		return harnessv2.MCPPolicyConfiguration{}, err
+	}
+	if task.Spec.AgentRuntime == nil || task.Spec.AgentRuntime.AllowedTools == nil {
+		return harnessv2.MCPPolicyConfiguration{}, permanentACPAgentConfiguration(
+			fmt.Errorf("task agentRuntime.allowedTools must be an explicit list for an external AgentRuntime"),
+		)
+	}
+	requested := effectiveACPAllowedTools(task, agent)
+	if !slices.Equal(requested, policy.AllowedTools) {
+		return harnessv2.MCPPolicyConfiguration{}, permanentACPAgentConfiguration(
+			fmt.Errorf("task allowedTools do not exactly match the registered external AgentRuntime MCP policy"),
+		)
+	}
+	return buildAgentRuntimeMCPConfigurationWithRegistry(ctx, reader, runtime, profile, registry)
+}
+
+func buildAgentRuntimeMCPConfigurationWithRegistry(
+	ctx context.Context,
+	reader client.Reader,
+	runtime *corev1alpha1.AgentRuntime,
+	profile harnessv2.RuntimeProfile,
+	registry *tools.Registry,
+) (harnessv2.MCPPolicyConfiguration, error) {
+	if runtime == nil || runtime.Spec.Capabilities == nil {
+		return harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("external AgentRuntime MCP policy is required")
+	}
+	policy := runtime.Spec.Capabilities.MCPPolicy
+	if err := validateAgentRuntimeMCPPolicyClaims(policy, profile); err != nil {
+		return harnessv2.MCPPolicyConfiguration{}, err
+	}
+	return buildMCPPolicyConfigurationWithRegistry(
+		ctx,
+		reader,
+		runtime.Namespace,
+		profile,
+		append([]string{}, policy.AllowedTools...),
+		append([]string{}, policy.DisallowedTools...),
+		policy.AllowBash,
+		agentRuntimeMCPApprovalPolicy(policy),
+		registry,
+	)
+}
+
+func validateAgentRuntimeMCPPolicyClaims(
+	policy *corev1alpha1.AgentRuntimeMCPPolicySpec,
+	profile harnessv2.RuntimeProfile,
+) error {
+	if policy == nil {
+		return fmt.Errorf("external AgentRuntime capabilities.mcpPolicy is required")
+	}
+	for _, field := range []struct {
+		name   string
+		values []string
+	}{
+		{name: "allowedTools", values: policy.AllowedTools},
+		{name: "disallowedTools", values: policy.DisallowedTools},
+		{name: "approvalRequiredTools", values: policy.ApprovalRequiredTools},
+	} {
+		if field.values == nil {
+			return fmt.Errorf("external AgentRuntime MCP policy %s must be an explicit list", field.name)
+		}
+		if !slices.Equal(field.values, sortedUnique(field.values)) {
+			return fmt.Errorf("external AgentRuntime MCP policy %s must be sorted, unique, and non-empty by item", field.name)
+		}
+	}
+	toolDigest, err := harnessv2.CanonicalRuntimeToolPolicyDigest(
+		policy.AllowedTools, policy.DisallowedTools, policy.AllowBash,
+	)
+	if err != nil || toolDigest != profile.ToolPolicyDigest {
+		return fmt.Errorf("registered external AgentRuntime MCP tool policy does not match the runtime profile")
+	}
+	approval := agentRuntimeMCPApprovalPolicy(policy)
+	approvalDigest, err := harnessv2.CanonicalMCPApprovalPolicyDigest(approval)
+	if err != nil || approvalDigest != profile.ApprovalPolicyDigest {
+		return fmt.Errorf("registered external AgentRuntime MCP approval policy does not match the runtime profile")
+	}
+	mcpDigest, err := harnessv2.CanonicalMCPConfigurationDigest(policy.AllowedTools)
+	if err != nil || mcpDigest != profile.MCPConfigurationDigest {
+		return fmt.Errorf("registered external AgentRuntime MCP configuration does not match the runtime profile")
+	}
+	return nil
+}
+
+func agentRuntimeMCPApprovalPolicy(policy *corev1alpha1.AgentRuntimeMCPPolicySpec) harnessv2.MCPApprovalPolicy {
+	if policy == nil || len(policy.ApprovalRequiredTools) == 0 {
+		return harnessv2.MCPApprovalPolicy{}
+	}
+	return harnessv2.MCPApprovalPolicy{RequiredTools: append([]string(nil), policy.ApprovalRequiredTools...)}
+}
+
+func buildMCPPolicyConfigurationWithRegistry(
+	ctx context.Context,
+	reader client.Reader,
+	namespace string,
+	profile harnessv2.RuntimeProfile,
+	allowed, disallowed []string,
+	allowBash bool,
+	approval harnessv2.MCPApprovalPolicy,
+	registry *tools.Registry,
+) (harnessv2.MCPPolicyConfiguration, error) {
+	if len(approval.RequiredTools) > 0 {
+		return harnessv2.MCPPolicyConfiguration{}, permanentACPAgentConfiguration(
+			fmt.Errorf("approval-required ACP MCP tools are unavailable until controller-owned permission review is implemented"),
+		)
+	}
 	toolDigest, err := harnessv2.CanonicalRuntimeToolPolicyDigest(allowed, disallowed, allowBash)
 	if err != nil || toolDigest != profile.ToolPolicyDigest {
-		return harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("effective MCP tool policy does not match RuntimePool profile")
+		return harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("effective MCP tool policy does not match runtime profile")
 	}
 	descriptors, err := buildCanonicalMCPToolDescriptors(
-		ctx, reader, task.Namespace, profile.ProviderKind, allowed, disallowed, allowBash, registry,
+		ctx, reader, namespace, profile.ProviderKind, allowed, disallowed, allowBash, registry,
 	)
 	if err != nil {
 		return harnessv2.MCPPolicyConfiguration{}, err
@@ -122,17 +251,13 @@ func buildRuntimeSessionMCPConfigurationWithRegistry(
 	if err != nil {
 		return harnessv2.MCPPolicyConfiguration{}, err
 	}
-	approval := harnessv2.MCPApprovalPolicy{}
-	if agent.Spec.Coordination != nil {
-		approval.RequiredTools = sortedUnique(agent.Spec.Coordination.ApprovalRequiredTools)
-	}
 	approvalDigest, err := harnessv2.CanonicalMCPApprovalPolicyDigest(approval)
 	if err != nil || approvalDigest != profile.ApprovalPolicyDigest {
-		return harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("effective MCP approval policy does not match RuntimePool profile")
+		return harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("effective MCP approval policy does not match runtime profile")
 	}
 	mcpDigest, err := harnessv2.CanonicalMCPConfigurationDigest(allowed)
 	if err != nil || mcpDigest != profile.MCPConfigurationDigest {
-		return harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("effective MCP configuration does not match RuntimePool profile")
+		return harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("effective MCP configuration does not match runtime profile")
 	}
 	configuration := harnessv2.MCPPolicyConfiguration{
 		ToolPolicyDigest: toolDigest, ApprovalPolicyDigest: approvalDigest, MCPConfigurationDigest: mcpDigest,

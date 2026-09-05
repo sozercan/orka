@@ -101,8 +101,8 @@ export function AgentCreateForm() {
             }
           : { type: runtimeType }
         : { runtimeRef: { name: runtimeRef.trim() } }
-      if (trimmedModel) {
-        spec.model = runtimeSource === 'built-in' && runtimeType === 'opencode'
+      if (runtimeSource === 'built-in' && trimmedModel) {
+        spec.model = runtimeType === 'opencode'
           ? { name: trimmedModel, contextWindow: parsedContextWindow, maxTokens: parsedMaxTokens }
           : { name: trimmedModel }
       }
@@ -245,27 +245,21 @@ export function AgentCreateForm() {
                   </div>
                 )}
 
-                <div className="space-y-2">
-                  <label htmlFor="runtime-model" className="text-sm font-medium">
-                    {runtimeSource === 'built-in' ? 'Model' : 'Model override'}
-                  </label>
-                  <Input
-                    id="runtime-model"
-                    value={model}
-                    onChange={(e) => setModel(e.target.value)}
-                    placeholder={
-                      runtimeSource === 'built-in' && runtimeType === 'opencode'
-                        ? 'openai/gpt-5.4'
-                        : runtimeSource === 'built-in'
-                          ? 'Enter model identifier'
-                          : 'Optional model override'
-                    }
-                    required={runtimeSource === 'built-in'}
-                  />
-                  {runtimeSource === 'built-in' && runtimeType === 'opencode' && (
-                    <p className="text-xs text-muted-foreground">OpenCode model IDs use provider/model form.</p>
-                  )}
-                </div>
+                {runtimeSource === 'built-in' && (
+                  <div className="space-y-2">
+                    <label htmlFor="runtime-model" className="text-sm font-medium">Model</label>
+                    <Input
+                      id="runtime-model"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder={runtimeType === 'opencode' ? 'openai/gpt-5.4' : 'Enter model identifier'}
+                      required
+                    />
+                    {runtimeType === 'opencode' && (
+                      <p className="text-xs text-muted-foreground">OpenCode model IDs use provider/model form.</p>
+                    )}
+                  </div>
+                )}
                 {runtimeSource === 'built-in' && runtimeType === 'opencode' && (
                   <div className="grid gap-4 md:grid-cols-2">
                     <div className="space-y-2">

@@ -21,8 +21,10 @@ type SessionCleanupRecoveryStore interface {
 // cleanup protocol. The durable intent closes the crash window between deleting
 // Kubernetes control records and deleting the transcript.
 type SessionCleanupPersistenceStore interface {
+	SessionTurnCleanupReceiptStore
 	GetSessionCleanupIntent(ctx context.Context, namespace, sessionName string) (*SessionCleanupIntent, error)
 	ListSessionCleanupIntents(ctx context.Context) ([]SessionCleanupIntent, error)
+	ListSessionCleanupTurns(ctx context.Context, intent SessionCleanupIntent) ([]SessionTurn, error)
 	GetSessionCleanupCompletion(ctx context.Context, namespace, sessionName string) (*SessionCleanupCompletion, error)
 	HasSessionCleanupFenceForUID(ctx context.Context, sessionUID string) (bool, error)
 	GetSessionCleanupIdentity(ctx context.Context, namespace, sessionName string) (string, error)
@@ -31,6 +33,18 @@ type SessionCleanupPersistenceStore interface {
 	PrepareSessionCleanup(ctx context.Context, intent SessionCleanupIntent) (*SessionCleanupIntent, error)
 	CompleteSessionCleanup(ctx context.Context, request CompleteSessionCleanupRequest) error
 }
+
+// SessionTurnCleanupReceiptStore reads Task-owned finalization evidence after
+// Session deletion. Ordinary turn and outbox reads never consult these receipts.
+type SessionTurnCleanupReceiptStore interface {
+	GetSessionTurnCleanupReceipt(ctx context.Context, namespace, sessionName, promptAttemptID string) (*SessionTurnCleanupReceipt, error)
+}
+
+// SessionRuntimeCleanupFunc retires resident runtime state after the durable
+// intent has fenced new work and before Session authority is removed.
+// It runs under the controller-epoch mutation lock and must not acquire that
+// lock again through another control-store mutation.
+type SessionRuntimeCleanupFunc func(context.Context, SessionCleanupIntent, ControllerEpochFence) error
 
 // ReclaimSessionRequest identifies one idempotent user-requested Session
 // deletion under the current controller epoch.

@@ -29,36 +29,37 @@ import (
 )
 
 const (
-	providerProxyPathPrefix               = "/_orka/provider/"
-	providerProxyScheme                   = "http"
-	providerProxyTLSScheme                = "https"
-	providerAuthorizationHeader           = "Authorization"
-	providerAPIKeyHeader                  = "X-Api-Key"
-	providerLegacyAPIKeyHeader            = "Api-Key"
-	providerProxyAuthorizationHeader      = "Proxy-Authorization"
-	providerCookieHeader                  = "Cookie"
-	providerForwardedForHeader            = "X-Forwarded-For"
-	providerContentEncodingHeader         = "Content-Encoding"
-	providerOpenAIResponsesV1Path         = "/v1/responses"
-	providerOpenAIChatCompletionsPath     = "/chat/completions"
-	providerOpenAIChatCompletionsV1Path   = "/v1/chat/completions"
-	providerModelsV1Path                  = "/v1/models"
-	providerMaxTokensField                = "max_tokens"
-	providerMaxCompletionTokensField      = "max_completion_tokens"
-	providerMaxOutputTokensField          = "max_output_tokens"
-	providerReasoningEffortField          = "reasoning_effort"
-	providerToolsField                    = "tools"
-	providerVerbosityField                = "verbosity"
-	defaultProviderProxyMaxRequestBytes   = 32 << 20
-	defaultProviderProxyMaxResponseBytes  = 64 << 20
-	defaultProviderProxyHeaderTimeout     = 2 * time.Minute
-	defaultProviderProxyReadHeaderTimeout = 5 * time.Second
-	defaultProviderProxyReadTimeout       = 30 * time.Second
-	defaultProviderProxySessionRequests   = 2
-	defaultProviderProxyGlobalRequests    = 8
-	providerUpstreamDetailProbeBytes      = 4 << 10
-	providerUpstreamDetailMaxBytes        = 256
-	providerUpstreamTransportFailure      = "provider upstream request failed"
+	providerProxyPathPrefix                     = "/_orka/provider/"
+	providerProxyScheme                         = "http"
+	providerProxyTLSScheme                      = "https"
+	providerAuthorizationHeader                 = "Authorization"
+	providerAPIKeyHeader                        = "X-Api-Key"
+	providerLegacyAPIKeyHeader                  = "Api-Key"
+	providerProxyAuthorizationHeader            = "Proxy-Authorization"
+	providerCookieHeader                        = "Cookie"
+	providerForwardedForHeader                  = "X-Forwarded-For"
+	providerContentEncodingHeader               = "Content-Encoding"
+	providerOpenAIResponsesV1Path               = "/v1/responses"
+	providerOpenAIChatCompletionsPath           = "/chat/completions"
+	providerOpenAIChatCompletionsV1Path         = "/v1/chat/completions"
+	providerModelsV1Path                        = "/v1/models"
+	providerMaxTokensField                      = "max_tokens"
+	providerMaxCompletionTokensField            = "max_completion_tokens"
+	providerMaxOutputTokensField                = "max_output_tokens"
+	providerReasoningEffortField                = "reasoning_effort"
+	providerToolsField                          = "tools"
+	providerVerbosityField                      = "verbosity"
+	defaultProviderProxyMaxRequestBytes         = 32 << 20
+	defaultProviderProxyMaxResponseBytes        = 64 << 20
+	defaultProviderProxyHeaderTimeout           = 2 * time.Minute
+	defaultProviderProxyReadHeaderTimeout       = 5 * time.Second
+	defaultProviderProxyReadTimeout             = 30 * time.Second
+	defaultProviderProxySessionRequests         = 2
+	defaultProviderProxyGlobalRequests          = 8
+	defaultProviderProxyMaxTurns          int32 = 50
+	providerUpstreamDetailProbeBytes            = 4 << 10
+	providerUpstreamDetailMaxBytes              = 256
+	providerUpstreamTransportFailure            = "provider upstream request failed"
 )
 
 type ProviderProxyConfig struct {
@@ -1443,7 +1444,7 @@ func normalizeProviderRequestBody(providerKind, model, requestPath string, model
 // when the caller omitted one.
 func providerOutputLimitFields(providerKind, requestPath string) (fields []string, canonical string) {
 	switch providerKind {
-	case providerKindCodex, providerKindCopilot:
+	case providerKindCodex, providerKindCopilot, providerKindAgentKit:
 		switch requestPath {
 		case "/responses", providerOpenAIResponsesV1Path, "/responses/compact", "/v1/responses/compact":
 			return []string{providerMaxOutputTokensField}, providerMaxOutputTokensField
@@ -1541,6 +1542,11 @@ func providerRequestRoute(providerKind, requestPath, method string) (allowed, re
 			allowed, requiresModel, class = method == http.MethodPost, true, providerRequestInference
 		case "/models", providerModelsV1Path:
 			allowed = method == http.MethodGet
+		}
+	case providerKindAgentKit:
+		switch requestPath {
+		case providerOpenAIChatCompletionsPath:
+			allowed, requiresModel, class = method == http.MethodPost, true, providerRequestInference
 		}
 	case providerKindOpencode:
 		switch requestPath {

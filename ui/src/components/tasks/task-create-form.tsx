@@ -9,9 +9,11 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/layout/page-header'
 import { useCreateTask } from '@/hooks/use-tasks'
 import { useAgentListAll } from '@/hooks/use-agents'
+import { api } from '@/lib/api-client'
 import { useUIStore } from '@/stores/ui'
 import { toast } from 'sonner'
 import { workspaceConfigSchema, type WorkspaceIntent } from '@/schemas/task'
+import { agentRuntimeSchema } from '@/schemas/runtime'
 import {
   sameWorkspaceRepositoryIdentity,
   validateWorkspaceRepositoryUrl,
@@ -91,10 +93,9 @@ export function TaskCreateForm() {
   const [createPR, setCreatePR] = useState(false)
 
   const dispatchableAgents = useMemo(
-    () => (agentsData?.items ?? []).filter((agent) => agent.spec.runtime && 'type' in agent.spec.runtime),
+    () => (agentsData?.items ?? []).filter((agent) => agent.spec.runtime),
     [agentsData],
   )
-  const externalRuntimeAgentCount = (agentsData?.items.length ?? 0) - dispatchableAgents.length
   // The inverse of dispatchableAgents: native AI-worker Agents carry their own
   // provider/model configuration and never set spec.runtime.
   const inlineAgents = useMemo(
@@ -347,6 +348,41 @@ export function TaskCreateForm() {
         }
         body.workspace = workspaceResult.data
       }
+
+      if (selectedRuntime && 'runtimeRef' in selectedRuntime) {
+        const runtimeName = selectedRuntime.runtimeRef.name
+        let registeredRuntime
+        try {
+          registeredRuntime = agentRuntimeSchema.parse(
+            await api.get<unknown>(`/agent-runtimes/${encodeURIComponent(runtimeName)}`, { namespace }),
+          )
+        } catch (err) {
+          toast.error(`Failed to load AgentRuntime ${runtimeName}: ${err instanceof Error ? err.message : 'Unknown error'}`)
+          return
+        }
+        if (registeredRuntime.spec.contractVersion === 'orka.harness.v2') {
+          const mcpPolicy = registeredRuntime.spec.capabilities.mcpPolicy
+          if (!mcpPolicy) {
+            toast.error(`AgentRuntime ${runtimeName} must define capabilities.mcpPolicy before orka.harness.v2 Task dispatch`)
+            return
+          }
+          const profileIntent = registeredRuntime.spec.capabilities.profile.workspaceIntent
+          if (profileIntent !== workspaceIntent) {
+            toast.error(`AgentRuntime ${runtimeName} profile workspace intent "${profileIntent}" does not match Task intent "${workspaceIntent}"`)
+            return
+          }
+          body.agentRuntime = {
+            allowedTools: [...mcpPolicy.allowedTools],
+          }
+        } else if (registeredRuntime.spec.contractVersion === 'orka.harness.v1') {
+          // External harness-v1 bindings require an explicit task-level list,
+          // even when the Task requests no brokered tools.
+          body.agentRuntime = { allowedTools: [] }
+        } else {
+          toast.error(`AgentRuntime ${runtimeName} must declare orka.harness.v1 or orka.harness.v2`)
+          return
+        }
+      }
     }
 
     if (priority) body.priority = parseInt(priority)
@@ -547,11 +583,6 @@ export function TaskCreateForm() {
                       ))}
                     </SelectContent>
                   </Select>
-                  {externalRuntimeAgentCount > 0 && (
-                    <p className="text-xs text-muted-foreground">
-                      Agents without a built-in CLI runtime are hidden because only built-in ACP Task dispatch is available.
-                    </p>
-                  )}
                 </div>
 
                 {selectedAgent && (

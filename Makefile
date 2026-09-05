@@ -12,6 +12,12 @@ ACP_CODEX_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-codex-runtime:latest
 ACP_CLAUDE_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-claude-runtime:latest
 ACP_COPILOT_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-copilot-runtime:latest
 ACP_OPENCODE_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-opencode-runtime:latest
+ACP_AGENTKIT_RUNTIME_IMG ?= ghcr.io/orka-agents/orka/acp-agentkit-runtime:latest
+# AgentKit images contain the framework runtime plus one frozen
+# /agent/agent.yaml. The Orka layer requires an immutable source image.
+AGENTKIT_RUNTIME_IMAGE ?=
+# Digest-pinned AgentKit source image identity used as the adapter authority.
+AGENTKIT_ADAPTER_DIGEST ?=
 WORKSPACE_PUBLISHER_IMG ?= ghcr.io/orka-agents/orka/workspace-publisher:latest
 # Providers backing the generated docker-build-acp-<provider>-runtime and
 # docker-push-acp-<provider>-runtime targets.
@@ -341,6 +347,14 @@ docker-build-acp-claude-runtime: ## Build the immutable Claude ACP runtime image
 docker-build-acp-copilot-runtime: ## Build the immutable GitHub Copilot ACP runtime image.
 docker-build-acp-opencode-runtime: ## Build the immutable OpenCode ACP runtime image.
 
+.PHONY: docker-build-acp-agentkit-runtime
+docker-build-acp-agentkit-runtime: ## Layer the Orka supervisor onto a digest-pinned AgentKit runtime image.
+	$(CONTAINER_TOOL) build \
+		--build-arg AGENTKIT_RUNTIME_IMAGE="$(AGENTKIT_RUNTIME_IMAGE)" \
+		--build-arg AGENTKIT_ADAPTER_DIGEST="$(AGENTKIT_ADAPTER_DIGEST)" \
+		-t ${ACP_AGENTKIT_RUNTIME_IMG} \
+		-f workers/acp/images/agentkit/Dockerfile .
+
 .PHONY: docker-build-workspace-publisher
 docker-build-workspace-publisher: ## Build the clean-room workspace publisher image.
 	$(CONTAINER_TOOL) build -t ${WORKSPACE_PUBLISHER_IMG} -f workers/publisher/Dockerfile .
@@ -364,6 +378,10 @@ docker-push-acp-codex-runtime: ## Push the immutable Codex ACP runtime image.
 docker-push-acp-claude-runtime: ## Push the immutable Claude ACP runtime image.
 docker-push-acp-copilot-runtime: ## Push the immutable GitHub Copilot ACP runtime image.
 docker-push-acp-opencode-runtime: ## Push the immutable OpenCode ACP runtime image.
+
+.PHONY: docker-push-acp-agentkit-runtime
+docker-push-acp-agentkit-runtime: ## Push an AgentKit ACP runtime image built from a frozen agent image.
+	$(CONTAINER_TOOL) push ${ACP_AGENTKIT_RUNTIME_IMG}
 
 # acp-provider-uc maps an ACP runtime provider word to the uppercase form used
 # in its image variable name (ACP_<PROVIDER>_RUNTIME_IMG).

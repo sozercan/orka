@@ -789,7 +789,7 @@ func (d *ACPDispatcher) acquireTaskSessionLease(
 		expires = time.Now().UTC().Add(task.Spec.Timeout.Duration + time.Minute)
 	}
 	return d.Sessions.AcquireMutationLease(ctx, ACPAcquireSessionLeaseRequest{
-		Session: *control, Fence: fence, TaskUID: string(task.UID), Attempt: int64(task.Status.Execution.Attempt),
+		Session: *control, Fence: fence, TaskName: task.Name, TaskUID: string(task.UID), Attempt: int64(task.Status.Execution.Attempt),
 		PromptID: task.Status.Execution.PromptID, PromptRequestDigest: task.Status.Execution.RequestDigest,
 		AcquiredAt: time.Now().UTC(), ExpiresAt: &expires,
 		NamespaceUID: lineage.NamespaceUID, RuntimeIdentity: lineage.RuntimeIdentity, ConfigDigest: lineage.ConfigDigest,

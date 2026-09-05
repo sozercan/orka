@@ -262,6 +262,7 @@ describe('AgentCreateForm', () => {
     const user = userEvent.setup()
     render(<AgentCreateForm />)
     await user.type(screen.getByPlaceholderText('my-agent'), 'external-agent')
+    await user.type(screen.getByLabelText('Model'), 'stale-built-in-model')
     const sourceTrigger = screen.getByText('Runtime source').closest('.space-y-2')!.querySelector('[role="combobox"]')!
     await act(async () => {
       fireEvent.pointerDown(sourceTrigger, { button: 0, pointerId: 1, pointerType: 'mouse' })
@@ -272,8 +273,7 @@ describe('AgentCreateForm', () => {
     })
     await waitFor(() => expect(sourceTrigger).toHaveTextContent('External v2 AgentRuntime'))
     await user.type(screen.getByPlaceholderText('external-codex'), 'external-codex')
-    expect(screen.getByLabelText('Model override')).not.toBeRequired()
-    expect(screen.getByLabelText('Model override')).toHaveAttribute('placeholder', 'Optional model override')
+    expect(screen.queryByLabelText('Model')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Create Agent' }))
 
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Agent created'))

@@ -98,29 +98,47 @@ func TestValidateFinalizedSessionProjectionAcceptsStrippedNoWorkspaceRevision(t 
 	// strips that value before the schema-validated Task status. Reclamation
 	// must compare through the same normalization, or every no-workspace Task
 	// with delivery evidence becomes undeletable.
-	task, sourceUID, attempt, projection := restoredProjectionFixture()
-	task.Spec.SessionRef = &corev1alpha1.SessionReference{Name: "session-transcript", Create: true}
-	attempt.DeliveryState = store.PromptDeliveryReadValidated
-	projection.Delivery = &corev1alpha1.TaskDeliveryStatus{
-		State:       corev1alpha1.TaskDeliveryStateReadValidated,
-		Outcome:     corev1alpha1.TaskDeliveryOutcomeReadValidated,
-		StartingSHA: NoWorkspaceRevision,
-	}
-	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
-		State:   corev1alpha1.TaskDeliveryStateReadValidated,
-		Outcome: corev1alpha1.TaskDeliveryOutcomeReadValidated,
-	}
-	payload := marshalProjection(t, projection)
-	turn := finalizedSessionProjectionTurn(t, payload, attempt)
+	for _, tt := range []struct {
+		name      string
+		workspace *corev1alpha1.WorkspaceConfig
+	}{
+		{name: "omitted workspace"},
+		{name: "empty workspace", workspace: &corev1alpha1.WorkspaceConfig{}},
+		{name: "read workspace without repository", workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			task, sourceUID, attempt, projection := restoredProjectionFixture()
+			task.Spec.Workspace = tt.workspace
+			task.Spec.SessionRef = &corev1alpha1.SessionReference{Name: "session-transcript", Create: true}
+			attempt.DeliveryState = store.PromptDeliveryReadValidated
+			projection.Delivery = &corev1alpha1.TaskDeliveryStatus{
+				State:       corev1alpha1.TaskDeliveryStateReadValidated,
+				Outcome:     corev1alpha1.TaskDeliveryOutcomeReadValidated,
+				StartingSHA: NoWorkspaceRevision,
+			}
+			task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
+				State:   corev1alpha1.TaskDeliveryStateReadValidated,
+				Outcome: corev1alpha1.TaskDeliveryOutcomeReadValidated,
+			}
+			payload := marshalProjection(t, projection)
+			turn := finalizedSessionProjectionTurn(t, payload, attempt)
 
-	if _, err := ValidateFinalizedSessionProjection(payload, task, sourceUID, attempt, turn); err != nil {
-		t.Fatalf("ValidateFinalizedSessionProjection(no-workspace revision) error = %v", err)
+			if _, err := ValidateFinalizedSessionProjection(payload, task, sourceUID, attempt, turn); err != nil {
+				t.Fatalf("ValidateFinalizedSessionProjection(no-repository revision) error = %v", err)
+			}
+			if _, err := ValidateRestoredProjection(payload, task, sourceUID, attempt); err != nil {
+				t.Fatalf("ValidateRestoredProjection(no-repository revision) error = %v", err)
+			}
+			if projection.Delivery.StartingSHA != NoWorkspaceRevision || task.Status.Delivery.StartingSHA != "" {
+				t.Fatal("projection validation changed immutable delivery evidence")
+			}
+		})
 	}
 }
 
 func TestValidateRestoredProjectionRejectsNoWorkspaceRevisionForWorkspaceTask(t *testing.T) {
 	task, sourceUID, attempt, projection := restoredProjectionFixture()
-	task.Spec.Workspace = &corev1alpha1.WorkspaceConfig{}
+	task.Spec.Workspace = &corev1alpha1.WorkspaceConfig{GitRepo: "https://github.com/example/repo.git"}
 	projection.Delivery.StartingSHA = NoWorkspaceRevision
 	task.Status.Delivery.StartingSHA = ""
 

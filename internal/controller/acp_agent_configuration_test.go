@@ -114,6 +114,25 @@ func TestBuildACPAgentSessionConfigurationAcceptsOpenCodeTokenLimits(t *testing.
 	}
 }
 
+func TestBuildACPAgentSessionConfigurationDefaultsMaxTurnsTo50(t *testing.T) {
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID("agent-uid"), Generation: 1},
+		Spec: corev1alpha1.AgentSpec{
+			Model:   &corev1alpha1.ModelConfig{Name: "model"},
+			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeCodex},
+		},
+	}
+
+	configuration, err := buildACPAgentSessionConfiguration(task, agent, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.MaxTurns != 50 {
+		t.Fatalf("MaxTurns = %d, want built-in default 50", configuration.MaxTurns)
+	}
+}
+
 func TestResolveACPAgentSessionConfigurationInlineAndConfigMap(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

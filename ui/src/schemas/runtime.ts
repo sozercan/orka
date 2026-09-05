@@ -114,6 +114,13 @@ const agentRuntimeLimitsSchema = z.object({
   maxWorkspaceDeltaBytes: z.number(),
 })
 
+const agentRuntimeMCPPolicySchema = z.object({
+  allowedTools: z.array(z.string()),
+  disallowedTools: z.array(z.string()),
+  allowBash: z.boolean(),
+  approvalRequiredTools: z.array(z.string()),
+})
+
 const workspaceGovernanceSchema = z.object({
   mode: z.enum(['strict-governed', 'trusted-non-governed']),
   trusted: z.boolean(),
@@ -173,6 +180,10 @@ const agentRuntimeV2SpecSchema = z.object({
   capabilities: z.object({
     runtimeInstanceID: z.string(),
     profile: agentRuntimeProfileSchema,
+    // Stored v2 registrations created before MCP policy materialization may
+    // omit this field. Read/list paths must preserve those records; dispatch
+    // validates the policy before using the registration.
+    mcpPolicy: agentRuntimeMCPPolicySchema.optional(),
     limits: agentRuntimeLimitsSchema,
     supportsDrain: z.boolean().default(false),
     supportsPublicationFinalization: z.boolean().optional(),

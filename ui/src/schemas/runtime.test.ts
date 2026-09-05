@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { agentRuntimeSchema, runtimePoolSchema } from './runtime'
+import { agentRuntimeListSchema, agentRuntimeSchema, runtimePoolSchema } from './runtime'
 
 const digest = `sha256:${'a'.repeat(64)}`
 
@@ -70,7 +70,7 @@ describe('agentRuntimeSchema', () => {
     expect(parsed.spec.contractVersion).toBeUndefined()
   })
 
-  it('parses the v2 capability surface', () => {
+  it('parses current and stored pre-mcpPolicy v2 capability surfaces', () => {
     const value = {
       metadata: { name: 'external-codex', namespace: 'default' },
       spec: {
@@ -87,6 +87,12 @@ describe('agentRuntimeSchema', () => {
             digestSchemaVersion: 1,
             adapterName: 'codex-acp',
             adapterDigest: digest,
+          },
+          mcpPolicy: {
+            allowedTools: ['web_search'],
+            disallowedTools: [],
+            allowBash: false,
+            approvalRequiredTools: [],
           },
           limits: {
             maxResidentSessions: 10,
@@ -123,6 +129,25 @@ describe('agentRuntimeSchema', () => {
     expect(parsed.spec.capabilities.supportsDrain).toBe(false)
     expect(parsed.spec.capabilities.profile.adapterName).toBe('codex-acp')
     expect(parsed.spec.capabilities.workspaceGovernance.mode).toBe('strict-governed')
+
+    const { mcpPolicy, ...legacyCapabilities } = value.spec.capabilities
+    expect(mcpPolicy).toBeDefined()
+    const list = {
+      items: [{
+        ...value,
+        metadata: { ...value.metadata, name: 'pre-policy-v2' },
+        spec: { ...value.spec, capabilities: legacyCapabilities },
+        status: { ready: false, message: 'capabilities.mcpPolicy is required' },
+      }, value],
+    }
+    const parsedList = agentRuntimeListSchema.parse(list)
+    expect(parsedList.items).toHaveLength(2)
+    expect(parsedList.items[0]?.metadata.name).toBe('pre-policy-v2')
+    expect(parsedList.items[0]?.spec.contractVersion).toBe('orka.harness.v2')
+    if (parsedList.items[0]?.spec.contractVersion !== 'orka.harness.v2') {
+      throw new Error('expected stored v2 runtime')
+    }
+    expect(parsedList.items[0].spec.capabilities.mcpPolicy).toBeUndefined()
 
     expect(agentRuntimeSchema.safeParse({
       ...value,

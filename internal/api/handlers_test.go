@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -278,6 +279,33 @@ func setupTestHandlersWithAuthzStore(
 	app.Put("/skills/:name", handlers.UpdateSkill)
 	app.Delete("/skills/:name", handlers.DeleteSkill)
 	return app, ss
+}
+
+func setupTestCreateTaskHandlerWithAuthzReaders(
+	t *testing.T,
+	ctxTokenConfig ContextTokenConfig,
+	mode string,
+	cachedClient client.Client,
+	apiReader client.Reader,
+) *fiber.App {
+	t.Helper()
+	db, err := sqlite.NewDB(":memory:")
+	require.NoError(t, err)
+	ss := sqlite.NewStore(db, ":memory:")
+	authz, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: mode})
+	require.NoError(t, err)
+	handlers := NewHandlers(HandlersConfig{
+		Client:                    cachedClient,
+		APIReader:                 apiReader,
+		SessionStore:              ss,
+		ResultStore:               ss,
+		ContextTokenAuthorization: authz,
+	})
+
+	app := fiber.New()
+	app.Use(NewAuthMiddleware(cachedClient, AuthConfig{ContextTokens: ctxTokenConfig}))
+	app.Post("/tasks", handlers.CreateTask)
+	return app
 }
 
 func setupTestHandlersWithObjects(objs ...runtime.Object) (*Handlers, *fiber.App) {
@@ -767,6 +795,149 @@ func TestHandlers_CreateTask_ContextTokenAuthorizationAuditAllowsFailures(t *tes
 	}
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("StatusCode = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+}
+
+func TestHandlers_CreateTask_ContextTokenAuthorizationUsesAuthoritativeExternalRuntimePolicy(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+
+	tests := []struct {
+		name               string
+		mode               string
+		cachedAllowedTools []string
+		apiAllowedTools    []string
+		requestAllowed     []string
+		tokenAllowed       []string
+		nilAPIReader       bool
+		failAPIReader      bool
+		wantStatus         int
+	}{
+		{
+			name:               "rejects cached match after authoritative policy expansion",
+			mode:               ContextTokenAuthorizationModeEnforce,
+			cachedAllowedTools: []string{"Read"},
+			apiAllowedTools:    []string{"Read", "Write"},
+			requestAllowed:     []string{"Read"},
+			tokenAllowed:       []string{"Read"},
+			wantStatus:         http.StatusForbidden,
+		},
+		{
+			name:               "allows exact authoritative policy",
+			mode:               ContextTokenAuthorizationModeEnforce,
+			cachedAllowedTools: []string{"Read"},
+			apiAllowedTools:    []string{"Read", "Write"},
+			requestAllowed:     []string{"Write", "Read", "Read"},
+			tokenAllowed:       []string{"Read", "Write"},
+			wantStatus:         http.StatusCreated,
+		},
+		{
+			name:               "allows explicit empty deny all policy",
+			mode:               ContextTokenAuthorizationModeEnforce,
+			cachedAllowedTools: []string{},
+			apiAllowedTools:    []string{},
+			requestAllowed:     []string{},
+			tokenAllowed:       []string{},
+			wantStatus:         http.StatusCreated,
+		},
+		{
+			name:               "rejects omitted external allowed tools",
+			mode:               ContextTokenAuthorizationModeEnforce,
+			cachedAllowedTools: []string{},
+			apiAllowedTools:    []string{},
+			requestAllowed:     nil,
+			tokenAllowed:       []string{},
+			wantStatus:         http.StatusForbidden,
+		},
+		{
+			name:               "uses cached client when API reader is absent",
+			mode:               ContextTokenAuthorizationModeEnforce,
+			cachedAllowedTools: []string{"Read"},
+			requestAllowed:     []string{"Read"},
+			tokenAllowed:       []string{"Read"},
+			nilAPIReader:       true,
+			wantStatus:         http.StatusCreated,
+		},
+		{
+			name:               "does not fall back after authoritative read error",
+			mode:               ContextTokenAuthorizationModeEnforce,
+			cachedAllowedTools: []string{"Read"},
+			requestAllowed:     []string{"Read"},
+			tokenAllowed:       []string{"Read"},
+			failAPIReader:      true,
+			wantStatus:         http.StatusInternalServerError,
+		},
+		{
+			name:               "audit mode records mismatch without blocking",
+			mode:               ContextTokenAuthorizationModeAudit,
+			cachedAllowedTools: []string{"Read"},
+			apiAllowedTools:    []string{"Read", "Write"},
+			requestAllowed:     []string{"Read"},
+			tokenAllowed:       []string{"Read"},
+			wantStatus:         http.StatusCreated,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cachedAgent, cachedRuntime := testExternalRuntimeAuthorizationObjects(tt.cachedAllowedTools)
+			cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cachedAgent, cachedRuntime).Build()
+
+			var apiReader client.Reader
+			switch {
+			case tt.nilAPIReader:
+			case tt.failAPIReader:
+				apiReader = fake.NewClientBuilder().
+					WithScheme(scheme).
+					WithInterceptorFuncs(interceptor.Funcs{
+						Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+							return errors.New("authoritative API unavailable")
+						},
+					}).
+					Build()
+			default:
+				apiAgent, apiRuntime := testExternalRuntimeAuthorizationObjects(tt.apiAllowedTools)
+				apiReader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(apiAgent, apiRuntime).Build()
+			}
+
+			app := setupTestCreateTaskHandlerWithAuthzReaders(t, ctxTokenConfig, tt.mode, cachedClient, apiReader)
+			token := issueTestContextToken(t, provider, nil, map[string]any{
+				"scope": ContextTokenScopeTaskCreate,
+				"tctx": map[string]any{
+					"namespace":    "default",
+					"taskType":     "agent",
+					"agent":        "agentkit",
+					"allowedTools": tt.tokenAllowed,
+				},
+			})
+			body := CreateTaskRequest{
+				Name:         strings.ReplaceAll(tt.name, " ", "-"),
+				Namespace:    "default",
+				Type:         corev1alpha1.TaskTypeAgent,
+				AgentRef:     &corev1alpha1.AgentReference{Name: "agentkit"},
+				AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: tt.requestAllowed},
+			}
+			bodyBytes, err := json.Marshal(body)
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPost, "/tasks", bytes.NewReader(bodyBytes))
+			req.Header.Set(TransactionTokenHeaderName, token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req)
+			require.NoError(t, err)
+			respBody, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equalf(t, tt.wantStatus, resp.StatusCode, "response body: %s", respBody)
+
+			created := &corev1alpha1.Task{}
+			err = cachedClient.Get(context.Background(), client.ObjectKey{Name: body.Name, Namespace: body.Namespace}, created)
+			if tt.wantStatus == http.StatusCreated {
+				require.NoError(t, err)
+			} else {
+				require.True(t, apierrors.IsNotFound(err), "task must not be created after authorization failure: %v", err)
+			}
+		})
 	}
 }
 

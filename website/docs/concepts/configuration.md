@@ -483,9 +483,10 @@ model IDs use provider/model form, for example `openai/gpt-5.4`, and require rev
 `contextWindow` and `maxTokens` values.
 
 Operator-owned runtimes outside the built-in set can use `orka.harness.v2`
-`AgentRuntime` registration and conformance, but Task planning through
-`runtime.runtimeRef` remains fail-closed until the external v2 dispatcher
-support boundary is enabled.
+`AgentRuntime` registration and conformance. A current-generation ready,
+strict-governed registration can be selected through `runtime.runtimeRef`;
+Orka freezes and revalidates its endpoint, profile, authentication authority,
+and observed runtime identity for dispatch.
 
 Agent runtime tasks reference an Agent with `runtime` configured:
 

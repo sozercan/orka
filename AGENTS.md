@@ -89,7 +89,7 @@ Do NOT delete `// +kubebuilder:scaffold:*` comments.
 - `Task.spec.workspace` is the only agent repository surface. Keep clone/read credentials in `readCredentialRef` and publication/forge credentials in `publicationCredentialRef`; neither enters the ACP process tree.
 - RuntimePools are controller-owned, digest-pinned, scale-to-zero resources. Only `Serving` + `Accepting` admits new RuntimeSessions; drain/finalization must complete before replacement or scale-down.
 - Safe v2 probes are `GET /v2/health` and `GET /v2/capabilities`; status and all mutations require controller authentication plus operation-scoped authorization and exact fences.
-- External `runtimeRef` registrations are v2-only. Registration/conformance exists, but external Task dispatch currently fails closed until its v2 dispatcher is wired.
+- External v2 `runtimeRef` dispatch freezes and revalidates the AgentRuntime UID, generation, profile, endpoint, authentication Secret versions, and observed runtime instance. External v2 sessions receive no per-Task `AgentConfiguration`; the registered profile digest remains authoritative. Harness v1 registrations and dispatch remain available when explicitly enabled.
 - ACP runtime Pods run the supervisor as root with narrowly added process/identity capabilities; ACP children use distinct non-reused UIDs/GIDs, private session trees, and no Git credentials.
 - Coordination memory tools: `recall_memory`, `remember`, `propose_memory`, `search_transcript`
 - Do not store secrets, credentials, tokens, raw transcripts, or one-off task status in durable memory

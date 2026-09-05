@@ -141,6 +141,30 @@ func clientError(operation string, kind ClientErrorKind, message string, cause e
 	return &ClientError{Operation: operation, Kind: kind, Message: message, cause: cause}
 }
 
+type retryablePreMutationError struct{ err error }
+
+func (e *retryablePreMutationError) Error() string { return e.err.Error() }
+func (e *retryablePreMutationError) Unwrap() error { return e.err }
+
+// MarkPreMutationRetryable marks a before-mutation validation failure as
+// transient. The client still rejects the mutation locally and reports that no
+// request bytes were written; callers may retry the same sealed identity while
+// its deadline remains valid.
+func MarkPreMutationRetryable(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := errors.AsType[*retryablePreMutationError](err); ok {
+		return err
+	}
+	return &retryablePreMutationError{err: err}
+}
+
+func preMutationRetryable(err error) bool {
+	var marked *retryablePreMutationError
+	return errors.As(err, &marked)
+}
+
 func classificationCode(class RequestClassification) ErrorCode {
 	switch class {
 	case RequestClassificationStaleFence:

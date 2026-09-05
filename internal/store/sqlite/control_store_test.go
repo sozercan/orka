@@ -208,6 +208,61 @@ func TestPromptAttemptSubmittedUnknownBecomesTerminalOutcomeUnknown(t *testing.T
 	}
 }
 
+func TestPromptAttemptProvenNotAcceptedRecoveryPreservesBindings(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	fence := seedControlEpoch(t, s)
+	key := store.PromptAttemptKey{Namespace: "ns", TaskUID: "retryable-unsent-task", Attempt: 1, PromptID: "retryable-unsent-prompt"}
+	attempt, err := s.CreatePromptAttempt(ctx, boundPromptAttemptForSQLiteTest(&store.PromptAttempt{
+		Key: key, RequestDigest: controlTestDigest("retryable-unsent-request"),
+	}), fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, next := range []store.PromptExecutionState{
+		store.PromptExecutionReserved,
+		store.PromptExecutionSessionStarting,
+		store.PromptExecutionPlanned,
+		store.PromptExecutionSubmitting,
+	} {
+		transition := store.PromptAttemptExecutionTransition{
+			ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+			NewState: next, OperationID: "to-" + string(next), OperationDigest: controlTestDigest("to-" + string(next)),
+			UpdatedAt: time.Now().UTC(),
+		}
+		if next == store.PromptExecutionPlanned {
+			transition.RuntimeInstanceID = "runtime-instance"
+			transition.SessionUID = "session-uid"
+			transition.SessionLeaseGeneration = 3
+		}
+		attempt, err = s.TransitionPromptAttemptExecution(ctx, transition)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	withoutProof := store.PromptAttemptPreSubmissionRecovery{
+		ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+		PreserveBindings: true, OperationID: "recover-without-proof",
+		OperationDigest: controlTestDigest("recover-without-proof"), RecoveredAt: time.Now().UTC(),
+	}
+	if _, err := s.RecoverPromptAttemptPreSubmission(ctx, withoutProof); !errors.Is(err, store.ErrValidation) {
+		t.Fatalf("unproven binding-preserving recovery error = %v, want ErrValidation", err)
+	}
+	recovered, err := s.RecoverPromptAttemptPreSubmission(ctx, store.PromptAttemptPreSubmissionRecovery{
+		ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+		ProvenNotAccepted: true, PreserveBindings: true, OperationID: "recover-retryable-unsent",
+		OperationDigest: controlTestDigest("recover-retryable-unsent"), RecoveredAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.ExecutionState != store.PromptExecutionReserved || recovered.ID != attempt.ID || recovered.Key != attempt.Key ||
+		recovered.RequestDigest != attempt.RequestDigest || recovered.RuntimeInstanceID != attempt.RuntimeInstanceID ||
+		recovered.SessionUID != attempt.SessionUID || recovered.SessionLeaseGeneration != attempt.SessionLeaseGeneration {
+		t.Fatalf("binding-preserving recovery = %#v, want identity and bindings from %#v", recovered, attempt)
+	}
+}
+
 func TestPromptAttemptBindingDigestMigrationPreservesLegacyRead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-prompt-attempt.db")
 	legacyDB, err := sql.Open("sqlite", path)

@@ -1,12 +1,12 @@
 # Immutable ACP runtime images
 
 These definitions build separate Codex, Claude, GitHub Copilot, and OpenCode
-ACP runtime images. The build context must be the repository root so each image can
-compile
+ACP runtime images, plus an AgentKit composition image. The build context must
+be the repository root so each image can compile
 `cmd/orka-acp-runtime` and verify its duplicated supply-chain values against
 `internal/acp/pins.go`.
 
-The final images intentionally:
+The four built-in final images intentionally:
 
 - run the Orka supervisor as root so it can create private session trees and
   launch each ACP child under a unique, non-reused UID/GID;
@@ -22,6 +22,23 @@ The final images intentionally:
 Runtime credentials must be mounted as files and referenced through the
 `ORKA_ACP_*_TOKEN_FILE` settings. Do not pass secrets as Docker build arguments,
 labels, or environment defaults.
+
+## AgentKit composition image
+
+`workers/acp/images/agentkit/Dockerfile` layers the static Orka supervisor and
+exec helper onto an operator-supplied AgentKit agent image. It requires the
+source image by immutable digest and validates the expected
+`/opt/agentkit/bin/agentkit-serve` executable and `/agent/agent.yaml`. The
+advertised adapter digest must equal the digest-pinned source image identity,
+so a stale or unrelated value cannot pass composition. The build does not
+rebuild or sanitize the source image.
+
+The source-image operator remains responsible for its packages and clients
+(including package managers, Git, SSH, curl, or wget), embedded defaults and
+credentials, writable paths, supported architectures, vulnerability posture,
+SBOM and signature, and third-party licensing. Deployment must apply the same
+read-only filesystem, credential-mount, service-account, egress, and supervisor
+capability controls described below.
 
 ## Frozen inputs
 
@@ -95,8 +112,8 @@ namespaces.
 
 The Copilot image instead installs the unmodified official per-architecture
 release executable. Its tar asset is checksum-verified, must contain exactly one
-`copilot` entry, and is never downloaded at runtime. All final images perform no
-package installation or network download.
+`copilot` entry, and is never downloaded at runtime. The four built-in final
+images perform no package installation or network download.
 
 OpenCode is not wrapped by an adapter: the supervisor launches the
 checksum-verified native binary as `opencode --pure acp`. Its per-session config
@@ -184,9 +201,10 @@ immutable digest rather than a mutable tag.
 
 ## Runtime contract
 
-Each image defaults only `ORKA_ACP_PROVIDER`. Deployment configuration must
-supply the model, runtime-pool and controller fence, profile digests, workspace
-intent, credential role/scope, and absolute Secret-mounted token-file paths.
+Each built-in image defaults only `ORKA_ACP_PROVIDER`. Deployment configuration
+must supply the model, runtime-pool and controller fence, profile digests,
+workspace intent, credential role/scope, and absolute Secret-mounted token-file
+paths.
 Mount a writable volume at `/sessions`; do not rely on the image layer for
 session durability. Kubernetes packaging must also enforce the read-only root
 filesystem, no service-account token, default-deny egress, and only the
@@ -199,7 +217,7 @@ tree.
 ## Licensing caveat
 
 Orka's license and notice, adapter licenses, and provider license/notice files
-are retained under `/usr/share/licenses` in the final images.
+are retained under `/usr/share/licenses` in the built-in final images.
 
 Codex ACP and the pinned Codex source are Apache-2.0. OpenCode is MIT, and
 ripgrep is dual-licensed under MIT or the Unlicense. Claude Agent ACP is

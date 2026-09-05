@@ -38,7 +38,7 @@ func TestMCPProxyIsPromptScopedAndForwardsExactAuthorization(t *testing.T) {
 	if idleList.Error != nil || responseToolCount(idleList.Result) != 1 {
 		t.Fatalf("idle tools/list = %#v", idleList)
 	}
-	idleCall := decodeMCPResponse(t, doMCPRequest(t, server, "credential", `{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"lookup","arguments":{}}}`))
+	idleCall := decodeMCPResponse(t, doMCPRequest(t, server, "credential", `{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"lookup","arguments":{},"_meta":{"progressToken":1}}}`))
 	if idleCall.Error == nil || calls.Load() != 0 {
 		t.Fatalf("idle tool call = %#v calls=%d", idleCall, calls.Load())
 	}
@@ -48,7 +48,7 @@ func TestMCPProxyIsPromptScopedAndForwardsExactAuthorization(t *testing.T) {
 	if err := session.activate(authorization, lease, now); err != nil {
 		t.Fatal(err)
 	}
-	pendingCall := decodeMCPResponse(t, doMCPRequest(t, server, "credential", `{"jsonrpc":"2.0","id":"call-2","method":"tools/call","params":{"name":"lookup","arguments":{}}}`))
+	pendingCall := decodeMCPResponse(t, doMCPRequest(t, server, "credential", `{"jsonrpc":"2.0","id":"call-2","method":"tools/call","params":{"name":"lookup","arguments":{},"_meta":{"progressToken":2}}}`))
 	if pendingCall.Error == nil || calls.Load() != 0 {
 		t.Fatalf("pre-accept tool call = %#v calls=%d", pendingCall, calls.Load())
 	}
@@ -81,6 +81,62 @@ func TestMCPProxyIsPromptScopedAndForwardsExactAuthorization(t *testing.T) {
 		t.Fatalf("wrong credential status = %d", unauthorized.StatusCode)
 	}
 	_ = unauthorized.Body.Close()
+}
+
+func TestMCPProxyToolCallMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fields    string
+		errorCode int
+	}{
+		{name: "numeric progress token", fields: `,"_meta":{"progressToken":2}`},
+		{name: "string progress token and extensions", fields: `,"_meta":{"progressToken":"progress-1","client":{"version":1}}`},
+		{name: "unknown parameter", fields: `,"progressToken":2`, errorCode: -32602},
+		{name: "metadata must be an object", fields: `,"_meta":[2]`, errorCode: -32602},
+		{name: "metadata stays request bounded", fields: `,"_meta":{"padding":"` + strings.Repeat("x", harnessv2.MaxMCPArgumentsBytes+(64<<10)) + `"}`, errorCode: -32600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := make(chan harnessv2.MCPBrokerCallRequest, 1)
+			session, endpoint := newTestMCPProxySession(t, MCPBrokerFunc(func(_ context.Context, request harnessv2.MCPBrokerCallRequest) (harnessv2.MCPBrokerCallResponse, error) {
+				captured <- request
+				return harnessv2.MCPBrokerCallResponse{
+					Protocol: harnessv2.ProtocolVersion, CallID: request.Call.CallID, Result: json.RawMessage(`{"value":"ok"}`),
+				}, nil
+			}), false)
+			now := time.Now().UTC()
+			authorization, lease := testMCPAuthorization(t, session.fence, now, false)
+			if err := session.activate(authorization, lease, now); err != nil {
+				t.Fatal(err)
+			}
+			if err := session.markRunning(authorization.PromptID, now); err != nil {
+				t.Fatal(err)
+			}
+			payload := `{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"lookup","arguments":{"query":"x"}` + tc.fields + `}}`
+			response := decodeMCPResponse(t, doMCPRequest(t, endpoint, "credential", payload))
+			if tc.errorCode != 0 {
+				if response.Error == nil || response.Error.Code != tc.errorCode {
+					t.Fatalf("MCP response = %#v, want error %d", response, tc.errorCode)
+				}
+				if len(captured) != 0 {
+					t.Fatal("invalid tool call reached the broker")
+				}
+				return
+			}
+			if response.Error != nil {
+				t.Fatalf("MCP metadata rejected: %#v", response.Error)
+			}
+			select {
+			case request := <-captured:
+				if request.Metadata.Fence != session.fence || request.Metadata.TaskUID != authorization.TaskUID ||
+					request.Metadata.PromptID != authorization.PromptID || request.Call.ToolName != "lookup" ||
+					!bytes.Equal(request.Call.Arguments, []byte(`{"query":"x"}`)) {
+					t.Fatal("MCP metadata changed the broker call or its authority")
+				}
+			default:
+				t.Fatal("tool call did not reach the broker")
+			}
+		})
+	}
 }
 
 func TestMCPProxySettlementRevokesAndCancelsInflightCall(t *testing.T) {

@@ -237,6 +237,33 @@ func TestProviderProxyAcceptsVersionedOpenAIPath(t *testing.T) {
 	}
 }
 
+func TestProviderProxyRejectsVersionedAgentKitChatCompletions(t *testing.T) {
+	var reached atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	_, session, binding := activeTestProviderProxySession(t, ProviderProxyConfig{
+		UpstreamBaseURL: upstream.URL + "/v1", UpstreamBearerToken: testUpstreamToken,
+		ProviderKind: providerKindAgentKit, Model: "gpt-test",
+	})
+	defer session.close()
+	response := doProviderProxyRequest(
+		t, http.MethodPost, binding.BaseURL+providerOpenAIChatCompletionsV1Path, binding.Credential,
+		[]byte(`{"model":"gpt-test"}`), nil,
+	)
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("versioned AgentKit chat request status = %d body=%s", response.StatusCode, body)
+	}
+	if got := reached.Load(); got != 0 {
+		t.Fatalf("versioned AgentKit chat request reached upstream %d times", got)
+	}
+}
+
 func TestProviderProxyLeaseExpiryCancelsInflightAndDeniesLateRequests(t *testing.T) {
 	started := make(chan struct{})
 	cancelled := make(chan struct{})

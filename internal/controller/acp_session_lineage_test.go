@@ -67,7 +67,7 @@ func newACPLineageTestFixture(t *testing.T, wrapProjection func(store.SessionLin
 	}
 	continuity, err := NewACPSessionContinuity(ACPSessionContinuityConfig{
 		SessionControls: controls, Transcripts: persistence, Publications: controls, BranchClaims: controls,
-		Lineages:      projection,
+		GatewayEvents: persistence, Lineages: projection,
 		NewSessionUID: func() (string, error) { return "acp-lineage-session-uid", nil },
 	})
 	if err != nil {
@@ -97,7 +97,7 @@ func acpLineageLeaseRequest(
 	taskUID string,
 ) ACPAcquireSessionLeaseRequest {
 	return ACPAcquireSessionLeaseRequest{
-		Session: *control, Fence: fence, TaskUID: taskUID, Attempt: 1, PromptID: "prompt-" + taskUID,
+		Session: *control, Fence: fence, TaskName: taskUID, TaskUID: taskUID, Attempt: 1, PromptID: "prompt-" + taskUID,
 		PromptRequestDigest: acpSessionTestDigest("request-" + taskUID),
 		AcquiredAt:          time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC),
 		NamespaceUID:        "ns-uid-1",
@@ -157,6 +157,67 @@ func TestAcquireMutationLeaseRejectsNonemptyUnclassifiedSession(t *testing.T) {
 	}
 	if _, getErr := fixture.persistence.GetSessionLineage(ctx, "ns", "unclassified-session"); !errors.Is(getErr, store.ErrNotFound) {
 		t.Fatalf("unclassified Session gained SQLite lineage: %v", getErr)
+	}
+}
+
+func TestAcquireMutationLeaseRequiresLinkedGatewayTask(t *testing.T) {
+	ctx := context.Background()
+	fixture := newACPLineageTestFixture(t, nil)
+	now := time.Date(2026, 8, 5, 9, 30, 0, 0, time.UTC)
+	event := store.GatewayEvent{
+		ID: "gateway-lineage-event", Namespace: "ns", NamespaceUID: "ns-uid-1",
+		GatewayUID: "gateway-uid", GatewayGeneration: 1, GatewayName: "gateway",
+		ExternalEventID: "external-gateway-lineage-event", ProtocolVersion: "orka.gateway.v1", EventType: "text",
+		AccountID: "account", ContextID: "context", SenderID: "sender", Text: "gateway prompt",
+		SessionName: "gateway-lineage-session", TaskName: "gateway-task",
+		NextAttemptAt: now, ReceivedAt: now, ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
+	}
+	if _, created, err := fixture.persistence.AdmitGatewayEvent(ctx, store.GatewayEventAdmission{
+		Event: event, AppendUserMessage: true, PendingLimit: 100,
+	}); err != nil || !created {
+		t.Fatalf("admit Gateway event = (created=%v, err=%v)", created, err)
+	}
+	control, err := fixture.continuity.EnsureSession(ctx, ACPEnsureSessionRequest{
+		Namespace: event.Namespace, SessionName: event.SessionName, SessionType: store.SessionTypeGateway,
+		RequireExistingTranscript: true, Fence: fixture.fence, CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := acpLineageLeaseRequest(control, fixture.fence, "gateway-task-uid")
+	request.TaskName = event.TaskName
+	if _, err := fixture.continuity.AcquireMutationLease(ctx, request); !errors.Is(err, store.ErrNotReady) {
+		t.Fatalf("unlinked Gateway Task acquisition error = %v, want ErrNotReady", err)
+	}
+	after, err := fixture.controls.GetSessionControl(ctx, event.Namespace, event.SessionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Lineage != nil || after.Lease != nil || after.LeaseGeneration != 0 {
+		t.Fatalf("unlinked Gateway Task mutated Session authority: %+v", after)
+	}
+	if _, err := fixture.persistence.ClaimNextGatewayEvent(ctx, event.Namespace, "gateway-owner", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.persistence.MarkGatewayEventTaskCreated(
+		ctx, event.Namespace, event.ID, event.TaskName, request.TaskUID, "gateway-owner", now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	request.Session = *after
+	request.TaskName = "unrelated-task"
+	request.TaskUID = "unrelated-task-uid"
+	if _, err := fixture.continuity.AcquireMutationLease(ctx, request); !errors.Is(err, store.ErrNotReady) {
+		t.Fatalf("unrelated Gateway Task acquisition error = %v, want ErrNotReady", err)
+	}
+	request.TaskName = event.TaskName
+	request.TaskUID = "gateway-task-uid"
+	lease, err := fixture.continuity.AcquireMutationLease(ctx, request)
+	if err != nil {
+		t.Fatalf("linked Gateway Task acquisition error = %v", err)
+	}
+	if lease.Session.Lineage == nil || lease.Session.Lease == nil || lease.Session.Lease.TaskUID != request.TaskUID {
+		t.Fatalf("linked Gateway Task lease = %+v", lease.Session)
 	}
 }
 

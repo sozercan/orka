@@ -2476,7 +2476,7 @@ func runtimePoolTestReconciler(
 	t.Helper()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&corev1alpha1.RuntimePool{}, &appsv1.Deployment{}, &corev1.Pod{}).
+		WithStatusSubresource(&corev1alpha1.RuntimePool{}, &corev1alpha1.Task{}, &appsv1.Deployment{}, &corev1.Pod{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Create: func(ctx context.Context, delegate client.WithWatch, object client.Object, opts ...client.CreateOption) error {
 				if secret, ok := object.(*corev1.Secret); ok && secret.UID == "" {

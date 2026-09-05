@@ -150,6 +150,7 @@ type chatSessionLockIdentity struct {
 // ChatHandler implements the orchestrator chat endpoints.
 type ChatHandler struct {
 	client                    client.Client
+	apiReader                 client.Reader
 	kubeClient                kubernetes.Interface
 	sessionManager            *controller.SessionManager
 	config                    ChatConfig
@@ -166,7 +167,7 @@ type ChatHandler struct {
 }
 
 // NewChatHandler creates a new ChatHandler.
-func NewChatHandler(c client.Client, sm *controller.SessionManager, config ChatConfig, watchNamespace string, enforceNS bool, ss store.SessionStore, rs store.ResultStore, resolver *ProviderResolver, kubeClientOpt ...kubernetes.Interface) *ChatHandler {
+func NewChatHandler(c client.Client, apiReader client.Reader, sm *controller.SessionManager, config ChatConfig, watchNamespace string, enforceNS bool, ss store.SessionStore, rs store.ResultStore, resolver *ProviderResolver, kubeClientOpt ...kubernetes.Interface) *ChatHandler {
 	var kubeClient kubernetes.Interface
 	if len(kubeClientOpt) > 0 {
 		kubeClient = kubeClientOpt[0]
@@ -174,6 +175,7 @@ func NewChatHandler(c client.Client, sm *controller.SessionManager, config ChatC
 
 	return &ChatHandler{
 		client:                    c,
+		apiReader:                 apiReader,
 		kubeClient:                kubeClient,
 		sessionManager:            sm,
 		config:                    config,
@@ -186,6 +188,13 @@ func NewChatHandler(c client.Client, sm *controller.SessionManager, config ChatC
 		resolver:                  resolver,
 		activeChats:               make(map[string]*activeChatRequest),
 	}
+}
+
+func (ch *ChatHandler) contextTokenAuthorizationReader() client.Reader {
+	if ch.apiReader != nil {
+		return ch.apiReader
+	}
+	return ch.client
 }
 
 // blockedNamespaces that cannot be targeted by chat requests.
@@ -385,17 +394,19 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 	executor.SetExecutionMode(ch.config.ExecutionMode)
 	executor.provider = providerInfo.Name
 	executor.providerType = providerInfo.Type
+	authorizationReader := ch.contextTokenAuthorizationReader()
+	executor.SetPolicyReader(authorizationReader)
 	executor.SetTaskCreateAuthorizer(func(ctx context.Context, task *corev1alpha1.Task) error {
-		return authorizeAndStampToolTaskCreate(ctx, ch.client, ch.kubeClient, contextToken, ch.contextTokenAuthorization, "chatToolCreateTask", userInfo, task)
+		return authorizeAndStampToolTaskCreate(ctx, authorizationReader, ch.kubeClient, contextToken, ch.contextTokenAuthorization, "chatToolCreateTask", userInfo, task)
 	})
 	executor.SetTaskDeleteAuthorizer(func(ctx context.Context, task *corev1alpha1.Task) error {
-		return authorizeContextTokenTaskDeleteObject(ctx, ch.client, contextToken, ch.contextTokenAuthorization, "chatToolDeleteTask", task)
+		return authorizeContextTokenTaskDeleteObject(ctx, authorizationReader, contextToken, ch.contextTokenAuthorization, "chatToolDeleteTask", task)
 	})
 	executor.SetAgentCreateAuthorizer(func(ctx context.Context, agent *corev1alpha1.Agent) error {
-		return authorizeContextTokenToolAgentCreate(ctx, ch.client, contextToken, ch.contextTokenAuthorization, "chatToolCreateAgent", agent)
+		return authorizeContextTokenToolAgentCreate(ctx, authorizationReader, contextToken, ch.contextTokenAuthorization, "chatToolCreateAgent", agent)
 	})
 	executor.SetAgentUpdateAuthorizer(func(ctx context.Context, agent *corev1alpha1.Agent) error {
-		return authorizeContextTokenToolAgentUpdate(ctx, ch.client, contextToken, ch.contextTokenAuthorization, "chatToolUpdateAgent", agent)
+		return authorizeContextTokenToolAgentUpdate(ctx, authorizationReader, contextToken, ch.contextTokenAuthorization, "chatToolUpdateAgent", agent)
 	})
 	executor.SetAgentDeleteAuthorizer(func(ctx context.Context, agent *corev1alpha1.Agent) error {
 		return authorizeContextTokenToolAgentDelete(contextToken, ch.contextTokenAuthorization, "chatToolDeleteAgent", agent)

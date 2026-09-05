@@ -62,6 +62,13 @@ rules:
   - create
   - update
   - delete
+# Registered external runtime policy lookup for delegate_task materialization
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - agentruntimes
+  verbs:
+  - get
 # Orka Task CRDs (for coordination - delegate and wait)
 - apiGroups:
   - core.orka.ai
@@ -286,6 +293,13 @@ rules:
   - create
   - update
   - delete
+# Registered external runtime policy lookup for delegate_task materialization
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - agentruntimes
+  verbs:
+  - get
 # Orka Task CRDs (for coordination - delegate and wait)
 - apiGroups:
   - core.orka.ai

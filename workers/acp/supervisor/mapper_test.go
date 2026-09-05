@@ -32,6 +32,28 @@ const (
 	supervisorTestProviderSessionID = "provider-session"
 )
 
+func TestPromptContentToACPAddsRequiredResourceLinkName(t *testing.T) {
+	blocks := []harnessv2.ContentBlock{
+		{Type: harnessv2.ContentBlockResourceLink, URI: "https://example.com/unnamed"},
+		{Type: harnessv2.ContentBlockResourceLink, URI: "https://example.com/named", Name: "report", MimeType: "text/plain"},
+	}
+
+	mapped, err := promptContentToACP(blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mapped) != 2 {
+		t.Fatalf("mapped blocks = %#v", mapped)
+	}
+	if mapped[0].Type != supervisorTestResourceLinkType || mapped[0].URI != blocks[0].URI || mapped[0].Name != blocks[0].URI {
+		t.Fatalf("unnamed resource link = %#v", mapped[0])
+	}
+	if mapped[1].Type != supervisorTestResourceLinkType || mapped[1].URI != blocks[1].URI ||
+		mapped[1].Name != blocks[1].Name || mapped[1].MIMEType != blocks[1].MimeType {
+		t.Fatalf("named resource link = %#v", mapped[1])
+	}
+}
+
 func TestMapACPUpdateDecodesAgentMessageContent(t *testing.T) {
 	update, text, ok, err := mapACPUpdate(&acp.SessionNotification{Update: json.RawMessage(`{
 		"sessionUpdate":"agent_message_chunk",

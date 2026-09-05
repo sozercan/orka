@@ -51,6 +51,27 @@ func TestPromptMCPAuthorizationEnforcesCanonicalDescriptorsAndProfile(t *testing
 	}
 }
 
+func TestMCPPolicyRequiresPermissionCapability(t *testing.T) {
+	brokered := MCPToolDescriptor{Source: MCPToolSourceBrokeredBuiltin}
+	providerNative := MCPToolDescriptor{Source: MCPToolSourceProviderNative}
+	for _, test := range []struct {
+		name       string
+		toolPolicy MCPToolPolicy
+		approval   MCPApprovalPolicy
+		want       bool
+	}{
+		{name: "approval-free brokered tool", toolPolicy: MCPToolPolicy{Tools: []MCPToolDescriptor{brokered}}},
+		{name: "approval-required brokered tool", toolPolicy: MCPToolPolicy{Tools: []MCPToolDescriptor{brokered}}, approval: MCPApprovalPolicy{RequiredTools: []string{"lookup"}}, want: true},
+		{name: "provider-native tool", toolPolicy: MCPToolPolicy{Tools: []MCPToolDescriptor{providerNative}}, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := MCPPolicyRequiresPermissionCapability(test.toolPolicy, test.approval); got != test.want {
+				t.Fatalf("MCPPolicyRequiresPermissionCapability() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestMCPBrokerCallRequiresRunningLeaseAllowlistAndApproval(t *testing.T) {
 	metadata := testMutationMetadata(t, true)
 	metadata.OperationID = "mcp-call-1"

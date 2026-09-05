@@ -474,6 +474,50 @@ func TestReclaimPromptAttemptsCompletionAllowsUnboundContinuityProjectionRetry(t
 func TestReclaimPromptAttemptsAcceptsPinnedLegacySessionProjectionAfterPreparedDelete(t *testing.T) {
 	ctx := context.Background()
 	kubeStore, kubeClient, fence := newPromptAttemptReclaimStore(t)
+	fixture := seedFinalizedSessionReclaimTurn(t, ctx, kubeStore, kubeClient, fence, true)
+	taskUID, namespace := string(fixture.task.UID), fixture.task.Namespace
+	attempt, request := fixture.attempt, fixture.request
+	createDeletingAgentTask(t, ctx, kubeClient, namespace, taskUID, taskUID)
+	if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); err != nil {
+		t.Fatalf("PreparePromptAttemptReclamation(legacy Session): %v", err)
+	}
+	assertPromptAttemptReclamationMarker(t, ctx, kubeClient, taskUID, true)
+	attemptObject := &corev1alpha1.PromptAttempt{}
+	if err := kubeClient.Get(ctx, client.ObjectKey{
+		Namespace: namespace, Name: objectName(promptAttemptNamePrefix, attempt.ID),
+	}, attemptObject); err != nil {
+		t.Fatalf("load prepared PromptAttempt: %v", err)
+	}
+	if err := kubeClient.Delete(ctx, attemptObject); err != nil {
+		t.Fatalf("simulate committed PromptAttempt deletion: %v", err)
+	}
+	if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); err != nil {
+		t.Fatalf("PreparePromptAttemptReclamation(post-delete retry): %v", err)
+	}
+	if deleted, err := kubeStore.ReclaimPromptAttempts(ctx, request); err != nil || deleted != 0 {
+		t.Fatalf("ReclaimPromptAttempts(post-delete retry) = deleted:%d err:%v, want 0,nil", deleted, err)
+	}
+	assertPromptAttemptReclamationMarker(t, ctx, kubeClient, taskUID, false)
+	assertPromptAttemptReclamationCompleted(t, ctx, kubeClient, request, true)
+}
+
+type finalizedSessionReclaimFixture struct {
+	task       *corev1alpha1.Task
+	attempt    *controlstore.PromptAttempt
+	turn       *controlstore.SessionTurn
+	projection *controlstore.OutboxProjection
+	request    controlstore.ReclaimPromptAttemptsRequest
+}
+
+func seedFinalizedSessionReclaimTurn(
+	t *testing.T,
+	ctx context.Context,
+	kubeStore *Store,
+	kubeClient client.Client,
+	fence controlstore.ControllerEpochFence,
+	legacy bool,
+) finalizedSessionReclaimFixture {
+	t.Helper()
 	persistence, ok := kubeStore.sessionTurns.(*sqlitestore.Store)
 	if !ok {
 		t.Fatalf("SessionTurn persistence = %T, want *sqlite.Store", kubeStore.sessionTurns)
@@ -497,7 +541,7 @@ func TestReclaimPromptAttemptsAcceptsPinnedLegacySessionProjectionAfterPreparedD
 	}
 	control, err := kubeStore.CreateSessionControl(ctx, &controlstore.SessionControl{
 		Namespace: namespace, SessionName: sessionName, SessionUID: sessionUID,
-		RequestDigest: testDigest("legacy-session-control"),
+		RequestDigest: testDigest("legacy-session-control"), LeaseGeneration: 1,
 	}, fence)
 	if err != nil {
 		t.Fatalf("CreateSessionControl(): %v", err)
@@ -575,7 +619,7 @@ func TestReclaimPromptAttemptsAcceptsPinnedLegacySessionProjectionAfterPreparedD
 	task.Status.Execution = &corev1alpha1.TaskExecutionStatus{
 		State: corev1alpha1.TaskExecutionStateCancelled, Outcome: corev1alpha1.TaskExecutionOutcomeCancelled,
 		Reason: "Cancelled", Attempt: 1, PromptID: promptID, RuntimeInstanceID: attempt.RuntimeInstanceID,
-		RuntimeSessionUID: sessionUID, RuntimeSessionGeneration: control.LeaseGeneration,
+		RuntimeSessionUID: sessionUID, RuntimeSessionGeneration: 1,
 		RequestDigest: promptRequestDigest, ControllerEpoch: fence.Epoch,
 	}
 	task.Status.Delivery = &corev1alpha1.TaskDeliveryStatus{
@@ -584,15 +628,19 @@ func TestReclaimPromptAttemptsAcceptsPinnedLegacySessionProjectionAfterPreparedD
 	if err := kubeClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("record terminal Task status: %v", err)
 	}
-	legacyPayload, err := json.Marshal(taskterminal.Projection{
+	terminal := taskterminal.Projection{
 		Namespace: namespace, Task: taskUID, TaskUID: taskUID, Attempt: 1, Phase: corev1alpha1.TaskPhaseCancelled,
-		Message: "controller restart recovered terminal cancellation",
-		Execution: corev1alpha1.TaskExecutionStatus{
+		Message:   "controller restart recovered terminal cancellation",
+		Execution: *task.Status.Execution.DeepCopy(),
+		Delivery:  task.Status.Delivery.DeepCopy(),
+	}
+	if legacy {
+		terminal.Execution = corev1alpha1.TaskExecutionStatus{
 			State: corev1alpha1.TaskExecutionStateCancelled, Outcome: corev1alpha1.TaskExecutionOutcomeCancelled,
 			Attempt: 1, PromptID: promptID,
-		},
-		Delivery: task.Status.Delivery.DeepCopy(),
-	})
+		}
+	}
+	legacyPayload, err := json.MarshalIndent(terminal, "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -602,12 +650,13 @@ func TestReclaimPromptAttemptsAcceptsPinnedLegacySessionProjectionAfterPreparedD
 		ProjectionKind: "TaskTerminalStatus", Payload: legacyPayload, PayloadDigest: testBytesDigest(legacyPayload),
 		AvailableAt: testNow.Add(5 * time.Minute),
 	}
-	if _, err := kubeStore.FinalizeSessionTurn(ctx, controlstore.FinalizeSessionTurnRequest{
+	turn, err = kubeStore.FinalizeSessionTurn(ctx, controlstore.FinalizeSessionTurnRequest{
 		Key: turnKey, Fence: fence, ExpectedSessionVersion: control.Version, ExpectedTurnVersion: turn.Version,
 		FinalizationDigest: testDigest("legacy-session-finalization"), TerminalKind: controlstore.SessionTurnOutcomeMarker,
 		TerminalContent: `{"kind":"Cancelled","reason":"controller restart recovered terminal cancellation","assistantResultRecorded":false}`,
 		Projection:      projection, FinalizedAt: testNow.Add(5 * time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("FinalizeSessionTurn(): %v", err)
 	}
 	claims, err := kubeStore.ClaimOutboxProjections(ctx, controlstore.ClaimOutboxProjectionsRequest{
@@ -621,41 +670,21 @@ func TestReclaimPromptAttemptsAcceptsPinnedLegacySessionProjectionAfterPreparedD
 		t.Fatalf("claimed projections = %#v, want %q", claims, projectionID)
 	}
 	claimed := claims[0]
-	if _, err := kubeStore.CompleteOutboxProjection(ctx, controlstore.CompleteOutboxProjectionRequest{
+	delivered, err := kubeStore.CompleteOutboxProjection(ctx, controlstore.CompleteOutboxProjectionRequest{
 		ID: claimed.ID, Fence: fence, ExpectedVersion: claimed.Version, LeaseOwner: claimed.LeaseOwner,
 		OperationID: "deliver-legacy-session-projection", OperationDigest: testDigest("deliver-legacy-session-projection"),
 		NewState: controlstore.OutboxProjectionDelivered, DeliveryDigest: testDigest("legacy-session-projection-delivered"),
 		UpdatedAt: testNow.Add(7 * time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("CompleteOutboxProjection(Delivered): %v", err)
 	}
-	createDeletingAgentTask(t, ctx, kubeClient, namespace, taskUID, taskUID)
 	request := controlstore.ReclaimPromptAttemptsRequest{
 		Namespace: namespace, TaskName: taskUID, TaskUID: taskUID,
 		Mode: controlstore.PromptAttemptReclamationProjected, ContinuitySession: true, FinalContinuitySession: true,
 		FinalPromptAttemptID: attempt.ID, TerminalProjectionID: projectionID, Fence: fence,
 	}
-	if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); err != nil {
-		t.Fatalf("PreparePromptAttemptReclamation(legacy Session): %v", err)
-	}
-	assertPromptAttemptReclamationMarker(t, ctx, kubeClient, taskUID, true)
-	attemptObject := &corev1alpha1.PromptAttempt{}
-	if err := kubeClient.Get(ctx, client.ObjectKey{
-		Namespace: namespace, Name: objectName(promptAttemptNamePrefix, attempt.ID),
-	}, attemptObject); err != nil {
-		t.Fatalf("load prepared PromptAttempt: %v", err)
-	}
-	if err := kubeClient.Delete(ctx, attemptObject); err != nil {
-		t.Fatalf("simulate committed PromptAttempt deletion: %v", err)
-	}
-	if err := kubeStore.PreparePromptAttemptReclamation(ctx, request); err != nil {
-		t.Fatalf("PreparePromptAttemptReclamation(post-delete retry): %v", err)
-	}
-	if deleted, err := kubeStore.ReclaimPromptAttempts(ctx, request); err != nil || deleted != 0 {
-		t.Fatalf("ReclaimPromptAttempts(post-delete retry) = deleted:%d err:%v, want 0,nil", deleted, err)
-	}
-	assertPromptAttemptReclamationMarker(t, ctx, kubeClient, taskUID, false)
-	assertPromptAttemptReclamationCompleted(t, ctx, kubeClient, request, true)
+	return finalizedSessionReclaimFixture{task: task, attempt: attempt, turn: turn, projection: delivered, request: request}
 }
 
 func TestPreparePromptAttemptReclamationRejectsUnprovenEmptyProjectedState(t *testing.T) {

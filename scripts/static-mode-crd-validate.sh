@@ -127,6 +127,11 @@ spec:
       proxyCredentialRole: provider-inference
       proxyCredentialScope: "model:gpt-5.2-codex"
       resourceClass: standard
+    mcpPolicy:
+      allowedTools: []
+      disallowedTools: []
+      allowBash: false
+      approvalRequiredTools: []
     limits:
       maxResidentSessions: 10
       maxConcurrentPrompts: 4

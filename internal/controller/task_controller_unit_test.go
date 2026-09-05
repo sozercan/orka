@@ -665,7 +665,7 @@ func TestValidateTaskAgentCompatibility_RuntimeRefRejectsCredentialSecretRefs(t 
 	}
 }
 
-func TestValidateTaskAgentCompatibility_RuntimeRefRejectsToolPolicyMetadata(t *testing.T) {
+func TestValidateTaskAgentCompatibility_RuntimeRefRejectsLegacyRestrictions(t *testing.T) {
 	tests := []struct {
 		name      string
 		mutate    func(*corev1alpha1.Task, *corev1alpha1.Agent)
@@ -679,12 +679,26 @@ func TestValidateTaskAgentCompatibility_RuntimeRefRejectsToolPolicyMetadata(t *t
 			wantError: "defaultAllowedTools",
 		},
 		{
+			name: "agent explicitly empty defaultAllowedTools",
+			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime.DefaultAllowedTools = []string{}
+			},
+			wantError: "defaultAllowedTools",
+		},
+		{
 			name: "agent defaultAllowBash",
 			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
 				allow := false
 				agent.Spec.Runtime.DefaultAllowBash = &allow
 			},
 			wantError: "defaultAllowBash",
+		},
+		{
+			name: "agent defaultReasoningEffort",
+			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime.DefaultReasoningEffort = "high"
+			},
+			wantError: "defaultReasoningEffort",
 		},
 		{
 			name: "task disallowedTools",
@@ -721,7 +735,175 @@ func TestValidateTaskAgentCompatibility_RuntimeRefRejectsToolPolicyMetadata(t *t
 	}
 }
 
-func TestValidateTaskAgentCompatibility_RuntimeRefAllowsBrokeredAllowedTools(t *testing.T) {
+func TestValidateHarnessV2RuntimeRefAgentTaskRestrictionsRejectsUnsupportedOverrides(t *testing.T) {
+	disabled := false
+	tests := []struct {
+		name      string
+		mutate    func(*corev1alpha1.Task, *corev1alpha1.Agent)
+		wantError string
+	}{
+		{
+			name: "agent model object",
+			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				agent.Spec.Model = &corev1alpha1.ModelConfig{}
+			},
+			wantError: "Agent.spec.model",
+		},
+		{
+			name: "agent system prompt",
+			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				agent.Spec.SystemPrompt = &corev1alpha1.PromptSource{Inline: "ignored prompt"}
+			},
+			wantError: "Agent.spec.systemPrompt",
+		},
+		{
+			name: "agent skills",
+			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				agent.Spec.Skills = []corev1alpha1.SkillReference{{Name: "ignored-skill"}}
+			},
+			wantError: "Agent.spec.skills",
+		},
+		{
+			name: "agent enabled tool",
+			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				agent.Spec.Tools = []corev1alpha1.ToolReference{{Name: "ignored-tool"}, {Name: "disabled-tool", Enabled: &disabled}}
+			},
+			wantError: "enabled Agent.spec.tools",
+		},
+		{
+			name: "agent defaultMaxTurns",
+			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				maxTurns := int32(20)
+				agent.Spec.Runtime.DefaultMaxTurns = &maxTurns
+			},
+			wantError: "defaultMaxTurns",
+		},
+		{
+			name: "agent explicitly empty defaultAllowedTools",
+			mutate: func(_ *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime.DefaultAllowedTools = []string{}
+			},
+			wantError: "defaultAllowedTools",
+		},
+		{
+			name: "task maxTurns",
+			mutate: func(task *corev1alpha1.Task, _ *corev1alpha1.Agent) {
+				maxTurns := int32(20)
+				task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{MaxTurns: &maxTurns}
+			},
+			wantError: "maxTurns",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do stuff"}}
+			agent := &corev1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: "a1"},
+				Spec: corev1alpha1.AgentSpec{
+					Runtime: &corev1alpha1.AgentCLIRuntime{RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "custom-runtime"}},
+				},
+			}
+			tt.mutate(task, agent)
+			err := validateHarnessV2RuntimeRefAgentTaskRestrictions(task, agent)
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("validateHarnessV2RuntimeRefAgentTaskRestrictions() error = %v, want %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestValidateHarnessV2RuntimeRefAgentTaskRestrictionsAcceptsPersistedHistoricalDefault(t *testing.T) {
+	defaultMaxTurns := int32(50)
+	agent := &corev1alpha1.Agent{
+		Spec: corev1alpha1.AgentSpec{
+			Runtime: &corev1alpha1.AgentCLIRuntime{
+				RuntimeRef:      &corev1alpha1.AgentRuntimeReference{Name: "custom-runtime"},
+				DefaultMaxTurns: &defaultMaxTurns,
+			},
+		},
+	}
+
+	if err := validateHarnessV2RuntimeRefAgentTaskRestrictions(nil, agent); err != nil {
+		t.Fatalf("validateHarnessV2RuntimeRefAgentTaskRestrictions() error = %v, want persisted historical default accepted", err)
+	}
+}
+
+func TestValidatePlannedRuntimeRefAgentTaskRestrictionsUsesResolvedContract(t *testing.T) {
+	tests := []struct {
+		name      string
+		contract  corev1alpha1.AgentRuntimeContractVersion
+		wantPath  agentExecutionPath
+		wantError string
+		mutate    func(*corev1alpha1.Task, *corev1alpha1.Agent)
+	}{
+		{
+			name:     "harness v1 preserves legacy overrides",
+			contract: corev1alpha1.AgentRuntimeContractHarnessV1,
+			wantPath: agentExecutionPathHarnessV1,
+			mutate: func(task *corev1alpha1.Task, agent *corev1alpha1.Agent) {
+				defaultMaxTurns := int32(50)
+				taskMaxTurns := int32(7)
+				agent.Spec.SystemPrompt = &corev1alpha1.PromptSource{Inline: "frozen system prompt"}
+				agent.Spec.Skills = []corev1alpha1.SkillReference{{Name: "legacy-skill"}}
+				agent.Spec.Tools = []corev1alpha1.ToolReference{{Name: "legacy-tool"}}
+				agent.Spec.Runtime.DefaultMaxTurns = &defaultMaxTurns
+				task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{MaxTurns: &taskMaxTurns}
+			},
+		},
+		{
+			name:      "harness v2 rejects model override",
+			contract:  corev1alpha1.AgentRuntimeContractHarnessV2,
+			wantPath:  agentExecutionPathExternal,
+			wantError: "Agent.spec.model",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime := plannerExternalRuntime()
+			runtime.Name = "custom-runtime"
+			contract := tt.contract
+			runtime.Spec.ContractVersion = &contract
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Namespace: defaultNS},
+				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do stuff"},
+			}
+			agent := &corev1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: "a1", Namespace: defaultNS},
+				Spec: corev1alpha1.AgentSpec{
+					Model:   &corev1alpha1.ModelConfig{Name: "configured-model"},
+					Runtime: &corev1alpha1.AgentCLIRuntime{RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: runtime.Name}},
+				},
+			}
+			if tt.mutate != nil {
+				tt.mutate(task, agent)
+			}
+			r := newUnitReconciler(newTestScheme(), runtime)
+			r.ACPRuntimeEnabled = true
+			r.HarnessV1Enabled = true
+
+			if err := r.validateTaskAgentCompatibility(task, agent); err != nil {
+				t.Fatalf("validateTaskAgentCompatibility() error = %v", err)
+			}
+			plan := r.planAgentExecution(context.Background(), task, agent)
+			if plan.path != tt.wantPath {
+				t.Fatalf("plan path = %q, want %q (plan=%#v)", plan.path, tt.wantPath, plan)
+			}
+			err := validatePlannedRuntimeRefAgentTaskRestrictions(task, agent, plan)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("validatePlannedRuntimeRefAgentTaskRestrictions() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("validatePlannedRuntimeRefAgentTaskRestrictions() error = %v, want %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestValidateTaskAgentCompatibility_RuntimeRefAllowsBrokeredAllowedToolsAndDisabledAgentTools(t *testing.T) {
+	disabled := false
 	r := &TaskReconciler{}
 	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
 		Type:         corev1alpha1.TaskTypeAgent,
@@ -731,6 +913,7 @@ func TestValidateTaskAgentCompatibility_RuntimeRefAllowsBrokeredAllowedTools(t *
 	agent := &corev1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{Name: "a1"},
 		Spec: corev1alpha1.AgentSpec{
+			Tools:   []corev1alpha1.ToolReference{{Name: "disabled-tool", Enabled: &disabled}},
 			Runtime: &corev1alpha1.AgentCLIRuntime{RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "custom-runtime"}},
 		},
 	}
@@ -4416,6 +4599,145 @@ func TestHandleScheduled_CreateChildTask(t *testing.T) {
 	}
 }
 
+func TestHandleScheduled_RefreshesRuntimeRefPolicyFromAPIReader(t *testing.T) {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	for _, tt := range []struct {
+		name         string
+		allowedTools []string
+	}{
+		{name: "current policy", allowedTools: []string{"read_current"}},
+		{name: "explicit deny all", allowedTools: []string{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := newTestScheme()
+			lastSchedule := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "sched-runtime-policy",
+					Namespace:         "default",
+					UID:               types.UID("scheduled-runtime-policy"),
+					CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+				},
+				Spec: corev1alpha1.TaskSpec{
+					Type:                    corev1alpha1.TaskTypeAgent,
+					AgentRef:                &corev1alpha1.AgentReference{Name: "external-agent"},
+					AgentRuntime:            &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"stale_tool"}},
+					Schedule:                "* * * * *",
+					StartingDeadlineSeconds: new(int64(300)),
+				},
+				Status: corev1alpha1.TaskStatus{
+					Phase:            corev1alpha1.TaskPhaseScheduled,
+					LastScheduleTime: &lastSchedule,
+				},
+			}
+			agent := &corev1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: "external-agent", Namespace: task.Namespace},
+				Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+					RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-runtime"},
+				}},
+			}
+			staleRuntime := scheduledTestAgentRuntime(contract, []string{"stale_tool"})
+			currentRuntime := scheduledTestAgentRuntime(contract, tt.allowedTools)
+
+			r := newUnitReconciler(scheme, task, agent.DeepCopy(), staleRuntime)
+			r.APIReader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, currentRuntime).Build()
+
+			if _, err := r.handleScheduled(context.Background(), task); err != nil {
+				t.Fatalf("handleScheduled() error = %v", err)
+			}
+
+			children := &corev1alpha1.TaskList{}
+			if err := r.List(context.Background(), children, client.InNamespace(task.Namespace), client.MatchingLabels{
+				labels.LabelParentTask: labels.SelectorValue(task.Name),
+			}); err != nil {
+				t.Fatalf("list scheduled children: %v", err)
+			}
+			if len(children.Items) != 1 {
+				t.Fatalf("scheduled children = %d, want 1", len(children.Items))
+			}
+			got := children.Items[0].Spec.AgentRuntime
+			if got == nil || got.AllowedTools == nil || !slices.Equal(got.AllowedTools, tt.allowedTools) {
+				t.Fatalf("child allowedTools = %#v, want %#v", got, tt.allowedTools)
+			}
+			if task.Spec.AgentRuntime == nil || !slices.Equal(task.Spec.AgentRuntime.AllowedTools, []string{"stale_tool"}) {
+				t.Fatalf("parent allowedTools = %#v, want unchanged stale policy", task.Spec.AgentRuntime)
+			}
+		})
+	}
+}
+
+func TestHandleScheduled_RuntimeRefPolicyFailureHasNoSideEffects(t *testing.T) {
+	scheme := newTestScheme()
+	lastSchedule := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sched-runtime-policy-failure",
+			Namespace:         "default",
+			UID:               types.UID("scheduled-runtime-policy-failure"),
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+		},
+		Spec: corev1alpha1.TaskSpec{
+			Type:                    corev1alpha1.TaskTypeAgent,
+			AgentRef:                &corev1alpha1.AgentReference{Name: "external-agent"},
+			AgentRuntime:            &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"stale_tool"}},
+			Schedule:                "* * * * *",
+			StartingDeadlineSeconds: new(int64(300)),
+		},
+		Status: corev1alpha1.TaskStatus{
+			Phase:            corev1alpha1.TaskPhaseScheduled,
+			LastScheduleTime: &lastSchedule,
+		},
+	}
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-agent", Namespace: task.Namespace},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "missing-runtime"},
+		}},
+	}
+	r := newUnitReconciler(scheme, task)
+	r.APIReader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
+
+	_, err := r.handleScheduled(context.Background(), task)
+	if err == nil || !strings.Contains(err.Error(), "refreshing scheduled child AgentRuntime policy") {
+		t.Fatalf("handleScheduled() error = %v, want policy refresh failure", err)
+	}
+	children := &corev1alpha1.TaskList{}
+	if err := r.List(context.Background(), children, client.InNamespace(task.Namespace), client.MatchingLabels{
+		labels.LabelParentTask: labels.SelectorValue(task.Name),
+	}); err != nil {
+		t.Fatalf("list scheduled children: %v", err)
+	}
+	if len(children.Items) != 0 {
+		t.Fatalf("scheduled children = %d, want 0", len(children.Items))
+	}
+	if task.Status.LastScheduleTime == nil || !task.Status.LastScheduleTime.Equal(&lastSchedule) {
+		t.Fatalf("LastScheduleTime = %v, want unchanged %v", task.Status.LastScheduleTime, lastSchedule)
+	}
+}
+
+func scheduledTestAgentRuntime(
+	contract corev1alpha1.AgentRuntimeContractVersion,
+	allowedTools []string,
+) *corev1alpha1.AgentRuntime {
+	return &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-runtime", Namespace: "default"},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind:    "codex",
+					Model:           "gpt-5.6",
+					WorkspaceIntent: corev1alpha1.WorkspaceIntentRead,
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:    append([]string{}, allowedTools...),
+					DisallowedTools: []string{},
+				},
+			},
+		},
+	}
+}
+
 func TestHandleScheduled_CopiesCoordinationToolInjectionDisableAnnotation(t *testing.T) {
 	scheme := newTestScheme()
 	lastSchedule := metav1.NewTime(time.Now().Add(-2 * time.Minute))
@@ -4983,64 +5305,9 @@ func TestHandlePending_BuiltInAgentRuntimeFailsClosedWhenACPDisabled(t *testing.
 	assertNoJobsForTask(t, r, task)
 }
 
-func TestHandlePending_ExternalRuntimeRefFailsBeforeAttemptCreation(t *testing.T) {
-	scheme := newTestScheme()
-	externalRuntime := plannerExternalRuntime()
-	agent := &corev1alpha1.Agent{
-		ObjectMeta: metav1.ObjectMeta{Name: "external-agent", Namespace: defaultNS},
-		Spec: corev1alpha1.AgentSpec{
-			Runtime: &corev1alpha1.AgentCLIRuntime{
-				RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: externalRuntime.Name},
-			},
-		},
-	}
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "external-task", Namespace: defaultNS},
-		Spec: corev1alpha1.TaskSpec{
-			Type:     corev1alpha1.TaskTypeAgent,
-			AgentRef: &corev1alpha1.AgentReference{Name: agent.Name},
-			Prompt:   "do work",
-		},
-		Status: corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhasePending},
-	}
-	r := newUnitReconciler(scheme, task, agent, externalRuntime)
-	r.ACPRuntimeEnabled = true
-
-	result, err := r.handlePending(context.Background(), task)
-	if err != nil {
-		t.Fatalf("handlePending() error = %v", err)
-	}
-	if result.RequeueAfter != time.Second {
-		t.Fatalf("RequeueAfter = %v, want %v", result.RequeueAfter, time.Second)
-	}
-
-	updated := &corev1alpha1.Task{}
-	if err := r.Get(context.Background(), types.NamespacedName{Name: task.Name, Namespace: task.Namespace}, updated); err != nil {
-		t.Fatalf("Get updated task: %v", err)
-	}
-	if updated.Status.Phase != corev1alpha1.TaskPhaseFailed {
-		t.Fatalf("phase = %s, want Failed", updated.Status.Phase)
-	}
-	if !strings.Contains(updated.Status.Message, "Task dispatch is not supported until the v2 dispatcher is wired") {
-		t.Fatalf("message = %q, want external dispatch support-boundary rejection", updated.Status.Message)
-	}
-	if updated.Status.Attempts != 0 {
-		t.Fatalf("attempts = %d, want 0", updated.Status.Attempts)
-	}
-	if updated.Status.Execution != nil {
-		t.Fatalf("execution = %#v, want nil", updated.Status.Execution)
-	}
-	if _, exists := updated.Labels[acpExternalRuntimeTaskLabel]; exists {
-		t.Fatalf("external runtime label was written: %v", updated.Labels)
-	}
-	attempts := &corev1alpha1.PromptAttemptList{}
-	if err := r.List(context.Background(), attempts, client.InNamespace(task.Namespace)); err != nil {
-		t.Fatalf("list PromptAttempts: %v", err)
-	}
-	if len(attempts.Items) != 0 {
-		t.Fatalf("PromptAttempts = %d, want 0", len(attempts.Items))
-	}
-	assertNoJobsForTask(t, r, task)
+func TestHandlePending_ExternalRuntimeRefQueuesDurableAttempt(t *testing.T) {
+	fixture := newExternalACPDispatchFixture(t)
+	fixture.queueTask(t, "external-task", types.UID("external-task-uid"), "do work", nil)
 }
 
 func TestHandlePending_AgentRuntimeWithResourcesFailsBeforeJobBackend(t *testing.T) {

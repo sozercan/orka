@@ -17,15 +17,20 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/orka-agents/orka/internal/tokenexchange"
 	"github.com/orka-agents/orka/internal/workerenv"
 )
 
 // WebSearchTool implements web search functionality
 type WebSearchTool struct {
-	apiKey  string
-	baseURL string
-	client  *http.Client
+	apiKey          string
+	baseURL         string
+	client          *http.Client
+	useMockFallback bool
+	maxQueryChars   int
+	maxResults      int
 }
 
 // WebSearchArgs are the arguments for the web search tool
@@ -44,15 +49,45 @@ type WebSearchResult struct {
 // NewWebSearchTool creates a new web search tool
 func NewWebSearchTool() *WebSearchTool {
 	return &WebSearchTool{
-		apiKey:  os.Getenv(workerenv.SearchAPIKey),
-		baseURL: os.Getenv(workerenv.SearchAPIURL),
+		apiKey:          os.Getenv(workerenv.SearchAPIKey),
+		baseURL:         os.Getenv(workerenv.SearchAPIURL),
+		useMockFallback: true,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
 }
 
-const webSearchToolName = "web_search"
+// NewBrokeredWebSearchTool creates a credential-free web search tool for the
+// controller MCP broker. It intentionally ignores worker search configuration
+// and permits only direct connections to public endpoints.
+func NewBrokeredWebSearchTool() *WebSearchTool {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = tokenexchange.PublicEndpointDialContext
+	transport.DisableKeepAlives = true
+	return &WebSearchTool{
+		maxQueryChars: brokeredWebSearchMaxQueryChars,
+		maxResults:    brokeredWebSearchMaxResults,
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Second,
+			CheckRedirect: func(request *http.Request, via []*http.Request) error {
+				if len(via) >= 5 {
+					return fmt.Errorf("too many redirects (max 5)")
+				}
+				return validateWebFetchURL(request.URL, false)
+			},
+		},
+	}
+}
+
+const (
+	webSearchToolName              = "web_search"
+	defaultWebSearchResults        = 5
+	brokeredWebSearchMaxQueryChars = 4 << 10
+	brokeredWebSearchMaxResults    = 10
+)
 
 // Name returns the tool name
 func (t *WebSearchTool) Name() string {
@@ -66,21 +101,29 @@ func (t *WebSearchTool) Description() string {
 
 // Parameters returns the JSON Schema for parameters
 func (t *WebSearchTool) Parameters() json.RawMessage {
-	return json.RawMessage(`{
+	maxLength := ""
+	if t.maxQueryChars > 0 {
+		maxLength = fmt.Sprintf(",\n\t\t\t\t\"maxLength\": %d", t.maxQueryChars)
+	}
+	maximum := ""
+	if t.maxResults > 0 {
+		maximum = fmt.Sprintf(",\n\t\t\t\t\"maximum\": %d", t.maxResults)
+	}
+	return json.RawMessage(fmt.Sprintf(`{
 		"type": "object",
 		"properties": {
 			"query": {
 				"type": "string",
-				"description": "The search query"
+				"description": "The search query"%s
 			},
 			"limit": {
 				"type": "integer",
 				"description": "Maximum number of results to return (default: 5)",
-				"default": 5
+				"default": %d%s
 			}
 		},
 		"required": ["query"]
-	}`)
+	}`, maxLength, defaultWebSearchResults, maximum))
 }
 
 // Execute performs the web search
@@ -93,9 +136,15 @@ func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	if searchArgs.Query == "" {
 		return "", fmt.Errorf("query is required")
 	}
+	if t.maxQueryChars > 0 && utf8.RuneCountInString(searchArgs.Query) > t.maxQueryChars {
+		return "", fmt.Errorf("query must be no greater than %d characters", t.maxQueryChars)
+	}
 
 	if searchArgs.Limit <= 0 {
-		searchArgs.Limit = 5
+		searchArgs.Limit = defaultWebSearchResults
+	}
+	if t.maxResults > 0 && searchArgs.Limit > t.maxResults {
+		return "", fmt.Errorf("limit must be no greater than %d", t.maxResults)
 	}
 
 	// If no API configured, use DuckDuckGo fallback
@@ -173,24 +222,27 @@ func (t *WebSearchTool) duckDuckGoSearch(ctx context.Context, args WebSearchArgs
 	ddgURL := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s", url.QueryEscape(args.Query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ddgURL, nil)
 	if err != nil {
-		return t.mockSearch(args)
+		return t.handleDuckDuckGoFailure(args, fmt.Errorf("create DuckDuckGo request: %w", err))
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return t.mockSearch(args)
+		return t.handleDuckDuckGoFailure(args, fmt.Errorf("DuckDuckGo request failed: %w", err))
 	}
 	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return t.handleDuckDuckGoFailure(args, fmt.Errorf("DuckDuckGo returned HTTP %d", resp.StatusCode))
+	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return t.mockSearch(args)
+		return t.handleDuckDuckGoFailure(args, fmt.Errorf("read DuckDuckGo response: %w", err))
 	}
 
 	results := parseDDGResults(string(body), args.Limit)
 	if len(results) == 0 {
-		return t.mockSearch(args)
+		return t.handleDuckDuckGoFailure(args, fmt.Errorf("DuckDuckGo returned no parseable results"))
 	}
 
 	output, err := json.MarshalIndent(results, "", "  ")
@@ -198,6 +250,13 @@ func (t *WebSearchTool) duckDuckGoSearch(ctx context.Context, args WebSearchArgs
 		return "", err
 	}
 	return string(output), nil
+}
+
+func (t *WebSearchTool) handleDuckDuckGoFailure(args WebSearchArgs, err error) (string, error) {
+	if t.useMockFallback {
+		return t.mockSearch(args)
+	}
+	return "", err
 }
 
 // parseDDGResults extracts search results from DuckDuckGo HTML

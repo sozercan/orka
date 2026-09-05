@@ -629,6 +629,54 @@ func TestACPMCPBrokerRejectsAuthFenceProfileAndInactivePrompt(t *testing.T) {
 	}
 }
 
+func TestACPMCPBrokerRejectsDescriptorDriftFromFrozenMCPConfiguration(t *testing.T) {
+	effects, fence := newMCPBrokerControlStore(t)
+	request, profile := testMCPBrokerRequest(t, harnessv2.MCPToolEffectConsequential)
+	frozen := request.Authorization.Configuration()
+	bearer := strings.Repeat("b", 32)
+	capability := []byte(strings.Repeat("c", 32))
+	var executions atomic.Int32
+	broker := &ACPMCPBroker{
+		Credentials: ACPMCPBrokerCredentialResolverFunc(func(_ context.Context, got harnessv2.MCPBrokerCallRequest) (ACPMCPBrokerCredentials, error) {
+			return ACPMCPBrokerCredentials{
+				ControllerBearerToken: bearer, CapabilitySecret: capability,
+				ExpectedFence: got.Metadata.Fence, RuntimeProfile: profile,
+				ExpectedMCPConfiguration: &frozen, ControllerFence: fence,
+			}, nil
+		}),
+		Prompts: ACPMCPPromptAuthorizerFunc(func(context.Context, harnessv2.MCPBrokerCallRequest) error {
+			t.Fatal("descriptor drift reached prompt authorization")
+			return nil
+		}),
+		Executor: ACPMCPToolExecutorFunc(func(context.Context, harnessv2.MCPBrokerCallRequest, harnessv2.MCPToolDescriptor) (json.RawMessage, error) {
+			executions.Add(1)
+			return json.RawMessage(acpMCPTestOKBody), nil
+		}),
+		Effects: effects,
+	}
+
+	forged := request
+	forged.Authorization.ToolPolicy.Tools = append(
+		[]harnessv2.MCPToolDescriptor(nil), request.Authorization.ToolPolicy.Tools...,
+	)
+	forged.Authorization.ToolPolicy.Tools[0].Effect = harnessv2.MCPToolEffectReadOnly
+	forged.Authorization.ToolPolicy.DescriptorDigest, _ = harnessv2.CanonicalMCPToolDescriptorDigest(
+		forged.Authorization.ToolPolicy.Tools,
+	)
+	forged.Metadata.RequestDigest, _ = harnessv2.CanonicalRequestDigest(forged)
+	if err := forged.Authorization.ValidateProfile(profile); err != nil {
+		t.Fatalf("forged descriptor no longer demonstrates profile-only validation: %v", err)
+	}
+
+	response := performMCPBrokerCall(t, broker, forged, bearer, capability)
+	if response.Code != http.StatusGone {
+		t.Fatalf("descriptor drift status = %d body=%s", response.Code, response.Body.String())
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("descriptor drift executed %d tools, want 0", executions.Load())
+	}
+}
+
 func TestRuntimePoolAuthSecretForEpochSelectsActiveInstanceSecretDuringRollover(t *testing.T) {
 	secrets := []corev1.Secret{
 		{ObjectMeta: metav1.ObjectMeta{Name: "pool-auth-e1"}},
@@ -770,7 +818,7 @@ func TestKubernetesACPMCPBrokerCredentialResolverChecksTaskSessionGeneration(t *
 	epochs := NewControllerEpochManager(nil, "controller-a")
 	epochs.current = &store.ControllerEpoch{Name: store.DefaultControllerEpochName, Epoch: 1, HolderID: "controller-a"}
 	close(epochs.ready)
-	resolver := KubernetesACPMCPBrokerCredentialResolver{Reader: reader, Epochs: epochs}
+	resolver := KubernetesACPMCPBrokerCredentialResolver{Reader: reader}
 
 	// Header pre-authentication accepts the pool bearer and rejects a wrong
 	// bearer or missing pool identity before any body is read.
@@ -783,6 +831,7 @@ func TestKubernetesACPMCPBrokerCredentialResolverChecksTaskSessionGeneration(t *
 	if err := resolver.PreAuthenticateACPMCPBroker(context.Background(), request.Namespace, "", "Bearer "+strings.Repeat("b", 32)); err == nil {
 		t.Fatal("missing pool identity pre-auth unexpectedly accepted")
 	}
+	resolver.Epochs = epochs
 
 	credentials, err := resolver.ResolveACPMCPBrokerCredentials(context.Background(), request)
 	if err != nil {
@@ -806,106 +855,240 @@ func TestKubernetesACPMCPBrokerCredentialResolverChecksTaskSessionGeneration(t *
 }
 
 func TestKubernetesACPMCPBrokerCredentialResolverSupportsExternalRuntime(t *testing.T) {
-	request, profile := testMCPBrokerRequest(t, harnessv2.MCPToolEffectReadOnly)
-	request.Metadata.Fence.RuntimeInstanceID = "external-instance"
-	request.Metadata.Fence.SupervisorBootID = "external-boot"
-	request.Metadata.Fence.RuntimePoolUID = "external-pool"
-	request.Metadata.Fence.RuntimePoolGeneration = 5
-	profileDigest, err := harnessv2.CanonicalProfileDigest(profile)
+	fixture, task, request, resolver := newSnapshotBackedExternalMCPResolver(t)
+	bearer := strings.Repeat("t", 32)
+	if err := resolver.PreAuthenticateACPMCPBroker(
+		fixture.ctx, request.Namespace, string(request.Metadata.Fence.RuntimePoolUID), "Bearer "+bearer,
+	); err != nil {
+		t.Fatalf("valid external pre-auth error = %v", err)
+	}
+	if err := resolver.PreAuthenticateACPMCPBroker(
+		fixture.ctx, request.Namespace, string(request.Metadata.Fence.RuntimePoolUID), "Bearer "+strings.Repeat("z", 32),
+	); err == nil {
+		t.Fatal("wrong external bearer unexpectedly passed pre-authentication")
+	}
+	credentials, err := resolver.ResolveACPMCPBrokerCredentials(fixture.ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Metadata.Fence.RuntimeProfileDigest = profileDigest
-	request.Authorization.RuntimeSessionUID = request.Metadata.Fence.RuntimeSessionUID
-	request.Authorization.SessionGeneration = request.Metadata.Fence.RuntimeSessionGeneration
-	digest, err := harnessv2.CanonicalRequestDigest(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Metadata.RequestDigest = digest
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := corev1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	profileSpec := corev1alpha1.AgentRuntimeProfileSpec{
-		Digest: string(request.Metadata.Fence.RuntimeProfileDigest), DigestSchemaVersion: int32(harnessv2.ProfileDigestSchemaVersion),
-		ACPProfile: profile.ACPProfile, AdapterName: "adapter", AdapterDigest: profile.AdapterDigests["adapter"],
-		ProviderKind: profile.ProviderKind, Model: profile.Model,
-		AgentConfigurationDigest: profile.AgentConfigurationDigest, ToolPolicyDigest: profile.ToolPolicyDigest,
-		ApprovalPolicyDigest: profile.ApprovalPolicyDigest, MCPConfigurationDigest: profile.MCPConfigurationDigest,
-		WorkspaceIntent:     corev1alpha1.WorkspaceIntent(profile.WorkspaceIntent),
-		ProxyCredentialRole: profile.ProxyCredentialRole, ProxyCredentialScope: profile.ProxyCredentialScope,
-		ResourceClass: profile.ResourceClass,
-	}
-	governance := corev1alpha1.AgentRuntimeWorkspaceGovernanceCapabilities{
-		Mode:                     corev1alpha1.AgentRuntimeWorkspaceGovernanceStrict,
-		OrkaOwnedWorkspaceDeltas: true, PromptScopedBrokerAuthorization: true, NoDirectSCMPublication: true,
-		OrkaOwnedCleanRoomPublication: true, ExactInstanceFencing: true,
-		DuplicateSafeMutations: true, CancellationSettlement: true,
-	}
-	external := &corev1alpha1.AgentRuntime{
-		ObjectMeta: metav1.ObjectMeta{Name: "external", Namespace: request.Namespace, UID: "external-uid", Generation: 1},
-		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
-			ContractVersion: new(corev1alpha1.AgentRuntimeContractHarnessV2),
-			Deployment:      corev1alpha1.AgentRuntimeDeploymentSpec{Mode: corev1alpha1.AgentRuntimeDeploymentModeExternalEndpoint, Endpoint: "https://runtime.example.invalid"},
-			ClientAuth: corev1alpha1.AgentRuntimeClientAuth{
-				ControllerBearerTokenSecretRef: &corev1alpha1.AgentRuntimeSecretKeyReference{Name: "external-bearer", Key: "token"},
-				OperationCapabilitySecretRef:   &corev1alpha1.AgentRuntimeSecretKeyReference{Name: "external-capability", Key: "secret"},
-			},
-			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
-				RuntimeInstanceID: "external-instance", Profile: &profileSpec, SupportsDrain: true,
-				WorkspaceGovernance: &governance,
-			},
-		},
-		Status: corev1alpha1.AgentRuntimeStatus{
-			Ready: true, ObservedGeneration: 1,
-			ObservedControllerAuthRefResourceVersion:      "rv-bearer",
-			ObservedOperationCapabilityRefResourceVersion: "rv-capability",
-			ObservedCapabilities: &corev1alpha1.AgentRuntimeObservedCapabilities{
-				ProtocolVersion: string(corev1alpha1.RuntimePoolProtocolHarnessV2), RuntimeInstanceID: "external-instance",
-				SupervisorBootID: "external-boot", ControllerEpoch: 1,
-				RuntimePoolUID: "external-pool", RuntimePoolGeneration: 5,
-				RuntimeProfileDigest: profileSpec.Digest, ProfileDigestSchemaVersion: int32(harnessv2.ProfileDigestSchemaVersion),
-			},
-		},
-	}
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: acpDispatcherTestTaskName, Namespace: request.Namespace, UID: acpDispatcherTaskUID},
-		Status: corev1alpha1.TaskStatus{Execution: &corev1alpha1.TaskExecutionStatus{
-			State: corev1alpha1.TaskExecutionStateRunning, Attempt: 1, PromptID: "prompt-1",
-			AgentRuntimeName: external.Name, AgentRuntimeUID: string(external.UID),
-			RuntimeInstanceID: "external-instance", RuntimeSessionUID: string(request.Authorization.RuntimeSessionUID),
-			RuntimeSessionGeneration: int64(request.Authorization.SessionGeneration), ControllerEpoch: 1,
-		}},
-	}
-	bearer := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "external-bearer", Namespace: request.Namespace, ResourceVersion: "rv-bearer"},
-		Data:       map[string][]byte{"token": []byte(strings.Repeat("b", 32))},
-	}
-	capability := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "external-capability", Namespace: request.Namespace, ResourceVersion: "rv-capability"},
-		Data:       map[string][]byte{"secret": []byte(strings.Repeat("c", 32))},
-	}
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(external, task, bearer, capability).Build()
-	epochs := NewControllerEpochManager(nil, "controller-a")
-	epochs.current = &store.ControllerEpoch{Name: store.DefaultControllerEpochName, Epoch: 1, HolderID: "controller-a"}
-	close(epochs.ready)
-	resolver := KubernetesACPMCPBrokerCredentialResolver{Reader: reader, Epochs: epochs}
-	credentials, err := resolver.ResolveACPMCPBrokerCredentials(context.Background(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if credentials.ExpectedFence.RuntimeInstanceID != "external-instance" ||
-		credentials.ExpectedFence.RuntimePoolGeneration != 5 || credentials.RuntimeProfile.Model != profile.Model {
+	if credentials.ExpectedFence != request.Metadata.Fence || credentials.RuntimeProfile.Model != acpTestModel {
 		t.Fatalf("external credentials = %#v", credentials)
+	}
+	if credentials.ExpectedMCPConfiguration == nil ||
+		credentials.ExpectedMCPConfiguration.ToolPolicy.DescriptorDigest != fixture.runtime.Status.ObservedCapabilities.MCPToolDescriptorDigest {
+		t.Fatalf("external frozen MCP configuration = %#v", credentials.ExpectedMCPConfiguration)
 	}
 	if credentials.Task.Name != task.Name || credentials.Task.Namespace != task.Namespace ||
 		credentials.Task.UID != string(task.UID) {
 		t.Fatalf("resolved external task identity = %#v", credentials.Task)
 	}
+
+	runtimeObject := &corev1alpha1.AgentRuntime{}
+	if err := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(fixture.runtime), runtimeObject); err != nil {
+		t.Fatal(err)
+	}
+	runtimeObject.Status.Ready = false
+	if err := fixture.client.Status().Update(fixture.ctx, runtimeObject); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolver.PreAuthenticateACPMCPBroker(
+		fixture.ctx, request.Namespace, string(request.Metadata.Fence.RuntimePoolUID), "Bearer "+bearer,
+	); err != nil {
+		t.Fatalf("draining external pre-auth error = %v", err)
+	}
+	if _, err := resolver.ResolveACPMCPBrokerCredentials(fixture.ctx, request); err != nil {
+		t.Fatalf("draining external credential resolution error = %v", err)
+	}
+}
+
+func TestKubernetesACPMCPBrokerCredentialResolverRequiresExternalTaskSupervisorBoot(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *externalACPDispatchFixture, *corev1alpha1.Task, *harnessv2.MCPBrokerCallRequest)
+	}{
+		{
+			name: "missing Task boot",
+			mutate: func(t *testing.T, fixture *externalACPDispatchFixture, task *corev1alpha1.Task, _ *harnessv2.MCPBrokerCallRequest) {
+				t.Helper()
+				task.Status.Execution.RuntimeSessionSupervisorBootID = ""
+				if err := fixture.client.Status().Update(fixture.ctx, task); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "restarted supervisor",
+			mutate: func(t *testing.T, fixture *externalACPDispatchFixture, _ *corev1alpha1.Task, request *harnessv2.MCPBrokerCallRequest) {
+				t.Helper()
+				runtimeObject := &corev1alpha1.AgentRuntime{}
+				if err := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(fixture.runtime), runtimeObject); err != nil {
+					t.Fatal(err)
+				}
+				runtimeObject.Status.ObservedCapabilities.SupervisorBootID = "replacement-boot"
+				if err := fixture.client.Status().Update(fixture.ctx, runtimeObject); err != nil {
+					t.Fatal(err)
+				}
+				request.Metadata.Fence.SupervisorBootID = "replacement-boot"
+				requestDigest, err := harnessv2.CanonicalRequestDigest(*request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Metadata.RequestDigest = requestDigest
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, task, request, resolver := newSnapshotBackedExternalMCPResolver(t)
+			test.mutate(t, fixture, task, &request)
+			if err := resolver.PreAuthenticateACPMCPBroker(
+				fixture.ctx, request.Namespace, string(request.Metadata.Fence.RuntimePoolUID), "Bearer "+strings.Repeat("t", 32),
+			); err != nil {
+				t.Fatalf("external pre-auth error = %v", err)
+			}
+			if _, err := resolver.ResolveACPMCPBrokerCredentials(fixture.ctx, request); err == nil ||
+				!strings.Contains(err.Error(), "supervisor boot does not match") {
+				t.Fatalf("external supervisor boot resolution error = %v", err)
+			}
+		})
+	}
+}
+
+func TestKubernetesACPMCPBrokerCredentialResolverRejectsAmbiguousRuntimeIdentity(t *testing.T) {
+	fixture, _, request, resolver := newSnapshotBackedExternalMCPResolver(t)
+	pool := &corev1alpha1.RuntimePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "colliding-pool",
+			Namespace: request.Namespace,
+			UID:       types.UID(request.Metadata.Fence.RuntimePoolUID),
+		},
+	}
+	if err := fixture.client.Create(fixture.ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	for _, bearer := range []string{strings.Repeat("t", 32), strings.Repeat("b", 32)} {
+		err := resolver.PreAuthenticateACPMCPBroker(
+			fixture.ctx, request.Namespace, string(request.Metadata.Fence.RuntimePoolUID), "Bearer "+bearer,
+		)
+		if err == nil || !strings.Contains(err.Error(), "missing or ambiguous") {
+			t.Fatalf("ambiguous identity pre-auth error = %v", err)
+		}
+	}
+}
+
+func TestKubernetesACPMCPBrokerCredentialResolverRejectsReconformedExternalAuthorityDrift(t *testing.T) {
+	t.Run("runtime generation", func(t *testing.T) {
+		fixture, _, request, resolver := newSnapshotBackedExternalMCPResolver(t)
+		runtimeObject := &corev1alpha1.AgentRuntime{}
+		if err := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(fixture.runtime), runtimeObject); err != nil {
+			t.Fatal(err)
+		}
+		runtimeObject.Spec.Deployment.Endpoint += "/reconfigured"
+		runtimeObject.Generation++
+		if err := fixture.client.Update(fixture.ctx, runtimeObject); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(fixture.runtime), runtimeObject); err != nil {
+			t.Fatal(err)
+		}
+		runtimeObject.Status.ObservedGeneration = runtimeObject.Generation
+		if err := fixture.client.Status().Update(fixture.ctx, runtimeObject); err != nil {
+			t.Fatal(err)
+		}
+		if err := resolver.PreAuthenticateACPMCPBroker(
+			fixture.ctx, request.Namespace, string(request.Metadata.Fence.RuntimePoolUID), "Bearer "+strings.Repeat("t", 32),
+		); err != nil {
+			t.Fatalf("reconformed runtime pre-auth error = %v", err)
+		}
+		if _, err := resolver.ResolveACPMCPBrokerCredentials(fixture.ctx, request); err == nil ||
+			!strings.Contains(err.Error(), "identity or generation changed after binding") {
+			t.Fatalf("reconformed runtime resolution error = %v", err)
+		}
+	})
+
+	t.Run("auth Secret rotation", func(t *testing.T) {
+		fixture, _, request, resolver := newSnapshotBackedExternalMCPResolver(t)
+		runtimeObject := &corev1alpha1.AgentRuntime{}
+		if err := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(fixture.runtime), runtimeObject); err != nil {
+			t.Fatal(err)
+		}
+		controllerRef := *runtimeObject.Spec.ClientAuth.ControllerBearerTokenSecretRef
+		capabilityRef := *runtimeObject.Spec.ClientAuth.OperationCapabilitySecretRef
+		secret := &corev1.Secret{}
+		if err := fixture.client.Get(fixture.ctx, client.ObjectKey{Namespace: runtimeObject.Namespace, Name: controllerRef.Name}, secret); err != nil {
+			t.Fatal(err)
+		}
+		secret.Data[controllerRef.Key] = []byte(strings.Repeat("n", 32))
+		secret.Data[capabilityRef.Key] = []byte(strings.Repeat("q", 32))
+		if err := fixture.client.Update(fixture.ctx, secret); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(secret), secret); err != nil {
+			t.Fatal(err)
+		}
+		runtimeObject.Status.ObservedControllerAuthRefResourceVersion = secret.ResourceVersion
+		runtimeObject.Status.ObservedOperationCapabilityRefResourceVersion = secret.ResourceVersion
+		if err := fixture.client.Status().Update(fixture.ctx, runtimeObject); err != nil {
+			t.Fatal(err)
+		}
+		if err := resolver.PreAuthenticateACPMCPBroker(
+			fixture.ctx, request.Namespace, string(request.Metadata.Fence.RuntimePoolUID), "Bearer "+strings.Repeat("n", 32),
+		); err != nil {
+			t.Fatalf("rotated Secret pre-auth error = %v", err)
+		}
+		if _, err := resolver.ResolveACPMCPBrokerCredentials(fixture.ctx, request); err == nil ||
+			!strings.Contains(err.Error(), "authentication authority changed after binding") {
+			t.Fatalf("rotated Secret resolution error = %v", err)
+		}
+	})
+}
+
+func newSnapshotBackedExternalMCPResolver(
+	t *testing.T,
+) (*externalACPDispatchFixture, *corev1alpha1.Task, harnessv2.MCPBrokerCallRequest, KubernetesACPMCPBrokerCredentialResolver) {
+	t.Helper()
+	fixture := newExternalACPDispatchFixture(t)
+	task := fixture.queueTask(t, "external-mcp", types.UID("external-mcp-task-uid"), "broker a tool", nil)
+	current := &corev1alpha1.Task{}
+	if err := fixture.client.Get(fixture.ctx, client.ObjectKeyFromObject(task), current); err != nil {
+		t.Fatal(err)
+	}
+	observed := fixture.runtime.Status.ObservedCapabilities
+	current.Status.Execution.State = corev1alpha1.TaskExecutionStateRunning
+	current.Status.Execution.RuntimeInstanceID = observed.RuntimeInstanceID
+	current.Status.Execution.RuntimeSessionUID = "external-mcp-session-uid"
+	current.Status.Execution.RuntimeSessionGeneration = 3
+	current.Status.Execution.RuntimeSessionSupervisorBootID = observed.SupervisorBootID
+	current.Status.Execution.ControllerEpoch = observed.ControllerEpoch
+	if err := fixture.client.Status().Update(fixture.ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	request, _ := testMCPBrokerRequest(t, harnessv2.MCPToolEffectReadOnly)
+	request.Namespace = current.Namespace
+	request.Metadata.TaskUID = harnessv2.TaskUID(current.UID)
+	request.Metadata.TaskAttempt = uint32(current.Status.Execution.Attempt)
+	request.Metadata.PromptID = harnessv2.PromptID(current.Status.Execution.PromptID)
+	request.Metadata.Fence = harnessv2.Fence{
+		RuntimeInstanceID:          harnessv2.RuntimeInstanceID(observed.RuntimeInstanceID),
+		SupervisorBootID:           harnessv2.SupervisorBootID(observed.SupervisorBootID),
+		ControllerEpoch:            uint64(observed.ControllerEpoch),
+		RuntimePoolUID:             harnessv2.RuntimePoolUID(observed.RuntimePoolUID),
+		RuntimePoolGeneration:      uint64(observed.RuntimePoolGeneration),
+		RuntimeSessionUID:          harnessv2.RuntimeSessionUID(current.Status.Execution.RuntimeSessionUID),
+		RuntimeSessionGeneration:   uint64(current.Status.Execution.RuntimeSessionGeneration),
+		RuntimeProfileDigest:       harnessv2.ProfileDigest(current.Status.AgentExecutionBinding.RuntimeProfileDigest),
+		ProfileDigestSchemaVersion: harnessv2.ProfileDigestSchemaVersion,
+	}
+	request.Authorization.RuntimeSessionUID = request.Metadata.Fence.RuntimeSessionUID
+	request.Authorization.SessionGeneration = request.Metadata.Fence.RuntimeSessionGeneration
+	request.Authorization.TaskUID = request.Metadata.TaskUID
+	request.Authorization.TaskAttempt = request.Metadata.TaskAttempt
+	request.Authorization.PromptID = request.Metadata.PromptID
+	request.Metadata.RequestDigest, _ = harnessv2.CanonicalRequestDigest(request)
+	resolver := KubernetesACPMCPBrokerCredentialResolver{
+		Reader: fixture.client, Epochs: fixture.epochs, AgentExecutionSnapshots: fixture.persistence,
+	}
+	return fixture, current, request, resolver
 }
 
 func TestDurableACPMCPPromptAuthorizerRequiresActiveExactAttempt(t *testing.T) {
@@ -934,6 +1117,71 @@ func TestDurableACPMCPPromptAuthorizerRequiresActiveExactAttempt(t *testing.T) {
 	authorizer.Attempts = staticPromptAttemptStore{attempt: &wrongSession}
 	if err := authorizer.AuthorizeACPMCPPrompt(context.Background(), request); err == nil {
 		t.Fatal("mismatched RuntimeSession remained authorized")
+	}
+}
+
+func TestDurableACPMCPPromptAuthorizerRequiresAcceptanceForConsequentialCalls(t *testing.T) {
+	tests := []struct {
+		name    string
+		effect  harnessv2.MCPToolEffect
+		state   store.PromptExecutionState
+		allowed bool
+	}{
+		{name: "read-only submitting", effect: harnessv2.MCPToolEffectReadOnly, state: store.PromptExecutionSubmitting, allowed: true},
+		{name: "consequential submitting", effect: harnessv2.MCPToolEffectConsequential, state: store.PromptExecutionSubmitting},
+		{name: "read-only accepted", effect: harnessv2.MCPToolEffectReadOnly, state: store.PromptExecutionAccepted, allowed: true},
+		{name: "consequential accepted", effect: harnessv2.MCPToolEffectConsequential, state: store.PromptExecutionAccepted, allowed: true},
+		{name: "read-only running", effect: harnessv2.MCPToolEffectReadOnly, state: store.PromptExecutionRunning, allowed: true},
+		{name: "consequential running", effect: harnessv2.MCPToolEffectConsequential, state: store.PromptExecutionRunning, allowed: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, _ := testMCPBrokerRequest(t, test.effect)
+			attempt := &store.PromptAttempt{
+				Key: store.PromptAttemptKey{
+					Namespace: request.Namespace, TaskUID: string(request.Metadata.TaskUID),
+					Attempt: int64(request.Metadata.TaskAttempt), PromptID: string(request.Metadata.PromptID),
+				},
+				SessionUID: string(request.Authorization.RuntimeSessionUID), RuntimeInstanceID: string(request.Metadata.Fence.RuntimeInstanceID),
+				ControllerEpoch: int64(request.Metadata.Fence.ControllerEpoch), ExecutionState: test.state,
+			}
+			attempt.ID, _ = attempt.Key.CanonicalID()
+			authorizer := DurableACPMCPPromptAuthorizer{Attempts: staticPromptAttemptStore{attempt: attempt}}
+			err := authorizer.AuthorizeACPMCPPrompt(context.Background(), request)
+			if test.allowed && err != nil {
+				t.Fatalf("AuthorizeACPMCPPrompt() error = %v", err)
+			}
+			if !test.allowed && err == nil {
+				t.Fatal("AuthorizeACPMCPPrompt() allowed a consequential call before prompt acceptance")
+			}
+		})
+	}
+}
+
+func TestDurableACPMCPPromptAuthorizerRejectsApprovalRequiredCalls(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	request, _ := testMCPBrokerRequest(t, harnessv2.MCPToolEffectConsequential)
+	request.Authorization.ApprovalPolicy = harnessv2.MCPApprovalPolicy{RequiredTools: []string{request.Call.ToolName}}
+	request.Call.Approval = &harnessv2.MCPApprovalEvidence{
+		PermissionRequestID: "permission-1",
+		ToolCallID:          request.Call.CallID,
+		ToolName:            request.Call.ToolName,
+		GrantedAt:           now.Add(-time.Minute),
+		ExpiresAt:           now.Add(time.Minute),
+	}
+	attempt := &store.PromptAttempt{
+		Key: store.PromptAttemptKey{
+			Namespace: request.Namespace, TaskUID: string(request.Metadata.TaskUID),
+			Attempt: int64(request.Metadata.TaskAttempt), PromptID: string(request.Metadata.PromptID),
+		},
+		SessionUID: string(request.Authorization.RuntimeSessionUID), RuntimeInstanceID: string(request.Metadata.Fence.RuntimeInstanceID),
+		ControllerEpoch: int64(request.Metadata.Fence.ControllerEpoch), ExecutionState: store.PromptExecutionRunning,
+	}
+	attempt.ID, _ = attempt.Key.CanonicalID()
+	authorizer := DurableACPMCPPromptAuthorizer{Attempts: staticPromptAttemptStore{attempt: attempt}}
+	err := authorizer.AuthorizeACPMCPPrompt(context.Background(), request)
+	if err == nil || !strings.Contains(err.Error(), "controller-owned permission review") {
+		t.Fatalf("approval-required call error = %v", err)
 	}
 }
 

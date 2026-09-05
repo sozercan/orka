@@ -1,8 +1,7 @@
-# External runtimes are operator-owned orka.harness.v2 services. Registration
-# and strict workspace-governance conformance are available, but runtimeRef Task
-# dispatch remains fail-closed until the external v2 dispatcher boundary is
-# enabled. Prefer controller-owned RuntimePools for built-in Codex, Claude,
-# Copilot, and OpenCode profiles.
+# External runtimes are operator-owned orka.harness.v2 services. Orka admits
+# runtimeRef Tasks only after registration and strict workspace-governance
+# conformance succeed. Prefer controller-owned RuntimePools for built-in Codex,
+# Claude, Copilot, and OpenCode profiles.
 #
 # Before applying this object, create both referenced Secrets in this namespace.
 # Each Secret must contain at least 32 bytes, set
@@ -49,6 +48,11 @@ spec:
       proxyCredentialRole: operator-managed
       proxyCredentialScope: external-runtime
       resourceClass: external
+    mcpPolicy:
+      allowedTools: []
+      disallowedTools: []
+      allowBash: false
+      approvalRequiredTools: []
     limits:
       maxResidentSessions: 10
       maxConcurrentPrompts: 4

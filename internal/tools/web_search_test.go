@@ -9,9 +9,15 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/orka-agents/orka/internal/workerenv"
 )
 
 func TestWebSearchTool_Name(t *testing.T) {
@@ -45,6 +51,157 @@ func TestWebSearchTool_Parameters(t *testing.T) {
 	// Check required fields
 	if schema[jsonSchemaTypeField] != typeObject {
 		t.Error("Parameters schema should have type: object")
+	}
+}
+
+func TestNewBrokeredWebSearchToolIgnoresWorkerConfigurationAndRejectsPrivateEndpoints(t *testing.T) {
+	t.Setenv(workerenv.SearchAPIKey, "configured-worker-value")
+	t.Setenv(workerenv.SearchAPIURL, "http://127.0.0.1:8080/search")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:8081")
+
+	tool := NewBrokeredWebSearchTool()
+	if tool.apiKey != "" || tool.baseURL != "" {
+		t.Fatalf("brokered search inherited worker configuration: apiKey=%t baseURL=%q", tool.apiKey != "", tool.baseURL)
+	}
+	transport, ok := tool.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("brokered search transport = %T, want *http.Transport", tool.client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("brokered search transport inherited proxy configuration")
+	}
+	if transport.DialContext == nil {
+		t.Fatal("brokered search transport has no public-endpoint dial guard")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if connection, err := transport.DialContext(ctx, "tcp", "127.0.0.1:80"); err == nil {
+		connection.Close() //nolint:errcheck
+		t.Fatal("brokered search transport dialed a private endpoint")
+	}
+	privateRedirect := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/internal", nil)
+	if err := tool.client.CheckRedirect(privateRedirect, nil); err == nil {
+		t.Fatal("brokered search client accepted a private redirect")
+	}
+}
+
+func TestBrokeredWebSearchReturnsErrorsInsteadOfSyntheticResults(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		transport http.RoundTripper
+		want      string
+	}{
+		{
+			name: "request failure",
+			transport: webSearchRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("offline")
+			}),
+			want: "DuckDuckGo request failed",
+		},
+		{
+			name: "unparseable response",
+			transport: webSearchRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("markup changed")),
+				}, nil
+			}),
+			want: "no parseable results",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tool := NewBrokeredWebSearchTool()
+			tool.client = &http.Client{Transport: test.transport}
+			result, err := tool.Execute(context.Background(), json.RawMessage(`{"query":"test"}`))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Execute() result = %q, error = %v, want error containing %q", result, err, test.want)
+			}
+			if strings.Contains(result, "Search Result") {
+				t.Fatalf("Execute() returned synthetic search data: %q", result)
+			}
+		})
+	}
+}
+
+func TestBrokeredWebSearchRejectsOversizedArgumentsBeforeRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    WebSearchArgs
+		wantErr string
+	}{
+		{
+			name:    "query",
+			args:    WebSearchArgs{Query: strings.Repeat("q", brokeredWebSearchMaxQueryChars+1)},
+			wantErr: "query must be no greater than",
+		},
+		{
+			name:    "limit",
+			args:    WebSearchArgs{Query: "test", Limit: brokeredWebSearchMaxResults + 1},
+			wantErr: "limit must be no greater than",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			tool := NewBrokeredWebSearchTool()
+			tool.client = &http.Client{Transport: webSearchRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				called = true
+				return nil, errors.New("unexpected request")
+			})}
+			args, err := json.Marshal(test.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tool.Execute(t.Context(), args); err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Execute() error = %v, want %q", err, test.wantErr)
+			}
+			if called {
+				t.Fatal("oversized brokered web_search arguments reached the HTTP client")
+			}
+		})
+	}
+}
+
+func TestBrokeredWebSearchQueryLimitCountsUnicodeCharacters(t *testing.T) {
+	query := strings.Repeat("é", brokeredWebSearchMaxQueryChars)
+	if len(query) <= brokeredWebSearchMaxQueryChars {
+		t.Fatalf("test query bytes = %d, want greater than character limit %d", len(query), brokeredWebSearchMaxQueryChars)
+	}
+
+	called := false
+	tool := NewBrokeredWebSearchTool()
+	tool.baseURL = "https://search.example.test"
+	tool.client = &http.Client{Transport: webSearchRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		called = true
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`[]`)),
+		}, nil
+	})}
+
+	args, err := json.Marshal(WebSearchArgs{Query: query})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(t.Context(), args); err != nil {
+		t.Fatalf("Execute() rejected query at character limit: %v", err)
+	}
+	if !called {
+		t.Fatal("query at character limit did not reach the HTTP client")
+	}
+
+	called = false
+	args, err = json.Marshal(WebSearchArgs{Query: query + "é"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(t.Context(), args); err == nil || !strings.Contains(err.Error(), "characters") {
+		t.Fatalf("Execute() error = %v, want character-limit error", err)
+	}
+	if called {
+		t.Fatal("query above character limit reached the HTTP client")
 	}
 }
 
@@ -303,4 +460,10 @@ func TestStripHTMLTags(t *testing.T) {
 			}
 		})
 	}
+}
+
+type webSearchRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f webSearchRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }

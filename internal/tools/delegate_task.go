@@ -360,6 +360,7 @@ func (t *DelegateTaskTool) parseDelegateArgs(ctx context.Context, args json.RawM
 	allowedAgents := os.Getenv(envOrkaCoordinationAllowedAgents)
 	maxDepthStr := os.Getenv(envOrkaCoordinationMaxDepth)
 	toolCtx := GetToolContext(ctx)
+	policyReader := toolPolicyReader(ctx, t.k8sClient)
 	brokered := toolCtx != nil && toolCtx.Brokered
 	if brokered {
 		parentName = strings.TrimSpace(toolCtx.TaskID)
@@ -428,7 +429,7 @@ func (t *DelegateTaskTool) parseDelegateArgs(ctx context.Context, args json.RawM
 		if parentLookupNS == "" {
 			parentLookupNS = taskNS
 		}
-		if err := t.k8sClient.Get(ctx, types.NamespacedName{Name: parentName, Namespace: parentLookupNS}, parentTask); err != nil {
+		if err := policyReader.Get(ctx, types.NamespacedName{Name: parentName, Namespace: parentLookupNS}, parentTask); err != nil {
 			return nil, fmt.Errorf("failed to get parent task: %w", err)
 		}
 	}
@@ -450,7 +451,7 @@ func (t *DelegateTaskTool) parseDelegateArgs(ctx context.Context, args json.RawM
 			parentAgentNamespace = value
 		}
 		parentAgent := &corev1alpha1.Agent{}
-		if err := t.k8sClient.Get(ctx, types.NamespacedName{
+		if err := policyReader.Get(ctx, types.NamespacedName{
 			Name: parentTask.Spec.AgentRef.Name, Namespace: parentAgentNamespace,
 		}, parentAgent); err != nil {
 			return nil, fmt.Errorf("failed to get parent agent: %w", err)
@@ -516,7 +517,7 @@ func (t *DelegateTaskTool) parseDelegateArgs(ctx context.Context, args json.RawM
 
 	// Look up the target Agent to determine task type.
 	targetAgent := &corev1alpha1.Agent{}
-	if err := t.k8sClient.Get(ctx, types.NamespacedName{
+	if err := policyReader.Get(ctx, types.NamespacedName{
 		Name: delegateArgs.Agent, Namespace: agentNS,
 	}, targetAgent); err != nil {
 		return nil, fmt.Errorf("failed to get agent %q: %w", namespacedDelegateAgent(agentNS, delegateArgs.Agent), err)
@@ -720,6 +721,13 @@ func (t *DelegateTaskTool) applyAgentRuntimeConfig(ctx context.Context, childTas
 	if dc.args.AllowBash != nil {
 		childTask.Spec.AgentRuntime.AllowBash = dc.args.AllowBash
 	}
+	if err := materializeRuntimeRefAllowedTools(ctx, toolPolicyReader(ctx, t.k8sClient), childTask, dc.targetAgent); err != nil {
+		return err
+	}
+	if dc.args.PriorTask != "" && dc.targetAgent.Spec.Runtime.RuntimeRef != nil &&
+		strings.TrimSpace(dc.targetAgent.Spec.Runtime.RuntimeRef.Name) != "" {
+		return fmt.Errorf("runtimeRef custom runtimes do not support priorTaskRef workspace handoff")
+	}
 	return nil
 }
 
@@ -902,7 +910,7 @@ func (t *DelegateTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(orkatracing.DelegateAttributes(dc.parentName, "")...)
 	orkatracing.StampTaskTraceContext(ctx, childTask)
-	if err := validateChildTaskAgainstParentTransaction(ctx, t.k8sClient, dc.parentTask, childTask, dc.args.Agent); err != nil {
+	if err := validateChildTaskAgainstParentTransaction(ctx, toolPolicyReader(ctx, t.k8sClient), dc.parentTask, childTask, dc.args.Agent); err != nil {
 		return "", err
 	}
 

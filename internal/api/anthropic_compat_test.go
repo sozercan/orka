@@ -51,7 +51,7 @@ func setupTestAnthropicHandler(objs ...runtime.Object) (*AnthropicCompatHandler,
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 	config := DefaultChatConfig()
 	resolver := NewProviderResolver(fakeClient, config)
-	handler := NewAnthropicCompatHandler(fakeClient, "default", false, config, resolver, nil)
+	handler := NewAnthropicCompatHandler(fakeClient, nil, "default", false, config, resolver, nil)
 
 	app := fiber.New()
 	return handler, app
@@ -1835,7 +1835,7 @@ func TestRunNonStreamingToolLoop_IterationLimit(t *testing.T) {
 	_ = corev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	_ = NewAnthropicCompatHandler(fakeClient, "default", false, config, NewProviderResolver(fakeClient, config), nil)
+	_ = NewAnthropicCompatHandler(fakeClient, nil, "default", false, config, NewProviderResolver(fakeClient, config), nil)
 
 	mock := &mockAnthropicProvider{
 		responses: []*llm.CompletionResponse{

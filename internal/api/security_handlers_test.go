@@ -39,6 +39,61 @@ const (
 	securityTestRepoPRURL = securityTestRepoURL + "/pull/99"
 )
 
+func securityRuntimeTestAgent(name string) *corev1alpha1.Agent {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	return &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "demo"},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			Type: corev1alpha1.AgentRuntimeCodex, ContractVersion: &contract,
+		}},
+	}
+}
+
+func securityExternalRuntimeTestFixtures(
+	agentName string,
+	workspaceIntent corev1alpha1.WorkspaceIntent,
+	allowedTools []string,
+) (*corev1alpha1.Agent, *corev1alpha1.AgentRuntime) {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	runtimeName := agentName + "-runtime"
+	return &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: agentName, Namespace: "demo"},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: runtimeName},
+		}},
+	}, &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: runtimeName, Namespace: "demo"},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "codex", Model: "gpt-5.6", WorkspaceIntent: workspaceIntent,
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          append([]string{}, allowedTools...),
+					DisallowedTools:       []string{},
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+}
+
+func securityExternalRuntimePolicySkew(
+	scheme *runtime.Scheme,
+	agentName string,
+	workspaceIntent corev1alpha1.WorkspaceIntent,
+	currentAllowedTools []string,
+) (*corev1alpha1.Agent, *corev1alpha1.AgentRuntime, client.Reader) {
+	agent, cachedRuntime := securityExternalRuntimeTestFixtures(agentName, workspaceIntent, []string{"revoked_tool"})
+	_, currentRuntime := securityExternalRuntimeTestFixtures(agentName, workspaceIntent, currentAllowedTools)
+	apiReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent.DeepCopy(), currentRuntime).
+		Build()
+	return agent, cachedRuntime, apiReader
+}
+
 func TestSecurityRepositoryActions_ContextTokenAuthorization(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")
@@ -241,7 +296,10 @@ func TestGenerateSecurityPatch_ContextTokenTransactionContextAuthorization(t *te
 					PatchAgentRef:                &patchAgent,
 				},
 			}
-			app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan)
+			patchAgentObject, patchRuntime := securityExternalRuntimeTestFixtures(
+				patchAgent.Name, corev1alpha1.WorkspaceIntentWrite, []string{"read_evidence"},
+			)
+			app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan, patchAgentObject, patchRuntime)
 
 			ctx := context.Background()
 			require.NoError(t, handlers.securityStore.UpsertFinding(ctx, &store.Finding{
@@ -273,6 +331,8 @@ func TestGenerateSecurityPatch_ContextTokenTransactionContextAuthorization(t *te
 				var tasks corev1alpha1.TaskList
 				require.NoError(t, handlers.client.List(ctx, &tasks, client.InNamespace("demo")))
 				require.Len(t, tasks.Items, 1)
+				require.NotNil(t, tasks.Items[0].Spec.AgentRuntime)
+				require.Equal(t, []string{"read_evidence"}, tasks.Items[0].Spec.AgentRuntime.AllowedTools)
 				proposals, err := handlers.securityStore.ListPatchProposals(ctx, "demo", "finding-1")
 				require.NoError(t, err)
 				require.Len(t, proposals, 1)
@@ -376,6 +436,8 @@ func TestCreateManualSecurityScan_ContextTokenTransactionContextAuthorizationDen
 func TestCreateManualSecurityScan_ContextTokenAllowsRefOnlyWorkspaceWithBranchAndRef(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
 	repoURL := securityTestRepoURL
 	scan := &corev1alpha1.RepositoryScan{
 		ObjectMeta: metav1.ObjectMeta{
@@ -388,7 +450,12 @@ func TestCreateManualSecurityScan_ContextTokenAllowsRefOnlyWorkspaceWithBranchAn
 			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
 		},
 	}
-	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan)
+	analysisAgent, cachedRuntime, apiReader := securityExternalRuntimePolicySkew(
+		scheme, scan.Spec.AnalysisAgentRef.Name, corev1alpha1.WorkspaceIntentRead,
+		[]string{"read_evidence", "search_findings"},
+	)
+	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan, analysisAgent, cachedRuntime)
+	handlers.apiReader = apiReader
 	token := issueTestContextToken(t, provider, nil, map[string]any{
 		"scope": ContextTokenScopeSecurityWrite,
 		"tctx": map[string]any{
@@ -413,6 +480,8 @@ func TestCreateManualSecurityScan_ContextTokenAllowsRefOnlyWorkspaceWithBranchAn
 	require.NotNil(t, task.Spec.Workspace)
 	require.Empty(t, task.Spec.Workspace.Branch)
 	require.Equal(t, "refs/tags/v1.0.0", task.Spec.Workspace.Ref)
+	require.NotNil(t, task.Spec.AgentRuntime)
+	require.Equal(t, []string{"read_evidence", "search_findings"}, task.Spec.AgentRuntime.AllowedTools)
 }
 
 func TestRepositoryScanMutations_ContextTokenTransactionContextAuthorizationDenials(t *testing.T) {
@@ -1272,7 +1341,8 @@ func TestCreateManualSecurityScan_ContextTokenStampsTaskRequesterAndTransaction(
 			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
 		},
 	}
-	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan)
+	analysisAgent := securityRuntimeTestAgent(scan.Spec.AnalysisAgentRef.Name)
+	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan, analysisAgent)
 
 	token := issueTestContextToken(t, provider, nil, map[string]any{"scope": ContextTokenScopeSecurityWrite + " " + ContextTokenScopeConfigMapsRead})
 	req := httptest.NewRequest(http.MethodPost, "/security/repositories/scan-1/scans?namespace=demo", nil)
@@ -1314,7 +1384,8 @@ func TestCreateManualSecurityScanConcurrentRequestsReturnCreatedAndConflict(t *t
 			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
 		},
 	}
-	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan)
+	analysisAgent := securityRuntimeTestAgent(scan.Spec.AnalysisAgentRef.Name)
+	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan, analysisAgent)
 	token := issueTestContextToken(t, provider, nil, map[string]any{"scope": ContextTokenScopeSecurityWrite})
 
 	type response struct {
@@ -1379,7 +1450,8 @@ func TestCreateManualSecurityScanReleasesAdmissionWhenTaskCreationFails(t *testi
 			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
 		},
 	}
-	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan)
+	analysisAgent := securityRuntimeTestAgent(scan.Spec.AnalysisAgentRef.Name)
+	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce, scan, analysisAgent)
 	baseClient := handlers.client
 	baseWithWatch, ok := baseClient.(client.WithWatch)
 	require.True(t, ok)
@@ -1540,13 +1612,17 @@ func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
+	patchAgent, cachedRuntime, apiReader := securityExternalRuntimePolicySkew(
+		scheme, scan.Spec.PatchAgentRef.Name, corev1alpha1.WorkspaceIntentWrite, []string{"read_evidence"},
+	)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, patchAgent, cachedRuntime).Build()
 	db, err := sqlite.NewDB(":memory:")
 	require.NoError(t, err)
 	securityStore := sqlite.NewStore(db, ":memory:")
 
 	handlers := NewHandlers(HandlersConfig{
 		Client:        fakeClient,
+		APIReader:     apiReader,
 		SecurityStore: securityStore,
 	})
 
@@ -1571,6 +1647,8 @@ func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
 	require.Equal(t, proposal.TaskName, task.Name)
 	require.Equal(t, corev1alpha1.TaskTypeAgent, task.Spec.Type)
 	require.Equal(t, "patch", task.Spec.AgentRef.Name)
+	require.NotNil(t, task.Spec.AgentRuntime)
+	require.Equal(t, []string{"read_evidence"}, task.Spec.AgentRuntime.AllowedTools)
 	require.Empty(t, task.Spec.Env)
 	require.Contains(t, task.Spec.Prompt, proposal.Branch)
 	require.NotNil(t, task.Spec.Workspace)
@@ -1600,6 +1678,39 @@ func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
 	require.Len(t, proposals, 1)
 	require.Equal(t, proposal.ID, proposals[0].ID)
 	require.Equal(t, proposal.Branch, proposals[0].Branch)
+}
+
+func TestCreateSecurityValidationTaskMaterializesRuntimeRefAllowedTools(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "scan-validation", Namespace: "demo"},
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL: securityTestRepoURL, AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	}
+	analysisAgent, cachedRuntime, apiReader := securityExternalRuntimePolicySkew(
+		scheme, scan.Spec.AnalysisAgentRef.Name, corev1alpha1.WorkspaceIntentRead, []string{},
+	)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan, analysisAgent, cachedRuntime).Build()
+	db, err := sqlite.NewDB(":memory:")
+	require.NoError(t, err)
+	securityStore := sqlite.NewStore(db, ":memory:")
+	handlers := NewHandlers(HandlersConfig{Client: fakeClient, APIReader: apiReader, SecurityStore: securityStore})
+	finding := &store.Finding{
+		ID: "finding-validation", Namespace: "demo", RepositoryScan: scan.Name, Severity: "high", Confidence: "high",
+	}
+
+	require.NoError(t, handlers.createSecurityValidationTask(context.Background(), nil, scan, finding))
+	var tasks corev1alpha1.TaskList
+	require.NoError(t, fakeClient.List(context.Background(), &tasks, client.InNamespace("demo")))
+	require.Len(t, tasks.Items, 1)
+	require.NotNil(t, tasks.Items[0].Spec.AgentRuntime)
+	require.NotNil(t, tasks.Items[0].Spec.AgentRuntime.AllowedTools)
+	require.Empty(t, tasks.Items[0].Spec.AgentRuntime.AllowedTools)
+	storedFinding, err := securityStore.GetFinding(context.Background(), "demo", finding.ID)
+	require.NoError(t, err)
+	require.Equal(t, "pending", storedFinding.ValidationStatus)
 }
 
 func TestCreateSecurityPatchTaskRejectsLegacyCredentialReuse(t *testing.T) {

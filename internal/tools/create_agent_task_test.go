@@ -9,6 +9,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -873,6 +874,205 @@ func TestCreateAgentTaskTool_Execute_AllowsReadWorkspaceWithoutGitRepo(t *testin
 	}
 	if task.Spec.Workspace.ReadCredentialRef != nil {
 		t.Fatalf("readCredentialRef = %#v, want nil without gitRepo", task.Spec.Workspace.ReadCredentialRef)
+	}
+}
+
+func TestCreateAgentTaskTool_Execute_MaterializesRuntimeRefAllowedTools(t *testing.T) {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	for _, tt := range []struct {
+		name    string
+		allowed []string
+	}{
+		{name: "nonempty allowlist", allowed: []string{"check_messages", "web_search"}},
+		{name: "explicit deny all", allowed: []string{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const runtimeName = "external-runtime"
+			agent := &corev1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: "external-agent", Namespace: defaultNamespace},
+				Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+					RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: runtimeName},
+				}},
+			}
+			runtime := &corev1alpha1.AgentRuntime{
+				ObjectMeta: metav1.ObjectMeta{Name: runtimeName, Namespace: defaultNamespace},
+				Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+					ContractVersion: &contract,
+					Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+						Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+							ProviderKind: "codex", Model: "gpt-5.6", WorkspaceIntent: corev1alpha1.WorkspaceIntentRead,
+						},
+						MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+							AllowedTools:          append([]string{}, tt.allowed...),
+							DisallowedTools:       []string{},
+							ApprovalRequiredTools: []string{},
+						},
+					},
+				},
+			}
+			fc := newFakeClient(agent, runtime)
+			result, err := (&CreateAgentTaskTool{}).Execute(
+				newCreateAgentTaskToolCtx(fc),
+				json.RawMessage(`{"name":"external-task","prompt":"work","agentRef":"external-agent"}`),
+			)
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			var response ChatToolResult
+			if err := json.Unmarshal([]byte(result), &response); err != nil {
+				t.Fatal(err)
+			}
+			if !response.Success {
+				t.Fatalf("Execute() result = %#v", response)
+			}
+
+			task := &corev1alpha1.Task{}
+			if err := fc.Get(context.Background(), apitypes.NamespacedName{
+				Name: testAgentTaskGeneratedName, Namespace: defaultNamespace,
+			}, task); err != nil {
+				t.Fatal(err)
+			}
+			if task.Spec.AgentRuntime == nil {
+				t.Fatal("agentRuntime = nil, want materialized runtime policy")
+			}
+			if !slices.Equal(task.Spec.AgentRuntime.AllowedTools, tt.allowed) {
+				t.Fatalf("allowedTools = %#v, want %#v", task.Spec.AgentRuntime.AllowedTools, tt.allowed)
+			}
+			if task.Spec.AgentRuntime.AllowedTools == nil {
+				t.Fatal("allowedTools = nil, want explicit list")
+			}
+		})
+	}
+}
+
+func TestCreateAgentTaskTool_Execute_UsesRuntimePolicyReader(t *testing.T) {
+	cachedAgent, cachedRuntime := externalRuntimePolicyFixtures([]string{"Read"})
+	liveAgent, liveRuntime := externalRuntimePolicyFixtures([]string{"Write"})
+	cachedClient := newFakeClient(cachedAgent, cachedRuntime)
+	liveReader := newFakeClient(liveAgent, liveRuntime)
+	ctx := newCreateAgentTaskToolCtx(cachedClient)
+	GetToolContext(ctx).PolicyReader = liveReader
+
+	result, err := (&CreateAgentTaskTool{}).Execute(
+		ctx,
+		json.RawMessage(`{"name":"external-task","prompt":"work","agentRef":"external-agent"}`),
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Success {
+		t.Fatalf("Execute() result = %#v", response)
+	}
+
+	task := &corev1alpha1.Task{}
+	if err := cachedClient.Get(context.Background(), apitypes.NamespacedName{
+		Name: testAgentTaskGeneratedName, Namespace: defaultNamespace,
+	}, task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Spec.AgentRuntime == nil || !slices.Equal(task.Spec.AgentRuntime.AllowedTools, []string{"Write"}) {
+		t.Fatalf("agentRuntime = %#v, want current live policy", task.Spec.AgentRuntime)
+	}
+}
+
+func TestCreateAgentTaskTool_Execute_RejectsRuntimeRefMaxTurns(t *testing.T) {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	const runtimeName = "external-runtime"
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-agent", Namespace: defaultNamespace},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: runtimeName},
+		}},
+	}
+	runtime := &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: runtimeName, Namespace: defaultNamespace},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "codex", Model: "gpt-5.6", WorkspaceIntent: corev1alpha1.WorkspaceIntentRead,
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          []string{},
+					DisallowedTools:       []string{},
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+	fc := newFakeClient(agent, runtime)
+	result, err := (&CreateAgentTaskTool{}).Execute(
+		newCreateAgentTaskToolCtx(fc),
+		json.RawMessage(`{"name":"external-task","prompt":"work","agentRef":"external-agent","maxTurns":10}`),
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Success || !strings.Contains(response.Error, "do not support maxTurns") {
+		t.Fatalf("Execute() result = %#v, want unsupported maxTurns error", response)
+	}
+	tasks := &corev1alpha1.TaskList{}
+	if err := fc.List(context.Background(), tasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks.Items) != 0 {
+		t.Fatalf("created %d Tasks after unsupported maxTurns override", len(tasks.Items))
+	}
+}
+
+func TestCreateAgentTaskTool_Execute_RejectsRuntimeRefWithoutExplicitAllowedTools(t *testing.T) {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	const runtimeName = "external-runtime"
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-agent", Namespace: defaultNamespace},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: runtimeName},
+		}},
+	}
+	runtime := &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: runtimeName, Namespace: defaultNamespace},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "codex", Model: "gpt-5.6", WorkspaceIntent: corev1alpha1.WorkspaceIntentRead,
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					DisallowedTools:       []string{},
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+	fc := newFakeClient(agent, runtime)
+	result, err := (&CreateAgentTaskTool{}).Execute(
+		newCreateAgentTaskToolCtx(fc),
+		json.RawMessage(`{"name":"external-task","prompt":"work","agentRef":"external-agent"}`),
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var response ChatToolResult
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Success || !strings.Contains(response.Error, "allowedTools must be an explicit list") {
+		t.Fatalf("Execute() result = %#v, want fail-closed policy error", response)
+	}
+	tasks := &corev1alpha1.TaskList{}
+	if err := fc.List(context.Background(), tasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks.Items) != 0 {
+		t.Fatalf("created %d Tasks after invalid runtime policy", len(tasks.Items))
 	}
 }
 

@@ -921,6 +921,69 @@ func TestRuntimeSessionCreationMayHaveApplied(t *testing.T) {
 	}
 }
 
+func TestRetryableUnsentMutationCanRetry(t *testing.T) {
+	zeroWrite := harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteZeroBytes}
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "retryable zero write",
+			err:  &harnessv2.ClientError{Kind: harnessv2.ClientErrorValidation, Retryable: true, WriteEvidence: zeroWrite},
+			want: true,
+		},
+		{
+			name: "nonretryable zero write",
+			err:  &harnessv2.ClientError{Kind: harnessv2.ClientErrorValidation, WriteEvidence: zeroWrite},
+		},
+		{
+			name: "retryable ambiguous write",
+			err: &harnessv2.ClientError{
+				Kind: harnessv2.ClientErrorTransport, Retryable: true,
+				WriteEvidence: harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteAmbiguous},
+			},
+		},
+		{name: "non client error", err: errors.New("validation unavailable")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := retryableUnsentMutationCanRetry(test.err); got != test.want {
+				t.Fatalf("retryableUnsentMutationCanRetry() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRetryableUnsentPromptCanRequeue(t *testing.T) {
+	zeroWrite := harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteZeroBytes}
+	ambiguousWrite := harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteAmbiguous}
+	retryableZeroWrite := &harnessv2.ClientError{Retryable: true, WriteEvidence: zeroWrite}
+	for _, test := range []struct {
+		name              string
+		accepted          bool
+		summary           harnessv2.PromptStreamSummary
+		runtimeContextErr error
+		err               error
+		want              bool
+	}{
+		{name: "retryable zero write", summary: harnessv2.PromptStreamSummary{WriteEvidence: zeroWrite}, err: retryableZeroWrite, want: true},
+		{name: "callback accepted", accepted: true, summary: harnessv2.PromptStreamSummary{WriteEvidence: zeroWrite}, err: retryableZeroWrite},
+		{name: "summary accepted", summary: harnessv2.PromptStreamSummary{Accepted: true, WriteEvidence: zeroWrite}, err: retryableZeroWrite},
+		{name: "task cancelled", summary: harnessv2.PromptStreamSummary{WriteEvidence: zeroWrite}, runtimeContextErr: context.Canceled, err: retryableZeroWrite},
+		{name: "task deadline", summary: harnessv2.PromptStreamSummary{WriteEvidence: zeroWrite}, runtimeContextErr: context.DeadlineExceeded, err: retryableZeroWrite},
+		{name: "nonretryable zero write", summary: harnessv2.PromptStreamSummary{WriteEvidence: zeroWrite}, err: &harnessv2.ClientError{WriteEvidence: zeroWrite}},
+		{name: "retryable ambiguous client write", summary: harnessv2.PromptStreamSummary{WriteEvidence: ambiguousWrite}, err: &harnessv2.ClientError{Retryable: true, WriteEvidence: ambiguousWrite}},
+		{name: "ambiguous summary", summary: harnessv2.PromptStreamSummary{WriteEvidence: ambiguousWrite}, err: retryableZeroWrite},
+		{name: "non client error", summary: harnessv2.PromptStreamSummary{WriteEvidence: zeroWrite}, err: errors.New("validation unavailable")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := retryableUnsentPromptCanRequeue(test.accepted, test.summary, test.runtimeContextErr, test.err); got != test.want {
+				t.Fatalf("retryableUnsentPromptCanRequeue() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestPublicationTerminalStateMapping(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -3020,6 +3083,9 @@ func TestACPDispatcherPublishesPreparedWorkspaceDelta(t *testing.T) {
 		if intent.BaseRepository.ID != "github.com/orka-agents/orka" || intent.HeadRepository.ID != "github.com/sozercan/orka-fork" {
 			t.Fatalf("continuation PR repositories = base %#v head %#v", intent.BaseRepository, intent.HeadRepository)
 		}
+		if intent.SessionUID != sessionUID {
+			t.Fatalf("continuation PR Session UID = %q, want durable owner %q", intent.SessionUID, sessionUID)
+		}
 	default:
 		t.Fatal("publisher did not receive a pull request intent")
 	}
@@ -3539,14 +3605,23 @@ func newDispatcherWriteRuntimeServer(
 	return httptest.NewServer(mux)
 }
 
-func newDispatcherRuntimeServer(
+func newDispatcherRuntimeServerWithSessionConfigurationAndDelete(
 	t *testing.T,
 	profile harnessv2.RuntimeProfile,
 	digest harnessv2.ProfileDigest,
+	supportsAgentSessionConfiguration bool,
+	supportsPermissions bool,
+	onDelete func(harnessv2.DeleteRuntimeSessionRequest),
 	onCreate ...func(harnessv2.CreateRuntimeSessionRequest),
 ) *httptest.Server {
 	t.Helper()
-	return newDispatcherRuntimeServerForPool(t, profile, digest, acpDispatcherTestPoolUID, onCreate...)
+	return newDispatcherRuntimeServerForPoolWithOptions(
+		t, profile, digest, acpDispatcherTestPoolUID, dispatcherRuntimeServerOptions{
+			disableAgentSessionConfiguration: !supportsAgentSessionConfiguration,
+			disablePermissions:               !supportsPermissions,
+			onDelete:                         onDelete,
+		}, onCreate...,
+	)
 }
 
 func newDispatcherRuntimeServerForPool(
@@ -3577,7 +3652,9 @@ func newDispatcherRuntimeServerWithTerminalEvents(
 }
 
 type dispatcherRuntimeServerOptions struct {
-	terminalEvents map[harnessv2.PromptID]harnessv2.EventType
+	terminalEvents                   map[harnessv2.PromptID]harnessv2.EventType
+	disableAgentSessionConfiguration bool
+	disablePermissions               bool
 	// rejectCreate answers a create request with the returned error response
 	// and status instead of creating the session when the response is non-nil.
 	// resident makes the runtime keep reporting the exact requested session as
@@ -3625,10 +3702,10 @@ func newDispatcherRuntimeServerForPoolWithOptions(
 			Protocol: harnessv2.ProtocolVersion, Transport: "http+ndjson", ACPVersion: harnessv2.ACPProfileV1,
 			RuntimeProfileDigest: digest, ProfileDigestSchemaVersion: harnessv2.ProfileDigestSchemaVersion,
 			AdapterDigests: profile.AdapterDigests, Limits: limits,
-			Provider:                          harnessv2.ProviderCapabilities{ProviderKinds: []string{profile.ProviderKind}, Models: []string{profile.Model}, SupportsCancel: true, SupportsPermissions: true, SupportsTools: true},
+			Provider:                          harnessv2.ProviderCapabilities{ProviderKinds: []string{profile.ProviderKind}, Models: []string{profile.Model}, SupportsCancel: true, SupportsPermissions: !options.disablePermissions, SupportsTools: true},
 			WorkspaceGovernance:               harnessv2.StrictWorkspaceGovernanceCapabilities(),
 			SupportsDrain:                     true,
-			SupportsAgentSessionConfiguration: true,
+			SupportsAgentSessionConfiguration: !options.disableAgentSessionConfiguration,
 		})
 	})
 	mux.HandleFunc("PUT /v2/runtime-sessions/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
@@ -3863,112 +3940,6 @@ func testACPExecuteBindingForDispatcher() *corev1alpha1.AgentExecutionBinding {
 		Snapshot: corev1alpha1.AgentExecutionSnapshotRef{
 			Digest: testControlDigestForDispatcher("test-v2-snapshot"),
 		},
-	}
-}
-
-func TestACPDispatcherRejectsPersistedExternalRuntimeAttemptsWithoutExecution(t *testing.T) {
-	for _, state := range []corev1alpha1.TaskExecutionState{
-		corev1alpha1.TaskExecutionStateQueued,
-		corev1alpha1.TaskExecutionStateReserved,
-	} {
-		t.Run(string(state), func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			var runtimeCalls atomic.Int32
-			runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				runtimeCalls.Add(1)
-				http.Error(w, "external runtime dispatch must remain unreachable", http.StatusInternalServerError)
-			}))
-			defer runtimeServer.Close()
-
-			db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "store.db"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close() //nolint:errcheck
-			controlStore := sqlite.NewStore(db, "test")
-			epochs, stopEpoch := startACPRecoveryEpochManager(t, ctx, controlStore, "external-cutover")
-			defer stopEpoch()
-			fence, err := epochs.CurrentFence(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			uid := types.UID("persisted-external-" + strings.ToLower(string(state)))
-			promptID := "prompt-" + string(uid) + "-1"
-			requestDigest := testControlDigestForDispatcher("external-cutover-" + string(state))
-			runtimeRegistration := plannerExternalRuntime()
-			runtimeRegistration.Spec.Deployment.Endpoint = runtimeServer.URL
-			task := &corev1alpha1.Task{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "default", Name: "persisted-external-" + strings.ToLower(string(state)), UID: uid,
-					Labels: map[string]string{acpExternalRuntimeTaskLabel: runtimeRegistration.Name},
-				},
-				Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do not dispatch"},
-				Status: corev1alpha1.TaskStatus{
-					Phase: corev1alpha1.TaskPhasePending, Attempts: 1,
-					AgentExecutionBinding: testACPExecuteBindingForDispatcher(),
-					Execution: &corev1alpha1.TaskExecutionStatus{
-						State: state, Attempt: 1, PromptID: promptID, RequestDigest: requestDigest,
-						AgentRuntimeName: runtimeRegistration.Name, AgentRuntimeUID: string(runtimeRegistration.UID), ControllerEpoch: fence.Epoch,
-					},
-					Delivery: &corev1alpha1.TaskDeliveryStatus{
-						State: corev1alpha1.TaskDeliveryStateNotRequested, Outcome: corev1alpha1.TaskDeliveryOutcomeNotRequested,
-					},
-				},
-			}
-			scheme := runtime.NewScheme()
-			if err := corev1alpha1.AddToScheme(scheme); err != nil {
-				t.Fatal(err)
-			}
-			kubeClient := fake.NewClientBuilder().WithScheme(scheme).
-				WithStatusSubresource(&corev1alpha1.Task{}, &corev1alpha1.AgentRuntime{}).
-				WithObjects(task, runtimeRegistration).Build()
-			key := store.PromptAttemptKey{Namespace: task.Namespace, TaskUID: string(task.UID), Attempt: 1, PromptID: promptID}
-			attempt, err := controlStore.CreatePromptAttempt(ctx, boundPromptAttemptForTest(&store.PromptAttempt{
-				Key: key, RequestDigest: requestDigest, ExecutionState: store.PromptExecutionQueued, DeliveryState: store.PromptDeliveryNotRequested,
-			}), fence)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if state == corev1alpha1.TaskExecutionStateReserved {
-				attempt, err = controlStore.TransitionPromptAttemptExecution(ctx, store.PromptAttemptExecutionTransition{
-					ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: store.PromptExecutionQueued,
-					NewState: store.PromptExecutionReserved, OperationID: "persisted-reservation", OperationDigest: testControlDigestForDispatcher("persisted-reservation"), UpdatedAt: time.Now().UTC(),
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			dispatcher := &ACPDispatcher{
-				Client: kubeClient, APIReader: kubeClient, Store: controlStore, ResultStore: controlStore, Epochs: epochs,
-				active: make(map[types.UID]struct{}), sem: make(chan struct{}, 1),
-			}
-			if err := dispatcher.dispatchOnce(ctx); err != nil {
-				t.Fatal(err)
-			}
-			if got := runtimeCalls.Load(); got != 0 {
-				t.Fatalf("external runtime received %d execution client calls", got)
-			}
-			terminalAttempt, err := controlStore.GetPromptAttempt(ctx, attempt.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if terminalAttempt.ExecutionState != store.PromptExecutionFailed || terminalAttempt.TerminalReason != string(acpExternalRuntimeDispatchUnsupportedExecutionReason) {
-				t.Fatalf("persisted attempt was not failed closed: %#v", terminalAttempt)
-			}
-			failed := &corev1alpha1.Task{}
-			if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(task), failed); err != nil {
-				t.Fatal(err)
-			}
-			wantMessage := externalAgentRuntimeDispatchUnsupportedReason(runtimeRegistration.Name)
-			if failed.Status.Phase != corev1alpha1.TaskPhaseFailed || failed.Status.Execution == nil ||
-				failed.Status.Execution.State != corev1alpha1.TaskExecutionStateFailed || failed.Status.Execution.Outcome != corev1alpha1.TaskExecutionOutcomeFailed ||
-				failed.Status.Execution.Reason != acpExternalRuntimeDispatchUnsupportedExecutionReason || failed.Status.Execution.Message != wantMessage {
-				t.Fatalf("persisted external Task was not failed closed: %#v", failed.Status)
-			}
-		})
 	}
 }
 
@@ -4403,6 +4374,95 @@ func TestACPDispatcherPreAcceptanceRateLimitRequeuesWithoutTerminalFailure(t *te
 	}
 }
 
+func TestACPDispatcherRejectedExternalPromptAdmissionReleasesTaskForRequeue(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	task := runtimePoolReservationTestTask("external-rate-limited", "external-rate-limited-uid", "")
+	task.Status.Execution.State = corev1alpha1.TaskExecutionStateSubmitting
+	task.Status.Execution.RuntimePoolName = ""
+	task.Status.Execution.RuntimePoolUID = ""
+	task.Status.Execution.AgentRuntimeName = "external-v2"
+	task.Status.Execution.AgentRuntimeUID = "external-v2-uid"
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.Task{}).WithObjects(task).Build()
+	db, err := sqlite.NewDB(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+	controlStore := sqlite.NewStore(db, "test")
+	epochs := NewControllerEpochManager(controlStore, "controller-test")
+	epochCtx, cancelEpoch := context.WithCancel(context.Background())
+	epochDone := make(chan error, 1)
+	go func() { epochDone <- epochs.Start(epochCtx) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	fence, err := epochs.CurrentFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.PromptAttemptKey{Namespace: task.Namespace, TaskUID: string(task.UID), Attempt: 1, PromptID: task.Status.Execution.PromptID}
+	attempt, err := controlStore.CreatePromptAttempt(ctx, boundPromptAttemptForTest(&store.PromptAttempt{
+		Key: key, RequestDigest: task.Status.Execution.RequestDigest,
+	}), fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := &ACPDispatcher{Client: kubeClient, Store: controlStore, Epochs: epochs}
+	for _, next := range []store.PromptExecutionState{
+		store.PromptExecutionReserved,
+		store.PromptExecutionSessionStarting,
+		store.PromptExecutionPlanned,
+		store.PromptExecutionSubmitting,
+	} {
+		if err := dispatcher.transitionAttempt(ctx, attempt.ID, fence, attempt.ExecutionState, next, "test-"+string(next), nil); err != nil {
+			t.Fatal(err)
+		}
+		attempt, err = controlStore.GetPromptAttempt(ctx, attempt.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := controlStore.RecoverPromptAttemptPreSubmission(ctx, store.PromptAttemptPreSubmissionRecovery{
+		ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+		OperationID: "unsafe-submitting-reset", OperationDigest: testControlDigestForDispatcher("unsafe-submitting-reset"),
+		RecoveredAt: time.Now().UTC(),
+	}); !errors.Is(err, store.ErrValidation) {
+		t.Fatalf("unproven Submitting recovery error = %v, want ErrValidation", err)
+	}
+
+	rateLimited := &harnessv2.ClientError{
+		Kind: harnessv2.ClientErrorHTTP, StatusCode: http.StatusTooManyRequests,
+		Code: harnessv2.ErrorCodeRateLimited, Retryable: true,
+	}
+	if err := dispatcher.requeueProvenNotAcceptedPromptAdmission(
+		ctx, task.DeepCopy(), attempt.ID, fence, rateLimited, nil, false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err = controlStore.GetPromptAttempt(ctx, attempt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.ExecutionState != store.PromptExecutionReserved || promptAttemptHasRuntimeOrSessionBinding(attempt) {
+		t.Fatalf("requeued external attempt = %#v, want unbound Reserved", attempt)
+	}
+	updated := &corev1alpha1.Task{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(task), updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Execution == nil || updated.Status.Execution.State != corev1alpha1.TaskExecutionStateReserved ||
+		updated.Status.Execution.Reason != corev1alpha1.TaskExecutionReasonAtCapacity ||
+		updated.Status.Execution.AgentRuntimeName != "external-v2" || taskExecutionStateTerminal(updated.Status.Execution.State) {
+		t.Fatalf("rate-limited external task was not released for retry: %#v", updated.Status.Execution)
+	}
+	cancelEpoch()
+	if err := <-epochDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestACPDispatcherReservedRetryReportsOnlyBoundedStage(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1alpha1.AddToScheme(scheme); err != nil {
@@ -4430,7 +4490,7 @@ func TestACPDispatcherReservedRetryReportsOnlyBoundedStage(t *testing.T) {
 	if updated.Status.Execution == nil {
 		t.Fatal("reserved retry removed execution status")
 	}
-	if got, want := updated.Status.Execution.Message, "RuntimePool admission will be retried (stage: session-preparation)"; got != want {
+	if got, want := updated.Status.Execution.Message, "runtime admission will be retried (stage: session-preparation)"; got != want {
 		t.Fatalf("retry message = %q, want %q", got, want)
 	}
 	if strings.Contains(updated.Status.Execution.Message, "sensitive provider diagnostic") {
@@ -5281,6 +5341,8 @@ func TestPromptLeaseRenewalRetryable(t *testing.T) {
 		{name: "http 410 settled", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: 410, Code: harnessv2.ErrorCodeSettled}, want: false},
 		{name: "http 409 digest conflict", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorHTTP, StatusCode: 409, Code: harnessv2.ErrorCodeDigestConflict}, want: false},
 		{name: "validation", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorValidation}, want: false},
+		{name: "retryable validation with zero write", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorValidation, Retryable: true, WriteEvidence: harnessv2.RequestWriteEvidence{State: harnessv2.RequestWriteZeroBytes}}, want: true},
+		{name: "retryable validation with unknown write", err: &harnessv2.ClientError{Kind: harnessv2.ClientErrorValidation, Retryable: true}, want: false},
 		{name: "plain error", err: errors.New("boom"), want: true},
 	}
 	for _, tc := range cases {
@@ -5288,6 +5350,130 @@ func TestPromptLeaseRenewalRetryable(t *testing.T) {
 			t.Parallel()
 			if got := promptLeaseRenewalRetryable(tc.err); got != tc.want {
 				t.Fatalf("promptLeaseRenewalRetryable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFrozenMCPPermissionDecisionAllowsOnlyProviderNativeToolsOnce(t *testing.T) {
+	t.Parallel()
+	providerNativePolicy := harnessv2.MCPToolPolicy{
+		AllowedToolNames: []string{providerNativeToolRead},
+		Tools: []harnessv2.MCPToolDescriptor{{
+			Name: providerNativeToolRead, Source: harnessv2.MCPToolSourceProviderNative,
+			Effect: harnessv2.MCPToolEffectReadOnly,
+		}},
+	}
+	brokeredPolicy := harnessv2.MCPToolPolicy{
+		AllowedToolNames: []string{"lookup"},
+		Tools: []harnessv2.MCPToolDescriptor{{
+			Name: "lookup", Source: harnessv2.MCPToolSourceBrokeredBuiltin,
+			Effect: harnessv2.MCPToolEffectReadOnly,
+		}},
+	}
+	options := []harnessv2.PermissionOption{
+		{OptionID: "allow-always", Kind: harnessv2.PermissionOptionAllowAlways},
+		{OptionID: "allow-once", Kind: harnessv2.PermissionOptionAllowOnce},
+		{OptionID: "reject-once", Kind: harnessv2.PermissionOptionRejectOnce},
+	}
+	tests := []struct {
+		name       string
+		policy     harnessv2.MCPToolPolicy
+		permission *harnessv2.PermissionRequestedEvent
+		want       harnessv2.PermissionDecision
+	}{
+		{
+			name:   "allowed provider-native tool",
+			policy: providerNativePolicy,
+			permission: &harnessv2.PermissionRequestedEvent{
+				ToolName: providerNativeToolRead, Options: options,
+			},
+			want: harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionSelected, OptionID: "allow-once"},
+		},
+		{
+			name:   "provider-native tool without one-shot allow",
+			policy: providerNativePolicy,
+			permission: &harnessv2.PermissionRequestedEvent{
+				ToolName: providerNativeToolRead,
+				Options: []harnessv2.PermissionOption{
+					{OptionID: "allow-always", Kind: harnessv2.PermissionOptionAllowAlways},
+					{OptionID: "reject-once", Kind: harnessv2.PermissionOptionRejectOnce},
+				},
+			},
+			want: harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionSelected, OptionID: "reject-once"},
+		},
+		{
+			name:   "brokered tool",
+			policy: brokeredPolicy,
+			permission: &harnessv2.PermissionRequestedEvent{
+				ToolName: "lookup", Options: options,
+			},
+			want: harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionSelected, OptionID: "reject-once"},
+		},
+		{
+			name:   "tool outside frozen policy",
+			policy: providerNativePolicy,
+			permission: &harnessv2.PermissionRequestedEvent{
+				ToolName: providerNativeToolWrite, Options: options,
+			},
+			want: harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionSelected, OptionID: "reject-once"},
+		},
+		{
+			name:   "missing tool identity",
+			policy: providerNativePolicy,
+			permission: &harnessv2.PermissionRequestedEvent{
+				Options: options,
+			},
+			want: harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionSelected, OptionID: "reject-once"},
+		},
+		{
+			name:   "unsafe options only",
+			policy: providerNativePolicy,
+			permission: &harnessv2.PermissionRequestedEvent{
+				ToolName: providerNativeToolRead,
+				Options:  []harnessv2.PermissionOption{{OptionID: "allow-always", Kind: harnessv2.PermissionOptionAllowAlways}},
+			},
+			want: harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionCancelled},
+		},
+		{
+			name:   "missing permission",
+			policy: providerNativePolicy,
+			want:   harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionCancelled},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := frozenMCPPermissionDecision(test.policy, test.permission); got != test.want {
+				t.Fatalf("frozenMCPPermissionDecision() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPromptLeaseRenewalDelayUsesEarlierAuthorityWindow(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name                 string
+		leaseExpiresAfter    time.Duration
+		authorizationExpires time.Duration
+		want                 time.Duration
+	}{
+		{name: "lease midpoint", leaseExpiresAfter: 40 * time.Second, authorizationExpires: 60 * time.Second, want: 20 * time.Second},
+		{name: "authorization midpoint", leaseExpiresAfter: 180 * time.Second, authorizationExpires: 60 * time.Second, want: 30 * time.Second},
+		{name: "expired authorization renews immediately", leaseExpiresAfter: 180 * time.Second, authorizationExpires: 0, want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := promptLeaseRenewalDelay(
+				now,
+				now.Add(test.leaseExpiresAfter),
+				now.Add(test.authorizationExpires),
+			)
+			if got != test.want {
+				t.Fatalf("promptLeaseRenewalDelay() = %s, want %s", got, test.want)
 			}
 		})
 	}
@@ -5360,8 +5546,10 @@ func TestRenewPromptLeaseLoopRetriesTransientFailures(t *testing.T) {
 		LeaseGeneration: lease.Generation, ToolPolicyDigest: toolDigest, ApprovalPolicyDigest: approvalDigest,
 		MCPConfigurationDigest: mcpDigest, ToolPolicy: toolPolicy, ApprovalPolicy: approvalPolicy, ExpiresAt: lease.ExpiresAt,
 	}
+	authorization.ExpiresAt = now
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	admitted := make(chan struct{})
 	cancelled := make(chan struct{}, 1)
 	cancelRuntime := func() {
 		select {
@@ -5372,8 +5560,22 @@ func TestRenewPromptLeaseLoopRetriesTransientFailures(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		(&ACPDispatcher{}).renewPromptLeaseLoop(ctx, cancelRuntime, runtimeClient, "runtime-session-renew-g1", task, fence, lease, authorization)
+		(&ACPDispatcher{}).renewPromptLeaseLoop(
+			ctx, admitted, cancelRuntime, runtimeClient, "runtime-session-renew-g1", task, fence, lease, authorization,
+			harnessv2.DefaultProtocolLimits(),
+		)
 	}()
+	select {
+	case <-done:
+		t.Fatal("renewal loop exited before prompt admission")
+	case <-cancelled:
+		t.Fatal("renewal loop cancelled the prompt before admission")
+	case <-time.After(250 * time.Millisecond):
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("renewal calls before prompt admission = %d, want 0", calls.Load())
+	}
+	close(admitted)
 	deadline := time.After(20 * time.Second)
 	for calls.Load() < 2 {
 		select {
@@ -5447,6 +5649,8 @@ func TestRenewPromptLeaseLoopStopsWithoutCancelWhenPromptSettled(t *testing.T) {
 		MCPConfigurationDigest: mcpDigest, ToolPolicy: toolPolicy, ApprovalPolicy: approvalPolicy, ExpiresAt: lease.ExpiresAt,
 	}
 	ctx := t.Context()
+	admitted := make(chan struct{})
+	close(admitted)
 	cancelled := make(chan struct{}, 1)
 	cancelRuntime := func() {
 		select {
@@ -5457,7 +5661,10 @@ func TestRenewPromptLeaseLoopStopsWithoutCancelWhenPromptSettled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		(&ACPDispatcher{}).renewPromptLeaseLoop(ctx, cancelRuntime, runtimeClient, "runtime-session-renew-settled-g1", task, fence, lease, authorization)
+		(&ACPDispatcher{}).renewPromptLeaseLoop(
+			ctx, admitted, cancelRuntime, runtimeClient, "runtime-session-renew-settled-g1", task, fence, lease, authorization,
+			harnessv2.DefaultProtocolLimits(),
+		)
 	}()
 	select {
 	case <-done:
@@ -5471,5 +5678,30 @@ func TestRenewPromptLeaseLoopStopsWithoutCancelWhenPromptSettled(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("renewal calls = %d, want exactly one before stopping", calls.Load())
+	}
+}
+
+func TestRenewPromptLeaseLoopStopsWhileWaitingForAdmission(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	admitted := make(chan struct{})
+	cancelled := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&ACPDispatcher{}).renewPromptLeaseLoop(
+			ctx, admitted, func() { cancelled <- struct{}{} }, nil, "", &corev1alpha1.Task{}, harnessv2.Fence{},
+			harnessv2.PromptLease{}, harnessv2.PromptMCPAuthorization{}, harnessv2.ProtocolLimits{},
+		)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("renewal loop did not stop while waiting for prompt admission")
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("renewal loop cancelled the runtime before prompt admission")
+	default:
 	}
 }

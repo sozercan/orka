@@ -38,6 +38,7 @@ type Target struct {
 	OperationCapabilitySecret       []byte
 	ControlTimeout                  time.Duration
 	ExpectedRuntimeInstanceID       harnessv2.RuntimeInstanceID
+	ExpectedControllerEpoch         uint64
 	Profile                         harnessv2.RuntimeProfile
 	ToolPolicy                      harnessv2.MCPToolPolicy
 	ApprovalPolicy                  harnessv2.MCPApprovalPolicy

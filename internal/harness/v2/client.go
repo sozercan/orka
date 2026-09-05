@@ -45,9 +45,26 @@ type Client struct {
 	maxJSONResponseBytes int64
 	maxErrorBodyBytes    int64
 	traceReliable        bool
+	beforeMutation       func(context.Context, string) error
 
 	limitsMu sync.RWMutex
 	limits   ProtocolLimits
+}
+
+// WithBeforeMutation installs a fail-closed check that runs immediately before
+// every mutating request is encoded, capability-signed, and sent. The check's
+// context reserves half of the effective remaining window, bounded by both the
+// request metadata expiry and caller deadline, for the mutation itself. It is
+// intended for callers that must revalidate external authority between
+// otherwise independent mutations.
+func WithBeforeMutation(validate func(context.Context, string) error) ClientOption {
+	return func(c *Client) error {
+		if validate == nil {
+			return fmt.Errorf("before-mutation validator is required")
+		}
+		c.beforeMutation = validate
+		return nil
+	}
 }
 
 func WithHTTPClient(httpClient *http.Client) ClientOption {
@@ -465,6 +482,14 @@ func (c *Client) mutateJSON(
 	if err := c.requireMutationAuth(operation); err != nil {
 		return err
 	}
+	if err := c.validateBeforeMutation(ctx, operation, metadata.ExpiresAt); err != nil {
+		if clientErr, ok := errors.AsType[*ClientError](err); ok {
+			copy := *clientErr
+			copy.WriteEvidence = RequestWriteEvidence{State: RequestWriteZeroBytes}
+			err = &copy
+		}
+		return err
+	}
 	payload, err := json.Marshal(input)
 	if err != nil {
 		return c.validationError(operation, fmt.Errorf("encode request: %w", err))
@@ -516,6 +541,43 @@ func (c *Client) mutateJSON(
 		return c.protocolErrorWithEvidence(operation, resp.StatusCode, err, tracker.evidence(), capability)
 	}
 	return nil
+}
+
+func (c *Client) validateBeforeMutation(ctx context.Context, operation string, expiresAt time.Time) error {
+	if c == nil || c.beforeMutation == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	effectiveDeadline := expiresAt
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(effectiveDeadline) {
+		effectiveDeadline = callerDeadline
+	}
+	now := time.Now()
+	remaining := effectiveDeadline.Sub(now)
+	if remaining <= 0 {
+		return c.preMutationValidationError(operation, fmt.Errorf("pre-mutation authority check: mutation deadline elapsed before revalidation"), false)
+	}
+	validationCtx, cancel := context.WithDeadline(ctx, now.Add(remaining/2))
+	defer cancel()
+	if err := c.beforeMutation(validationCtx, operation); err != nil {
+		retryable := preMutationRetryable(err) || errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+		return c.preMutationValidationError(operation, fmt.Errorf("pre-mutation authority check: %w", err), retryable)
+	}
+	if err := validationCtx.Err(); err != nil {
+		retryable := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+		return c.preMutationValidationError(operation, fmt.Errorf("pre-mutation authority check exceeded its reserved deadline: %w", err), retryable)
+	}
+	return nil
+}
+
+func (c *Client) preMutationValidationError(operation string, err error, retryable bool) error {
+	message := c.redact(err.Error(), "")
+	return &ClientError{
+		Operation: operation, Kind: ClientErrorValidation, Retryable: retryable,
+		Message: message, cause: ErrClientValidation,
+	}
 }
 
 func (c *Client) decodeHTTPError(operation string, response *http.Response, tracker *requestTrace, capability string) error {

@@ -166,8 +166,9 @@ func requirePublicDialAddress(address string) error {
 }
 
 // Check probes one external runtime. It is deliberately single-attempt: no
-// control request is retried, and the lifecycle probe opens exactly one prompt
-// stream that is consumed to its original terminal settlement.
+// prompt stream is reconnected or re-executed. Strict lifecycle checks use
+// separate completed-workspace and cancellation sessions, consuming each
+// original stream through terminal settlement.
 func Check(ctx context.Context, target Target) Result {
 	result := Result{}
 	if ctx == nil {
@@ -259,7 +260,7 @@ func Check(ctx context.Context, target Target) Result {
 		return result
 	}
 
-	if err := probeMutationAuthNegatives(probeCtx, httpClient, target); err != nil {
+	if err := probeMutationAuthNegatives(probeCtx, httpClient, client, target, status.Fence); err != nil {
 		result.Message = boundedMessage(err)
 		return result
 	}
@@ -283,6 +284,9 @@ func validateTarget(target Target) error {
 	}
 	if strings.TrimSpace(string(target.ExpectedRuntimeInstanceID)) == "" {
 		return fmt.Errorf("expected runtime instance ID is required")
+	}
+	if target.ExpectedControllerEpoch == 0 {
+		return fmt.Errorf("expected controller epoch is required")
 	}
 	if err := target.Profile.Validate(); err != nil {
 		return fmt.Errorf("expected runtime profile: %w", err)
@@ -345,6 +349,9 @@ func validateExactCapabilities(target Target, observed *CapabilitiesResponse) er
 	if base.SupportsPublicationFinalization != target.SupportsPublicationFinalization {
 		return fmt.Errorf("supportsPublicationFinalization=%t does not match expected %t", base.SupportsPublicationFinalization, target.SupportsPublicationFinalization)
 	}
+	if base.SupportsAgentSessionConfiguration {
+		return fmt.Errorf("supportsAgentSessionConfiguration must be false because Orka sends no AgentConfiguration to external runtimes")
+	}
 	if observed.WorkspaceGovernance != target.WorkspaceGovernance {
 		return fmt.Errorf("workspace governance claims do not exactly match the AgentRuntime registration")
 	}
@@ -357,8 +364,13 @@ func validateExactCapabilities(target Target, observed *CapabilitiesResponse) er
 	if !base.Provider.SupportsCancel {
 		return fmt.Errorf("provider capabilities must support cancellation")
 	}
-	if target.WorkspaceGovernance.Strict() && (!base.Provider.SupportsPermissions || !base.Provider.SupportsTools) {
-		return fmt.Errorf("strict-governed runtime must support permissions and prompt-scoped tools")
+	if target.WorkspaceGovernance.Strict() && !base.Provider.SupportsTools {
+		return fmt.Errorf("strict-governed runtime must support prompt-scoped tools")
+	}
+	if target.WorkspaceGovernance.Strict() &&
+		harnessv2.MCPPolicyRequiresPermissionCapability(target.ToolPolicy, target.ApprovalPolicy) &&
+		!base.Provider.SupportsPermissions {
+		return fmt.Errorf("strict-governed runtime policy requires permission support")
 	}
 	return nil
 }
@@ -373,6 +385,9 @@ func validateExactStatus(target Target, status *harnessv2.StatusResponse) error 
 	}
 	if status.Fence.RuntimeInstanceID != target.ExpectedRuntimeInstanceID {
 		return fmt.Errorf("authenticated status runtime instance ID %q does not match expected %q", status.Fence.RuntimeInstanceID, target.ExpectedRuntimeInstanceID)
+	}
+	if status.Fence.ControllerEpoch != target.ExpectedControllerEpoch {
+		return fmt.Errorf("authenticated status controller epoch %d does not match expected %d", status.Fence.ControllerEpoch, target.ExpectedControllerEpoch)
 	}
 	if status.Fence.RuntimeProfileDigest != expectedDigest {
 		return fmt.Errorf("authenticated status profile digest %q does not match expected %q", status.Fence.RuntimeProfileDigest, expectedDigest)
@@ -461,25 +476,50 @@ func probeStatusAuthNegatives(ctx context.Context, client *http.Client, target T
 	return nil
 }
 
-func probeMutationAuthNegatives(ctx context.Context, client *http.Client, target Target) error {
-	path := harnessv2.RuntimeSessionsPath + "/conformance-auth-negative"
-	body := []byte(`{"protocol":"orka.harness.v2"}`)
-	if err := expectAuthRejected(ctx, client, target.BaseURL, http.MethodPut, path, "", "", body); err != nil {
+func probeMutationAuthNegatives(
+	ctx context.Context,
+	httpClient *http.Client,
+	client *harnessv2.Client,
+	target Target,
+	poolFence harnessv2.Fence,
+) error {
+	probeID, err := newProbeID()
+	if err != nil {
+		return fmt.Errorf("allocate authentication probe identity: %w", err)
+	}
+	state := newLifecycleProbeState(httpClient, client, target, poolFence, "auth-"+probeID)
+	// Vary only authentication so body validation cannot mask the capability
+	// checks, regardless of the runtime's validation order.
+	request, err := state.createSessionRequest("auth-negative-" + probeID)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("encode authentication probe: %w", err)
+	}
+	path := harnessv2.RuntimeSessionsPath + "/" + string(state.sessionID)
+	// A broken runtime may admit a negative probe. Clean up its unique session
+	// on an unexpected response, including an ambiguous transport failure.
+	state.sessionCreated = true
+	defer state.cleanup(ctx)
+	if err := expectAuthRejected(ctx, httpClient, target.BaseURL, http.MethodPut, path, "", "", body); err != nil {
 		return fmt.Errorf("unauthenticated mutation negative probe: %w", err)
 	}
 	wrongToken := strings.Repeat("w", 32)
 	if wrongToken == target.ControllerBearerToken {
 		wrongToken = strings.Repeat("z", 32)
 	}
-	if err := expectAuthRejected(ctx, client, target.BaseURL, http.MethodPut, path, wrongToken, "", body); err != nil {
+	if err := expectAuthRejected(ctx, httpClient, target.BaseURL, http.MethodPut, path, wrongToken, "", body); err != nil {
 		return fmt.Errorf("wrong-token mutation negative probe: %w", err)
 	}
-	if err := expectAuthRejected(ctx, client, target.BaseURL, http.MethodPut, path, target.ControllerBearerToken, "", body); err != nil {
+	if err := expectAuthRejected(ctx, httpClient, target.BaseURL, http.MethodPut, path, target.ControllerBearerToken, "", body); err != nil {
 		return fmt.Errorf("missing operation-capability negative probe: %w", err)
 	}
-	if err := expectAuthRejected(ctx, client, target.BaseURL, http.MethodPut, path, target.ControllerBearerToken, "invalid.capability", body); err != nil {
+	if err := expectAuthRejected(ctx, httpClient, target.BaseURL, http.MethodPut, path, target.ControllerBearerToken, "invalid.capability", body); err != nil {
 		return fmt.Errorf("invalid operation-capability negative probe: %w", err)
 	}
+	state.sessionCreated = false
 	return nil
 }
 

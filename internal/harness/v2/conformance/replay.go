@@ -42,33 +42,74 @@ func (s *lifecycleProbeState) probeCreateSessionReplay(
 	return expectClassificationError("conflicting runtime-session creation", err, harnessv2.OperationPhaseApplied, "")
 }
 
+type promptReplayObservation struct {
+	settlement       *harnessv2.PromptSettlement
+	conflictTerminal harnessv2.EventType
+}
+
 func (s *lifecycleProbeState) probeAcceptedPromptReplay(
 	ctx context.Context,
 	request harnessv2.StartPromptRequest,
 	acceptedAt time.Time,
-) error {
+) (promptReplayObservation, error) {
+	var observed promptReplayObservation
 	duplicate, err := s.promptAdmissionReplay(ctx, request)
 	if err != nil {
-		return fmt.Errorf("replay identical accepted prompt admission: %w", err)
+		return observed, fmt.Errorf("replay identical accepted prompt admission: %w", err)
 	}
-	if duplicate.Classification.Class != harnessv2.RequestClassificationAlreadyAccepted ||
-		duplicate.Classification.Phase != harnessv2.OperationPhaseAccepted ||
-		!duplicate.AcceptedAt.Equal(acceptedAt) {
-		return fmt.Errorf("identical accepted prompt admission returned %#v, want original already_accepted admission", duplicate)
+	if !duplicate.AcceptedAt.Equal(acceptedAt) {
+		return observed, fmt.Errorf("identical accepted prompt admission did not preserve the original acceptance timestamp")
+	}
+	// Completion can win either round trip. Retain any settled observation
+	// and compare it with the original stream's cancellation settlement.
+	switch duplicate.Classification.Class {
+	case harnessv2.RequestClassificationAlreadyAccepted:
+		if duplicate.Classification.Phase != harnessv2.OperationPhaseAccepted {
+			return observed, fmt.Errorf("identical accepted prompt admission has phase %q, want accepted", duplicate.Classification.Phase)
+		}
+	case harnessv2.RequestClassificationSettled:
+		if duplicate.Classification.TerminalEvent != duplicate.Settlement.TerminalEvent {
+			return observed, fmt.Errorf("identical accepted prompt admission classification disagrees with its settlement terminal event")
+		}
+		observed.settlement = duplicate.Settlement
+	default:
+		return observed, fmt.Errorf("identical accepted prompt admission classified as %q, want already_accepted or settled", duplicate.Classification.Class)
 	}
 
 	conflicting := conflictingPromptRequest(request)
 	if err := setRequestDigest(&conflicting, &conflicting.Metadata); err != nil {
-		return fmt.Errorf("build conflicting accepted prompt admission: %w", err)
+		return observed, fmt.Errorf("build conflicting accepted prompt admission: %w", err)
 	}
 	stream, err := s.client.StartPrompt(ctx, s.sessionID, conflicting)
 	if stream != nil {
 		_ = stream.Close()
 	}
-	return expectClassificationError(
-		"conflicting accepted prompt admission", err,
-		harnessv2.OperationPhaseAccepted, "",
-	)
+	phase := harnessv2.OperationPhaseAccepted
+	var clientErr *harnessv2.ClientError
+	if errors.As(err, &clientErr) && clientErr.Classification != nil && clientErr.Classification.Phase == harnessv2.OperationPhaseSettled {
+		phase = harnessv2.OperationPhaseSettled
+		observed.conflictTerminal = clientErr.Classification.TerminalEvent
+		if !observed.conflictTerminal.IsTerminal() {
+			return observed, fmt.Errorf("conflicting accepted prompt admission omitted its settled terminal event")
+		}
+	}
+	if err := expectClassificationError("conflicting accepted prompt admission", err, phase, observed.conflictTerminal); err != nil {
+		return observed, err
+	}
+	if observed.settlement != nil && phase != harnessv2.OperationPhaseSettled {
+		return observed, fmt.Errorf("conflicting accepted prompt admission regressed from settled to accepted")
+	}
+	return observed, nil
+}
+
+func (o promptReplayObservation) validateSettlement(settlement harnessv2.PromptSettlement) error {
+	if o.settlement != nil && !reflect.DeepEqual(*o.settlement, settlement) {
+		return fmt.Errorf("identical accepted prompt admission did not replay the original settlement")
+	}
+	if o.conflictTerminal != "" && o.conflictTerminal != settlement.TerminalEvent {
+		return fmt.Errorf("conflicting accepted prompt admission terminal event does not match the original settlement")
+	}
+	return nil
 }
 
 func (s *lifecycleProbeState) probeSettledPromptReplay(

@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -145,6 +146,41 @@ func newGatewayServiceFixture(t *testing.T) (*Service, *sqlite.Store, *reference
 	return service, sqliteStore, adapter
 }
 
+func configureGatewayExternalRuntime(t *testing.T, service *Service, allowedTools []string) {
+	t.Helper()
+	ctx := context.Background()
+	agent := &corev1alpha1.Agent{}
+	if err := service.Client.Get(ctx, client.ObjectKey{Namespace: "default", Name: "assistant"}, agent); err != nil {
+		t.Fatal(err)
+	}
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
+		RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-runtime"},
+	}
+	if err := service.Client.Update(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	runtimeObject := &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-runtime", Namespace: "default", UID: "external-runtime-uid", Generation: 1},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "codex", Model: "gpt-5.6", WorkspaceIntent: corev1alpha1.WorkspaceIntentRead,
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          append([]string{}, allowedTools...),
+					DisallowedTools:       []string{},
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+	if err := service.Client.Create(ctx, runtimeObject); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func gatewayEventBody(t *testing.T, externalID, sender string) []byte {
 	t.Helper()
 	return gatewayEnvelopeBody(t, protocol.EventEnvelope{
@@ -243,6 +279,102 @@ func TestServiceEndToEndAndDuplicateSafety(t *testing.T) {
 	}
 	if len(session.Messages) != 2 || session.Messages[0].Role != "user" || session.Messages[1].Content != "final response" {
 		t.Fatalf("session transcript = %#v", session.Messages)
+	}
+}
+
+func TestGatewayDispatchMaterializesExternalRuntimeAllowedTools(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		allowedTools []string
+	}{
+		{name: "registered tools", allowedTools: []string{"read_evidence"}},
+		{name: "explicit deny all", allowedTools: []string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, sqliteStore, _ := newGatewayServiceFixture(t)
+			configureGatewayExternalRuntime(t, service, test.allowedTools)
+			ctx := context.Background()
+			accepted, err := service.AdmitEvent(ctx, "default", "chat", "Bearer inbound-token", gatewayEventBody(t, "external-runtime-"+strings.ReplaceAll(test.name, " ", "-"), "user-1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.DispatchOnce(ctx); err != nil {
+				t.Fatalf("DispatchOnce() error = %v", err)
+			}
+			event, err := sqliteStore.GetGatewayEvent(ctx, "default", accepted.EventID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			task := &corev1alpha1.Task{}
+			if err := service.Client.Get(ctx, client.ObjectKey{Namespace: "default", Name: event.TaskName}, task); err != nil {
+				t.Fatal(err)
+			}
+			if task.Spec.AgentRuntime == nil || task.Spec.AgentRuntime.MaxTurns != nil {
+				t.Fatalf("agentRuntime = %#v, want allowedTools without maxTurns", task.Spec.AgentRuntime)
+			}
+			if task.Spec.AgentRuntime.AllowedTools == nil || !slices.Equal(task.Spec.AgentRuntime.AllowedTools, test.allowedTools) {
+				t.Fatalf("allowedTools = %#v, want explicit %#v", task.Spec.AgentRuntime.AllowedTools, test.allowedTools)
+			}
+		})
+	}
+}
+
+func TestGatewayDispatchRecoveryMatchesMaterializedExternalRuntimePolicy(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		allowedTools []string
+		nextTools    []string
+	}{
+		{name: "registered tools", allowedTools: []string{"read_evidence"}, nextTools: []string{"search_evidence"}},
+		{name: "explicit deny all", allowedTools: []string{}, nextTools: []string{"search_evidence"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const recoveryClaimLease = time.Second
+			service, sqliteStore, _ := newGatewayServiceFixture(t)
+			configureGatewayExternalRuntime(t, service, test.allowedTools)
+			service.Config.ClaimLease = recoveryClaimLease
+			service.EventStore = conflictMarkGatewayEventStore{GatewayEventStore: sqliteStore}
+			ctx := context.Background()
+			accepted, err := service.AdmitEvent(
+				ctx, "default", "chat", "Bearer inbound-token",
+				gatewayEventBody(t, "external-runtime-recovery-"+strings.ReplaceAll(test.name, " ", "-"), "user-1"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.DispatchOnce(ctx); !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("DispatchOnce() simulated lost-link error = %v, want ErrConflict", err)
+			}
+			event, err := sqliteStore.GetGatewayEvent(ctx, "default", accepted.EventID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if event.State != store.GatewayEventDispatching || !event.TaskPolicyFrozen ||
+				event.TaskAllowedTools == nil || !slices.Equal(event.TaskAllowedTools, test.allowedTools) {
+				t.Fatalf("event after lost link = %+v", event)
+			}
+			existing := &corev1alpha1.Task{}
+			if err := service.Client.Get(ctx, client.ObjectKey{Namespace: "default", Name: event.TaskName}, existing); err != nil {
+				t.Fatal(err)
+			}
+			runtimeObject := &corev1alpha1.AgentRuntime{}
+			if err := service.Client.Get(ctx, client.ObjectKey{Namespace: "default", Name: "external-runtime"}, runtimeObject); err != nil {
+				t.Fatal(err)
+			}
+			runtimeObject.Spec.Capabilities.MCPPolicy.AllowedTools = append([]string{}, test.nextTools...)
+			if err := service.Client.Update(ctx, runtimeObject); err != nil {
+				t.Fatal(err)
+			}
+			service.EventStore = sqliteStore
+			time.Sleep(recoveryClaimLease + 10*time.Millisecond)
+			if err := service.DispatchOnce(ctx); err != nil {
+				t.Fatalf("DispatchOnce() recovery error = %v", err)
+			}
+			recovered, err := sqliteStore.GetGatewayEvent(ctx, "default", accepted.EventID)
+			if err != nil || recovered.State != store.GatewayEventTaskCreated || recovered.TaskUID != string(existing.UID) {
+				t.Fatalf("event after external runtime recovery = (%+v, %v)", recovered, err)
+			}
+		})
 	}
 }
 

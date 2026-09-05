@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
 )
 
@@ -412,7 +413,8 @@ type CreateTaskRequest struct {
 	AgentRef *struct {
 		Name string `json:"name"`
 	} `json:"agentRef,omitempty"`
-	AI *struct {
+	AgentRuntime *corev1alpha1.AgentRuntimeSpec `json:"agentRuntime,omitempty"`
+	AI           *struct {
 		ProviderRef *struct {
 			Name string `json:"name"`
 		} `json:"providerRef,omitempty"`

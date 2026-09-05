@@ -81,6 +81,8 @@ type GatewayEvent struct {
 	SessionName       string            `json:"sessionName,omitempty"`
 	TaskName          string            `json:"taskName,omitempty"`
 	TaskUID           string            `json:"taskUid,omitempty"`
+	TaskAllowedTools  []string          `json:"-"`
+	TaskPolicyFrozen  bool              `json:"-"`
 	DeliveryID        string            `json:"deliveryId,omitempty"`
 	ProviderMessageID string            `json:"providerMessageId,omitempty"`
 	TraceParent       string            `json:"-"`

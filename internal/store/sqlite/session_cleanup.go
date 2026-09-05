@@ -310,6 +310,9 @@ func (s *Store) CompleteSessionCleanup(ctx context.Context, request store.Comple
 	if err := validateSessionCleanupEligibilityTx(ctx, tx, *intent); err != nil {
 		return err
 	}
+	if err := archiveSessionTurnCleanupReceipts(ctx, tx, *intent); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM outbox_projections
 		 WHERE aggregate_kind = ?
@@ -575,7 +578,10 @@ func validateSessionCleanupEligibilityTx(ctx context.Context, tx *sql.Tx, intent
 			var marker struct {
 				Kind string `json:"kind"`
 			}
-			if err := json.Unmarshal([]byte(terminalContent), &marker); err != nil || marker.Kind == "OutcomeUnknown" {
+			// OutcomeUnknown is a finalized v2 turn. The coordinated cleanup
+			// still requires quiescent controls and exact runtime retirement;
+			// completion archives the unchanged terminal projection.
+			if err := json.Unmarshal([]byte(terminalContent), &marker); err != nil {
 				return store.ErrConflict
 			}
 		}

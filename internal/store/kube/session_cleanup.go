@@ -65,6 +65,11 @@ func (s *Store) ReclaimSession(ctx context.Context, request store.ReclaimSession
 	if err := s.validateSessionCleanupBranchClaimScope(*intent); err != nil {
 		return err
 	}
+	if s.sessionRuntimeCleanup != nil {
+		if err := s.sessionRuntimeCleanup(ctx, *intent, fence); err != nil {
+			return err
+		}
+	}
 	if err := s.reclaimSessionBranchClaims(ctx, *intent); err != nil {
 		return err
 	}

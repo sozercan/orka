@@ -283,9 +283,9 @@ orka task download <task-name> [filename] -o <path>
 
 ACP agent runtimes run the supported Codex, Claude, Copilot, and OpenCode profiles as
 fenced RuntimeSessions in controller-owned RuntimePools. External
-`orka.harness.v2` registrations can be probed and conformance-tested, but
-`runtimeRef` Task dispatch remains fail-closed until the external v2 dispatcher
-support boundary is enabled.
+`orka.harness.v2` registrations remain operator-owned. Once a registration is
+current-generation, ready, and strict-governed, an Agent can select it through
+`runtimeRef` and use the same durable Task and RuntimeSession lifecycle.
 
 ### 1. Configure the central provider proxy
 

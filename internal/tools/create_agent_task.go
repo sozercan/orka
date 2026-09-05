@@ -81,6 +81,12 @@ func (t *CreateAgentTaskTool) Execute(ctx context.Context, args json.RawMessage)
 	if r, ok := checkChatNamespaceScope(tc, namespace); !ok {
 		return r, nil
 	}
+	policyReader := toolPolicyReader(ctx, tc.Client)
+	agent, err := loadAgent(ctx, policyReader, namespace, agentRef)
+	if err != nil {
+		result, _ := ChatToolErrorResult(internalErrorType, err.Error(), "")
+		return result, nil
+	}
 
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
@@ -159,11 +165,6 @@ func (t *CreateAgentTaskTool) Execute(ctx context.Context, args json.RawMessage)
 		// workspace preflight rejects readCredentialRef without gitRepo, so
 		// auto-discovery must not doom a repository-free workspace.
 		if strings.TrimSpace(wsCfg.GitRepo) != "" {
-			agent, err := loadAgent(ctx, tc.Client, namespace, agentRef)
-			if err != nil {
-				result, _ := ChatToolErrorResult(internalErrorType, err.Error(), "")
-				return result, nil
-			}
 			readRef, err := resolveWorkspaceCredentialRef(ctx, tc.Client, namespace, agent, readCredential)
 			if err != nil {
 				result, _ := ChatToolErrorResult(internalErrorType, err.Error(), "")
@@ -184,6 +185,10 @@ func (t *CreateAgentTaskTool) Execute(ctx context.Context, args json.RawMessage)
 	}
 
 	task.Spec.AgentRuntime = agentRuntime
+	if err := materializeRuntimeRefAllowedTools(ctx, policyReader, task, agent); err != nil {
+		result, _ := ChatToolErrorResult(internalErrorType, err.Error(), "")
+		return result, nil
+	}
 
 	schedule := chatGetStringArg(a, scheduleField)
 	if schedule != "" {

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
@@ -330,6 +333,244 @@ func TestContextTokenTaskCreateAuthorizationDerivesOpenCodeProviderFromModelName
 		overrideOnlyToken, authzCtx.EffectiveProvider, authzCtx.EffectiveModel, "", false, "",
 	)
 	require.NotEmpty(t, failures)
+}
+
+func TestContextTokenAuthorizationFailsClosedWhenFallbackProviderReadFails(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "coder", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentSpec{Model: &corev1alpha1.ModelConfig{
+			Fallbacks: []corev1alpha1.ModelFallback{{ProviderRef: "fallback-provider", Model: "fallback-model"}},
+		}},
+	}
+	fallbackProvider := &corev1alpha1.Provider{
+		ObjectMeta: metav1.ObjectMeta{Name: "fallback-provider", Namespace: "team-a"},
+		Spec: corev1alpha1.ProviderSpec{
+			Type:         corev1alpha1.ProviderTypeAnthropic,
+			SecretRef:    corev1alpha1.ProviderSecretRef{Name: "fallback-secret"},
+			DefaultModel: "fallback-model",
+		},
+	}
+	reader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, fallbackProvider).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == fallbackProvider.Name {
+					if _, ok := obj.(*corev1alpha1.Provider); ok {
+						return errors.New("authoritative fallback provider read failed")
+					}
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	t.Run("task create", func(t *testing.T) {
+		_, err := resolveContextTokenTaskCreateAuthorizationContext(context.Background(), reader, CreateTaskRequest{
+			Type:     corev1alpha1.TaskTypeAgent,
+			AgentRef: &corev1alpha1.AgentReference{Name: agent.Name},
+		}, agent.Namespace)
+		require.ErrorContains(t, err, "authoritative fallback provider read failed")
+	})
+
+	t.Run("agent spec", func(t *testing.T) {
+		_, err := resolveContextTokenAgentSpecAuthorizationContext(context.Background(), reader, agent)
+		require.ErrorContains(t, err, "authoritative fallback provider read failed")
+	})
+}
+
+func TestContextTokenTaskCreateAuthorizationUsesExternalRuntimeProfile(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentSpec{
+			Coordination: &corev1alpha1.CoordinationConfig{Enabled: true},
+			Runtime: &corev1alpha1.AgentCLIRuntime{
+				RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "agentkit-runtime"},
+			},
+		},
+	}
+	externalRuntime := &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit-runtime", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "operator-managed",
+					Model:        "operator-reviewed-model",
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          []string{"Bash", "read_tool", "write_tool"},
+					DisallowedTools:       []string{"write_tool"},
+					AllowBash:             false,
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, externalRuntime).Build()
+	authzCtx, err := resolveContextTokenTaskCreateAuthorizationContext(context.Background(), k8sClient, CreateTaskRequest{
+		Type:         corev1alpha1.TaskTypeAgent,
+		AgentRef:     &corev1alpha1.AgentReference{Name: agent.Name},
+		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"Bash", "read_tool", "write_tool"}},
+	}, "team-a")
+	require.NoError(t, err)
+	require.Equal(t, ProviderResolutionInfo{Type: "operator-managed"}, authzCtx.EffectiveProvider)
+	require.Equal(t, "operator-reviewed-model", authzCtx.EffectiveModel)
+	require.Empty(t, authzCtx.EffectiveAITools)
+	require.Equal(t, []string{"read_tool"}, authzCtx.RuntimeAllowedTools)
+	require.False(t, authzCtx.RuntimeAllowBash)
+
+	matchingToken := &ContextToken{
+		Scopes: []string{ContextTokenScopeTaskCreate},
+		TransactionContext: map[string]any{
+			"allowedProviders": []any{"operator-managed"},
+			"allowedModels":    []any{"operator-managed/operator-reviewed-model"},
+			"allowedTools":     []any{"read_tool"},
+		},
+	}
+	require.Empty(t, contextTokenTaskCreateFailures(matchingToken, enforceContextTokenAuthorizationConfig(), authzCtx))
+
+	mismatchedToken := &ContextToken{
+		Scopes: []string{ContextTokenScopeTaskCreate},
+		TransactionContext: map[string]any{
+			"allowedProviders": []any{"other-provider"},
+			"allowedModels":    []any{"other-model"},
+		},
+	}
+	failures := strings.Join(contextTokenTaskCreateFailures(mismatchedToken, enforceContextTokenAuthorizationConfig(), authzCtx), "\n")
+	require.Contains(t, failures, `provider "operator-managed" is not allowed by token context`)
+	require.Contains(t, failures, `model "operator-reviewed-model" is not allowed by token context`)
+}
+
+func testExternalRuntimeAuthorizationObjects(allowedTools []string) (*corev1alpha1.Agent, *corev1alpha1.AgentRuntime) {
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit", Namespace: "default"},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "agentkit-runtime"},
+		}},
+	}
+	externalRuntime := &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit-runtime", Namespace: "default"},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "codex",
+					Model:        "gpt-5.6",
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          append([]string{}, allowedTools...),
+					DisallowedTools:       []string{},
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+	return agent, externalRuntime
+}
+
+func TestContextTokenTaskCreateAuthorizationRejectsMissingExternalRuntime(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "agentkit-runtime"},
+		}},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
+
+	_, err := resolveContextTokenTaskCreateAuthorizationContext(context.Background(), k8sClient, CreateTaskRequest{
+		Type:     corev1alpha1.TaskTypeAgent,
+		AgentRef: &corev1alpha1.AgentReference{Name: agent.Name},
+	}, "team-a")
+	require.ErrorContains(t, err, `resolve AgentRuntime "agentkit-runtime" in namespace "team-a"`)
+	require.ErrorContains(t, err, "not found")
+}
+
+func TestContextTokenAgentSpecAuthorizationRejectsMissingExternalRuntime(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "agentkit-runtime"},
+		}},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	_, err := resolveContextTokenAgentSpecAuthorizationContext(context.Background(), k8sClient, agent)
+	require.ErrorContains(t, err, `resolve AgentRuntime "agentkit-runtime" in namespace "team-a"`)
+	require.ErrorContains(t, err, "not found")
+}
+
+func TestContextTokenAgentSpecAuthorizationUsesExternalRuntimeProfile(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentSpec{
+			Coordination: &corev1alpha1.CoordinationConfig{Enabled: true},
+			Runtime: &corev1alpha1.AgentCLIRuntime{
+				RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "agentkit-runtime"},
+			},
+		},
+	}
+	externalRuntime := &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit-runtime", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					ProviderKind: "operator-managed",
+					Model:        "operator-reviewed-model",
+				},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          []string{"Bash", "read_tool", "write_tool"},
+					DisallowedTools:       []string{"write_tool"},
+					AllowBash:             false,
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(externalRuntime).Build()
+
+	authzCtx, err := resolveContextTokenAgentSpecAuthorizationContext(context.Background(), k8sClient, agent)
+	require.NoError(t, err)
+	require.Equal(t, ProviderResolutionInfo{Type: "operator-managed"}, authzCtx.EffectiveProvider)
+	require.Equal(t, "operator-reviewed-model", authzCtx.EffectiveModel)
+	require.Empty(t, authzCtx.EffectiveAITools)
+	require.Equal(t, []string{"read_tool"}, authzCtx.RuntimeAllowedTools)
+	require.False(t, authzCtx.RuntimeAllowBash)
+
+	matchingToken := &ContextToken{TransactionContext: map[string]any{
+		"allowedProviders": []any{"operator-managed"},
+		"allowedModels":    []any{"operator-managed/operator-reviewed-model"},
+		"allowedTools":     []any{"read_tool"},
+	}}
+	failures, err := contextTokenAgentSpecFailures(context.Background(), k8sClient, matchingToken, agent)
+	require.NoError(t, err)
+	require.Empty(t, failures)
+
+	mismatchedToken := &ContextToken{TransactionContext: map[string]any{
+		"allowedProviders": []any{"other-provider"},
+		"allowedModels":    []any{"other-model"},
+		"allowedTools":     []any{"other-tool"},
+	}}
+	failures, err = contextTokenAgentSpecFailures(context.Background(), k8sClient, mismatchedToken, agent)
+	require.NoError(t, err)
+	joined := strings.Join(failures, "\n")
+	require.Contains(t, joined, `agent provider "operator-managed" is not allowed by token context`)
+	require.Contains(t, joined, `agent model "operator-reviewed-model" is not allowed by token context`)
+	require.Contains(t, joined, `agent tool "read_tool" is not allowed by token context`)
 }
 
 func TestContextTokenTaskReadFailures(t *testing.T) {
@@ -914,6 +1155,24 @@ func TestContextTokenRuntimeToolConstraintsDoesNotDuplicateOpenCodeBash(t *testi
 	require.Equal(t, []string{"bash"}, got)
 }
 
+func TestContextTokenToolFailuresDoNotSynthesizeRuntimeRefBash(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-runtime"},
+	}}}
+	token := &ContextToken{TransactionContext: map[string]any{"allowedTools": []any{"bash"}}}
+
+	taskFailures := contextTokenTaskToolFailures(token, contextTokenTaskCreateAuthorizationContext{
+		Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent}, Agent: agent,
+		RuntimeAllowedTools: []string{"bash"}, RuntimeAllowBash: true,
+	})
+	require.Empty(t, taskFailures)
+
+	agentFailures := contextTokenAgentSpecToolFailures(token, contextTokenAgentSpecAuthorizationContext{
+		Agent: agent, RuntimeAllowedTools: []string{"bash"}, RuntimeAllowBash: true,
+	})
+	require.Empty(t, agentFailures)
+}
+
 func TestContextTokenTaskToolFailuresAcceptsOpenCodeDenyAll(t *testing.T) {
 	allowBash := false
 	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
@@ -1364,6 +1623,63 @@ func TestContextTokenTaskToolCredentialFailuresRejectsUnresolvedBrokeredRuntimeT
 	require.Equal(t, []string{`Tool "read_incident" is unresolved`}, failures)
 }
 
+func TestContextTokenTaskToolCredentialFailuresUsesResolvedExternalRuntimeProfile(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1alpha1.AddToScheme(scheme))
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	agent := &corev1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "agentkit-runtime"},
+		}},
+	}
+	externalRuntime := &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "agentkit-runtime", Namespace: "team-a"},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{ProviderKind: "codex", Model: "gpt-5.6"},
+				MCPPolicy: &corev1alpha1.AgentRuntimeMCPPolicySpec{
+					AllowedTools:          []string{"Read", "web_search", "read_incident"},
+					DisallowedTools:       []string{},
+					ApprovalRequiredTools: []string{},
+				},
+			},
+		},
+	}
+	customTool := &corev1alpha1.Tool{
+		ObjectMeta: metav1.ObjectMeta{Name: "read_incident", Namespace: "team-a"},
+		Spec: corev1alpha1.ToolSpec{HTTP: &corev1alpha1.HTTPExecution{
+			URL: "https://tools.example.test/incidents",
+			AuthSecretRef: &corev1alpha1.SecretKeySelector{
+				Name: "incident-tool-auth", Key: "token",
+			},
+		}},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, externalRuntime, customTool).Build()
+	authzCtx, err := resolveContextTokenTaskCreateAuthorizationContext(context.Background(), k8sClient, CreateTaskRequest{
+		Type:         corev1alpha1.TaskTypeAgent,
+		AgentRef:     &corev1alpha1.AgentReference{Name: agent.Name},
+		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"Read", "web_search", "read_incident"}},
+	}, "team-a")
+	require.NoError(t, err)
+	require.Equal(t, "codex", authzCtx.RuntimeProviderKind)
+
+	cfg := enforceContextTokenAuthorizationConfig()
+	cfg.SecretCredentialReadScopeList = []string{ContextTokenScopeSecretsCredentialsRead}
+	token := &ContextToken{Scopes: []string{ContextTokenScopeTaskCreate}}
+	failures, err := contextTokenTaskToolCredentialFailures(context.Background(), k8sClient, token, cfg, authzCtx)
+	require.NoError(t, err)
+	require.Len(t, failures, 1)
+	require.Contains(t, failures[0], ContextTokenScopeSecretsCredentialsRead)
+
+	token.Scopes = append(token.Scopes, ContextTokenScopeSecretsCredentialsRead)
+	token.TransactionContext = map[string]any{"secret": "incident-tool-auth"}
+	failures, err = contextTokenTaskToolCredentialFailures(context.Background(), k8sClient, token, cfg, authzCtx)
+	require.NoError(t, err)
+	require.Empty(t, failures)
+}
+
 func TestContextTokenTaskToolCredentialFailuresUsesToolProvenance(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1alpha1.AddToScheme(scheme))
@@ -1384,9 +1700,11 @@ func TestContextTokenTaskToolCredentialFailuresUsesToolProvenance(t *testing.T) 
 		{name: "built-in runtime accepts scoped native syntax", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: builtinAgent, RuntimeAllowedTools: []string{"Read(/workspace/**)"}}},
 		{name: "runtimeRef observed defaults remain backend-owned", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, RuntimeAllowedTools: []string{"analyze"}}},
 		{name: "runtimeRef brokered coordination tool is builtin", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"delegate_task"}}}, RuntimeAllowedTools: []string{"delegate_task"}, RuntimeAllowBash: true}},
-		{name: "runtimeRef brokered override must resolve", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"read_incident"}}}, RuntimeAllowedTools: []string{"read_incident"}, RuntimeAllowBash: true}, wantFailure: "read_incident"},
-		{name: "runtimeRef brokered registry collision must resolve", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"web_search"}}}, RuntimeAllowedTools: []string{"web_search"}}, wantFailure: "web_search"},
-		{name: "runtimeRef explicit Bash must resolve", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"Bash"}}}, RuntimeAllowedTools: []string{"Bash"}, RuntimeAllowBash: true}, wantFailure: "Bash"},
+		{name: "resolved runtimeRef custom override must resolve", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"read_incident"}}}, RuntimeAllowedTools: []string{"read_incident"}, RuntimeAllowBash: true, RuntimeProviderKind: "codex"}, wantFailure: "read_incident"},
+		{name: "resolved runtimeRef brokered registry collision is builtin", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"web_search"}}}, RuntimeAllowedTools: []string{"web_search"}, RuntimeProviderKind: "codex"}},
+		{name: "resolved runtimeRef provider-native Read is builtin", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"Read"}}}, RuntimeAllowedTools: []string{"Read"}, RuntimeProviderKind: "claude"}},
+		{name: "resolved runtimeRef explicit Bash is provider-native", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"Bash"}}}, RuntimeAllowedTools: []string{"Bash"}, RuntimeAllowBash: true, RuntimeProviderKind: "codex"}},
+		{name: "resolved runtimeRef unknown provider keeps Read custom", ctx: contextTokenTaskCreateAuthorizationContext{Namespace: "team-a", Agent: remoteAgent, Request: CreateTaskRequest{Type: corev1alpha1.TaskTypeAgent, AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"Read"}}}, RuntimeAllowedTools: []string{"Read"}, RuntimeProviderKind: "operator-managed"}, wantFailure: "Read"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

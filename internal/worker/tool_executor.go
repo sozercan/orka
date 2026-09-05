@@ -550,6 +550,17 @@ type ToolRequestAttemptedError struct {
 func (e ToolRequestAttemptedError) Error() string { return e.Err.Error() }
 func (e ToolRequestAttemptedError) Unwrap() error { return e.Err }
 
+// ToolExecutionError reports a failure returned by an admitted tool call.
+// Authorization, transport, cancellation, and malformed-response errors do not
+// carry this marker. Callers must not expose its upstream diagnostic as an MCP
+// result without applying their own disclosure policy.
+type ToolExecutionError struct {
+	Err error
+}
+
+func (e ToolExecutionError) Error() string { return e.Err.Error() }
+func (e ToolExecutionError) Unwrap() error { return e.Err }
+
 // ToolRequestWasAttempted reports whether err happened after the custom tool send path began.
 func ToolRequestWasAttempted(err error) bool {
 	var attempted ToolRequestAttemptedError
@@ -644,7 +655,14 @@ func executeToolHTTPRequest(httpClient *http.Client, req *http.Request, suppress
 		if suppressErrorBody {
 			return nil, fmt.Errorf("gateway returned HTTP %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("tool returned HTTP %d: %s", resp.StatusCode, redactToolHTTPErrorBody(string(respBody), secrets...))
+		err := fmt.Errorf("tool returned HTTP %d: %s", resp.StatusCode, redactToolHTTPErrorBody(string(respBody), secrets...))
+		// A completed API failure can be delivered to the model as a tool
+		// result. Redirect and authentication failures remain protocol errors.
+		if resp.StatusCode >= 400 && resp.StatusCode < 600 && resp.StatusCode != http.StatusUnauthorized &&
+			resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusProxyAuthRequired {
+			return nil, ToolExecutionError{Err: err}
+		}
+		return nil, err
 	}
 	return []byte(redactToolSensitiveText(string(respBody), secrets...)), nil
 }
@@ -1561,10 +1579,13 @@ func decodeMCPToolCallResponse(body []byte, secrets ...string) (string, error) {
 	if err := json.Unmarshal(response.Result, &result); err == nil && (len(result.Content) > 0 || result.IsError) {
 		text := mcpToolContentText(result.Content)
 		if result.IsError {
+			if response.JSONRPC != mcpJSONRPCVersion || result.Content == nil {
+				return "", errors.New("MCP tool returned an invalid error result")
+			}
 			if text == "" {
 				text = string(response.Result)
 			}
-			return "", fmt.Errorf("MCP tool reported error: %s", redactToolHTTPErrorBody(text, secrets...))
+			return "", ToolExecutionError{Err: fmt.Errorf("MCP tool reported error: %s", redactToolHTTPErrorBody(text, secrets...))}
 		}
 		if text != "" {
 			return redactToolSensitiveText(text, secrets...), nil

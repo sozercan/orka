@@ -406,6 +406,12 @@ rules:
 - apiGroups:
   - core.orka.ai
   resources:
+  - agentruntimes
+  verbs:
+  - get
+- apiGroups:
+  - core.orka.ai
+  resources:
   - tasks
   verbs:
   - get
@@ -1531,6 +1537,12 @@ rules:
   - create
   - update
   - delete
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - agentruntimes
+  verbs:
+  - get
 - apiGroups:
   - core.orka.ai
   resources:

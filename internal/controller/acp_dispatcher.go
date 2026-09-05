@@ -1,14 +1,17 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,21 +41,21 @@ import (
 )
 
 const (
-	DefaultACPDispatchInterval                           = time.Second
-	DefaultACPDispatchWorkers                            = 4
-	DefaultACPIdlePoolTTL                                = 15 * time.Minute
-	DefaultACPRuntimePoolReservationTTL                  = 2 * time.Minute
-	DefaultACPRateLimitReconcileInterval                 = time.Second
-	defaultACPTaskTimeout                                = 30 * time.Minute
-	acpTaskTimeoutReason                                 = "TaskTimeout"
-	acpTaskTimeoutCancellationSettledMessage             = "task deadline cancellation settled"
-	acpCancelledOperation                                = "cancelled"
-	acpSettlingOperation                                 = "settling"
-	acpSucceededOperation                                = "succeeded"
-	acpCredentialBlockedOperation                        = "credential-blocked"
-	acpCredentialBlockedMessage                          = "workspace credential changed or became unavailable after queue; refusing to change frozen authority"
-	acpExternalRuntimeDispatchUnsupportedExecutionReason = corev1alpha1.TaskExecutionReason("ExternalRuntimeDispatchUnsupported")
-	acpCredentialBlockedExecutionReason                  = corev1alpha1.TaskExecutionReason("CredentialBlocked")
+	DefaultACPDispatchInterval               = time.Second
+	DefaultACPDispatchWorkers                = 4
+	DefaultACPIdlePoolTTL                    = 15 * time.Minute
+	DefaultACPRuntimePoolReservationTTL      = 2 * time.Minute
+	DefaultACPRateLimitReconcileInterval     = time.Second
+	defaultACPTaskTimeout                    = 30 * time.Minute
+	defaultPromptLeaseDuration               = 90 * time.Second
+	acpTaskTimeoutReason                     = "TaskTimeout"
+	acpTaskTimeoutCancellationSettledMessage = "task deadline cancellation settled"
+	acpCancelledOperation                    = "cancelled"
+	acpSettlingOperation                     = "settling"
+	acpSucceededOperation                    = "succeeded"
+	acpCredentialBlockedOperation            = "credential-blocked"
+	acpCredentialBlockedMessage              = "workspace credential changed or became unavailable after queue; refusing to change frozen authority"
+	acpCredentialBlockedExecutionReason      = corev1alpha1.TaskExecutionReason("CredentialBlocked")
 )
 
 var (
@@ -111,6 +114,7 @@ type ACPDispatcher struct {
 	sem             chan struct{}
 	runtimeSessions map[string]ACPRuntimeSessionBinding
 	finalizedTurns  map[types.UID]string
+	staleRecoveryMu sync.Mutex
 
 	substrateRouteOnce  sync.Once
 	substrateRouteHTTP  *http.Client
@@ -175,11 +179,20 @@ func (d *ACPDispatcher) Start(ctx context.Context) error {
 		d.runtimeSessions = make(map[string]ACPRuntimeSessionBinding)
 	}
 	d.mu.Unlock()
+	defer func() {
+		// A periodic recovery uses this Start context and must stop before
+		// the dispatcher relinquishes its controller lifecycle.
+		d.staleRecoveryMu.Lock()
+		d.staleRecoveryMu.Unlock() //nolint:staticcheck // SA2001: acquisition waits for the recovery worker to finish.
+	}()
 	if _, err := d.Epochs.CurrentFence(ctx); err != nil {
 		return err
 	}
 	if err := d.recoverStaleAttempts(ctx); err != nil {
-		return fmt.Errorf("recover stale ACP attempts: %w", err)
+		if _, ok := errors.AsType[*acpTaskRecoveryErrors](err); !ok {
+			return fmt.Errorf("recover stale ACP attempts: %w", err)
+		}
+		logf.FromContext(ctx).Error(err, "ACP Tasks remain blocked on recovery; independent work may proceed")
 	}
 	ticker := time.NewTicker(d.Interval)
 	defer ticker.Stop()
@@ -207,15 +220,14 @@ func (d *ACPDispatcher) dispatchOnce(ctx context.Context) error {
 	if err := d.scheduleACPDeliveryRecoveries(ctx, tasks.Items); err != nil {
 		return err
 	}
-	if err := d.rejectPersistedExternalRuntimeDispatches(ctx, tasks.Items); err != nil {
-		return err
-	}
 	queued := make([]*corev1alpha1.Task, 0)
 	for i := range tasks.Items {
 		task := &tasks.Items[i]
+		hasPool := task.Status.Execution != nil && strings.TrimSpace(task.Status.Execution.RuntimePoolName) != ""
+		hasExternal := task.Status.Execution != nil && strings.TrimSpace(task.Status.Execution.AgentRuntimeName) != ""
 		if !taskDispatchableByACP(task) || task.Status.Execution == nil ||
 			(task.Status.Execution.State != corev1alpha1.TaskExecutionStateQueued && task.Status.Execution.State != corev1alpha1.TaskExecutionStateReserved) ||
-			strings.TrimSpace(task.Status.Execution.AgentRuntimeName) != "" || strings.TrimSpace(task.Status.Execution.RuntimePoolName) == "" {
+			hasPool == hasExternal {
 			continue
 		}
 		queued = append(queued, task.DeepCopy())
@@ -268,100 +280,24 @@ dispatchLoop:
 	return d.reapIdlePools(ctx, tasks.Items)
 }
 
-func (d *ACPDispatcher) rejectPersistedExternalRuntimeDispatches(ctx context.Context, tasks []corev1alpha1.Task) error {
-	for i := range tasks {
-		task := &tasks[i]
-		if !persistedExternalRuntimeDispatch(task) {
-			continue
-		}
-		if err := d.rejectPersistedExternalRuntimeDispatch(ctx, task.DeepCopy()); err != nil {
-			return fmt.Errorf("reject persisted external runtime dispatch for Task %s/%s: %w", task.Namespace, task.Name, err)
-		}
-	}
-	return nil
-}
-
-func persistedExternalRuntimeDispatch(task *corev1alpha1.Task) bool {
-	if !taskDispatchableByACP(task) || task.Status.Execution == nil ||
-		strings.TrimSpace(task.Status.Execution.AgentRuntimeName) == "" {
-		return false
-	}
-	return task.Status.Execution.State == corev1alpha1.TaskExecutionStateQueued ||
-		task.Status.Execution.State == corev1alpha1.TaskExecutionStateReserved
-}
-
-func (d *ACPDispatcher) rejectPersistedExternalRuntimeDispatch(ctx context.Context, task *corev1alpha1.Task) error {
-	runtimeName := strings.TrimSpace(task.Status.Execution.AgentRuntimeName)
-	message := externalAgentRuntimeDispatchUnsupportedReason(runtimeName)
-	if err := d.failPersistedExternalRuntimeAttempt(ctx, task, message); err != nil {
-		return err
-	}
-	return d.failTask(
-		ctx,
-		task,
-		corev1alpha1.TaskExecutionStateFailed,
-		corev1alpha1.TaskExecutionOutcomeFailed,
-		acpExternalRuntimeDispatchUnsupportedExecutionReason,
-		message,
-	)
-}
-
-func (d *ACPDispatcher) failPersistedExternalRuntimeAttempt(ctx context.Context, task *corev1alpha1.Task, message string) error {
-	attemptID, err := promptAttemptIDFromTask(task)
-	if err != nil {
-		return nil
-	}
+//nolint:gocyclo // Terminal projection and cleanup recovery branches are audited together.
+func (d *ACPDispatcher) scheduleACPDeliveryRecoveries(ctx context.Context, tasks []corev1alpha1.Task) error {
 	fence, err := d.Epochs.CurrentFence(ctx)
 	if err != nil {
 		return err
 	}
-	for range 3 {
-		attempt, getErr := d.Store.GetPromptAttempt(ctx, attemptID)
-		if errors.Is(getErr, store.ErrNotFound) {
-			return nil
-		}
-		if getErr != nil {
-			return getErr
-		}
-		if store.IsTerminalPromptExecutionState(attempt.ExecutionState) {
-			return nil
-		}
-		if transitionErr := store.ValidatePromptExecutionTransition(attempt.ExecutionState, store.PromptExecutionFailed); transitionErr != nil {
-			return nil
-		}
-		digest, digestErr := acpDomainDigest("external-runtime-dispatch-rejection", struct {
-			AttemptID string                     `json:"attemptID"`
-			From      store.PromptExecutionState `json:"from"`
-			Version   int64                      `json:"version"`
-			Message   string                     `json:"message"`
-		}{
-			AttemptID: attempt.ID, From: attempt.ExecutionState, Version: attempt.Version, Message: message,
-		})
-		if digestErr != nil {
-			return digestErr
-		}
-		_, transitionErr := d.Store.TransitionPromptAttemptExecution(ctx, store.PromptAttemptExecutionTransition{
-			ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
-			NewState:    store.PromptExecutionFailed,
-			OperationID: "reject-external-runtime-dispatch-" + strconv.FormatInt(attempt.Version, 10), OperationDigest: digest,
-			TerminalReason: string(acpExternalRuntimeDispatchUnsupportedExecutionReason), UpdatedAt: time.Now().UTC(),
-		})
-		if errors.Is(transitionErr, store.ErrConflict) {
-			continue
-		}
-		return transitionErr
-	}
-	return fmt.Errorf("prompt attempt %s changed while rejecting external runtime dispatch", attemptID)
-}
-
-//nolint:gocyclo // Terminal projection and cleanup recovery branches are audited together.
-func (d *ACPDispatcher) scheduleACPDeliveryRecoveries(ctx context.Context, tasks []corev1alpha1.Task) error {
-	var fence store.ControllerEpochFence
-	haveFence := false
+	d.scheduleStaleAttemptRecoveries(ctx, tasks, fence)
 	for i := range tasks {
 		task := &tasks[i]
-		if !taskDispatchableByACP(task) || task.Status.Execution == nil ||
-			task.Status.Execution.Attempt < 1 || strings.TrimSpace(task.Status.Execution.PromptID) == "" {
+		if !taskDispatchableByACP(task) || task.Status.Execution == nil {
+			continue
+		}
+		if task.Status.Execution.ControllerEpoch < fence.Epoch || acpTaskHasUnvalidatedSourceIdentity(task) {
+			// The separate stale scan owns recovery while this epoch remains
+			// outside admission. Network waits cannot consume dispatch slots.
+			continue
+		}
+		if task.Status.Execution.Attempt < 1 || strings.TrimSpace(task.Status.Execution.PromptID) == "" {
 			continue
 		}
 		attemptID, idErr := promptAttemptIDFromTask(task)
@@ -398,28 +334,12 @@ func (d *ACPDispatcher) scheduleACPDeliveryRecoveries(ctx context.Context, tasks
 		}
 		cleanupPending := !taskScopedRuntimeSessionCleanupComplete(task)
 		if recoveryKind == "" && store.IsTerminalPromptExecutionState(attempt.ExecutionState) && store.IsTerminalPromptDeliveryState(attempt.DeliveryState) {
-			if !haveFence {
-				var fenceErr error
-				fence, fenceErr = d.Epochs.CurrentFence(ctx)
-				if fenceErr != nil {
-					return fenceErr
-				}
-				haveFence = true
-			}
-			if cleanupPending || task.Status.Execution.ControllerEpoch < fence.Epoch {
+			if cleanupPending {
 				recoveryKind = "stale-terminal"
 			}
 		}
 		if recoveryKind == "" {
 			continue
-		}
-		if !haveFence {
-			var fenceErr error
-			fence, fenceErr = d.Epochs.CurrentFence(ctx)
-			if fenceErr != nil {
-				return fenceErr
-			}
-			haveFence = true
 		}
 		select {
 		case d.sem <- struct{}{}:
@@ -963,6 +883,7 @@ func (d *ACPDispatcher) loadVerifiedACPDispatchExecution(
 	verifier := TaskReconciler{
 		Client:                  d.Client,
 		APIReader:               d.APIReader,
+		ControllerEpochManager:  d.Epochs,
 		AgentExecutionSnapshots: d.Snapshots,
 	}
 	bound, err := verifier.loadVerifiedBoundExecution(ctx, task, task.Status.AgentExecutionBinding)
@@ -999,8 +920,22 @@ func validateFrozenACPDispatchTarget(
 	bound *verifiedAgentExecution,
 	deliveryPlan ACPRuntimePlan,
 ) error {
-	if task == nil || task.Status.Execution == nil || target.pool == nil || bound == nil || bound.binding == nil {
-		return errors.New("frozen ACP Task, RuntimePool target, and execution binding are required")
+	if task == nil || task.Status.Execution == nil || bound == nil || bound.binding == nil ||
+		(target.pool == nil) == (target.external == nil) {
+		return errors.New("frozen ACP Task, one runtime target, and execution binding are required")
+	}
+	if target.external != nil {
+		ref := bound.binding.RuntimeRef
+		if bound.binding.Backend != corev1alpha1.AgentExecutionBackendExternalEndpoint || ref == nil ||
+			bound.externalRuntime == nil || bound.body.ExternalRuntime == nil ||
+			target.external.Name != ref.Name || target.external.UID != ref.UID || target.external.Generation != ref.Generation ||
+			bound.externalRuntime.Name != target.external.Name || bound.externalRuntime.UID != target.external.UID ||
+			task.Status.Execution.AgentRuntimeName != target.external.Name ||
+			task.Status.Execution.AgentRuntimeUID != string(target.external.UID) ||
+			task.Status.Execution.RuntimePoolName != "" || task.Status.Execution.RuntimePoolUID != "" {
+			return errors.New("reserved external AgentRuntime does not exactly match the immutable execution snapshot")
+		}
+		return nil
 	}
 	if target.pool.Name != deliveryPlan.PoolName || target.pool.Spec.Runtime.Image != deliveryPlan.Image ||
 		target.pool.Spec.Runtime.Profile.Digest != bound.body.ProfileDigest ||
@@ -1012,6 +947,16 @@ func validateFrozenACPDispatchTarget(
 		return errors.New("reserved RuntimePool execution workspace binding does not exactly match the immutable execution snapshot")
 	}
 	return nil
+}
+
+func agentExecutionRuntimeIdentity(bound *verifiedAgentExecution) string {
+	if bound == nil || bound.binding == nil {
+		return ""
+	}
+	if bound.binding.RuntimeRef != nil {
+		return "runtimeRef:" + string(bound.binding.RuntimeRef.UID)
+	}
+	return bound.body.RuntimeType
 }
 
 func validateFrozenACPDispatchPlan(
@@ -1056,17 +1001,23 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		return err
 	}
 	task = bound.frozenTask
-	delivery, err := acpRuntimeDeliveryPlanForAttempt(
-		bound.plan, task.Status.Execution, bound.promptAttempt, d.ACPRuntimeImages, target.pool,
-	)
-	if err != nil {
-		if frozenErr := validateFrozenACPDispatchTarget(task, target, bound, bound.plan); frozenErr != nil {
+	if target.external != nil {
+		if err := validateFrozenACPDispatchTarget(task, target, bound, bound.plan); err != nil {
 			return err
 		}
-		delivery.plan = bound.plan
-	}
-	if err := validateFrozenACPDispatchPlan(task, target, bound, delivery.plan); err != nil {
-		return err
+	} else {
+		delivery, err := acpRuntimeDeliveryPlanForAttempt(
+			bound.plan, task.Status.Execution, bound.promptAttempt, d.ACPRuntimeImages, target.pool,
+		)
+		if err != nil {
+			if frozenErr := validateFrozenACPDispatchTarget(task, target, bound, bound.plan); frozenErr != nil {
+				return err
+			}
+			delivery.plan = bound.plan
+		}
+		if err := validateFrozenACPDispatchPlan(task, target, bound, delivery.plan); err != nil {
+			return err
+		}
 	}
 	if reservationLease != nil {
 		reservationLease.startRenewal(ctx)
@@ -1085,7 +1036,9 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 		return deadlineErr
 	}
-	runtimeClient, runtimeFence, profile, maxResultBytes, authErr := d.runtimeClient(runtimeCtx, target)
+	runtimeClient, runtimeFence, profile, maxResultBytes, authErr := d.runtimeClient(
+		runtimeCtx, target, bound.mcpConfiguration, true,
+	)
 	if authErr != nil {
 		if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 			return deadlineErr
@@ -1103,9 +1056,13 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	}
 	runtimeProfileDigest, digestErr := harnessv2.CanonicalProfileDigest(profile)
 	if digestErr != nil || runtimeFence.RuntimeProfileDigest != bound.plan.Digest || runtimeProfileDigest != bound.plan.Digest {
-		return d.requeueReservedTask(ctx, task, acpReservedRetryProfile, errors.New("RuntimePool profile does not match the immutable execution snapshot"))
+		return d.requeueReservedTask(ctx, task, acpReservedRetryProfile, errors.New("runtime profile does not match the immutable execution snapshot"))
 	}
 	profile = bound.plan.Profile
+	promptLimits := harnessv2.DefaultProtocolLimits()
+	if bound.body.ExternalRuntime != nil {
+		promptLimits = bound.body.ExternalRuntime.Limits
+	}
 	agentConfiguration := bound.configuration
 	var agentConfigurationRef *harnessv2.AgentSessionConfiguration
 	if target.pool != nil {
@@ -1116,7 +1073,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	if err != nil {
 		return d.requeueReservedTask(ctx, task, acpReservedRetryMCPConfiguration, err)
 	}
-	lineage := acpSessionLineageIdentity{RuntimeIdentity: bound.body.RuntimeType}
+	lineage := acpSessionLineageIdentity{RuntimeIdentity: agentExecutionRuntimeIdentity(bound)}
 	if task.Spec.SessionRef != nil {
 		lineageConfigDigest, lineageErr := acpSessionLineageConfigDigest(bound.plan)
 		if lineageErr != nil {
@@ -1617,6 +1574,17 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 					sessionExecution.requeued = true
 					return nil
 				}
+			} else if retryableUnsentMutationCanRetry(err) {
+				if sessionExecution == nil {
+					return d.requeuePreSubmissionTask(ctx, task, attemptID, fence, err)
+				}
+				if requeueErr := d.requeuePreSubmissionTaskWithRuntimeBinding(
+					ctx, task, attemptID, fence, err, &sessionExecution.Binding,
+				); requeueErr != nil {
+					return requeueErr
+				}
+				sessionExecution.requeued = true
+				return nil
 			} else if sessionExecution != nil && isACPRateLimitedClientError(err) {
 				if requeueErr := d.requeuePreSubmissionTaskWithRuntimeBinding(
 					ctx, task, attemptID, fence, err, &sessionExecution.Binding,
@@ -1656,6 +1624,14 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 				sessionExecution.requeued = true
 				return nil
 			}
+		}
+	}
+	if sessionExecution == nil {
+		if err := d.patchExecution(ctx, task, func(status *corev1alpha1.TaskExecutionStatus) {
+			status.RuntimeSessionSupervisorBootID = string(runtimeFence.SupervisorBootID)
+			status.LastTransitionTime = nowMeta()
+		}); err != nil {
+			return err
 		}
 	}
 	if reservationLease != nil {
@@ -1795,7 +1771,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	admissionRetry := 0
 	for {
 		promptRequest, err := d.buildPromptRequest(
-			task, runtimeFence, profile, mcpConfiguration, bootstrap, userPrompt, admissionRetry,
+			task, runtimeFence, profile, mcpConfiguration, bootstrap, userPrompt, promptLimits, admissionRetry,
 		)
 		if err != nil {
 			return err
@@ -1804,13 +1780,16 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			return err
 		}
 		leaseCtx, stopLease := context.WithCancel(runtimeCtx)
+		admitted := make(chan struct{})
+		var admitOnce sync.Once
 		go d.renewPromptLeaseLoop(
-			leaseCtx, cancelRuntime, runtimeClient, createRequest.RuntimeSessionID, task, runtimeFence,
-			promptRequest.Lease, promptRequest.MCPAuthorization,
+			leaseCtx, admitted, cancelRuntime, runtimeClient, createRequest.RuntimeSessionID, task, runtimeFence,
+			promptRequest.Lease, promptRequest.MCPAuthorization, promptLimits,
 		)
 		summary, streamErr := runtimeClient.StreamPrompt(runtimeCtx, createRequest.RuntimeSessionID, promptRequest, func(event harnessv2.Event) error {
 			switch event.Type {
 			case harnessv2.EventAccepted:
+				admitOnce.Do(func() { close(admitted) })
 				runtimeSessionSettlementRequired = true
 				if _, _, err := journalState.AppendPromptLifecycleIfNew(ctx, event); err != nil {
 					return acpUpdatePersistenceError(err, nil)
@@ -1881,7 +1860,9 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 					return persistenceErr
 				}
 			case harnessv2.EventPermissionRequested:
-				return d.resolvePromptPermission(runtimeCtx, runtimeClient, createRequest.RuntimeSessionID, task, runtimeFence, event)
+				return d.resolvePromptPermission(
+					runtimeCtx, runtimeClient, createRequest.RuntimeSessionID, task, runtimeFence, mcpConfiguration, event,
+				)
 			case harnessv2.EventCompleted, harnessv2.EventCancelled, harnessv2.EventFailed, harnessv2.EventOutcomeUnknown:
 				copy := event
 				terminal = &copy
@@ -1889,6 +1870,25 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			return nil
 		})
 		stopLease()
+		runtimeContextErr := runtimeContextError(runtimeCtx)
+		if retryableUnsentPromptCanRequeue(accepted, summary, runtimeContextErr, streamErr) {
+			var runtimeBinding *ACPRuntimeSessionBinding
+			if sessionExecution != nil {
+				runtimeBinding = &sessionExecution.Binding
+			}
+			if err := d.requeueProvenNotAcceptedPromptAdmission(
+				ctx, task, attemptID, fence, streamErr, runtimeBinding, true,
+			); err != nil {
+				return err
+			}
+			// No prompt request reached the runtime, so retain the exact live
+			// RuntimeSession for the same sealed prompt identity on reconciliation.
+			runtimeSessionCleanupPending = false
+			if sessionExecution != nil {
+				sessionExecution.requeued = true
+			}
+			return nil
+		}
 		if accepted || summary.Accepted || streamErr == nil || !isACPRateLimitedClientError(streamErr) {
 			runtimeSessionSettlementRequired = true
 		}
@@ -1896,6 +1896,21 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			break
 		}
 		if !accepted && !summary.Accepted && isACPRateLimitedClientError(streamErr) {
+			if target.external != nil {
+				var runtimeBinding *ACPRuntimeSessionBinding
+				if sessionExecution != nil {
+					runtimeBinding = &sessionExecution.Binding
+				}
+				if err := d.requeueProvenNotAcceptedPromptAdmission(
+					ctx, task, attemptID, fence, streamErr, runtimeBinding, false,
+				); err != nil {
+					return err
+				}
+				if sessionExecution != nil {
+					sessionExecution.requeued = true
+				}
+				return nil
+			}
 			if reservationLease != nil {
 				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 				releaseErr := reservationLease.release(releaseCtx)
@@ -1935,7 +1950,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		cancel()
 		return d.handlePromptStreamError(
 			ctx, promptTrace, runtimeClient, createRequest.RuntimeSessionID, task, attemptID, fence, runtimeFence, journalState,
-			accepted || summary.Accepted, summary.WriteEvidence, runtimeContextError(runtimeCtx), streamErr,
+			accepted || summary.Accepted, summary.WriteEvidence, runtimeContextErr, streamErr,
 		)
 	}
 	if terminal == nil {
@@ -2067,7 +2082,9 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	if err := sealMutation(&deltaRequest.Metadata.RequestDigest, deltaRequest); err != nil {
 		return err
 	}
-	delta, err := runtimeClient.CreateWorkspaceDelta(runtimeCtx, createRequest.RuntimeSessionID, deltaRequest)
+	delta, err := createWorkspaceDeltaWithRetry(
+		runtimeCtx, runtimeClient, createRequest.RuntimeSessionID, deltaRequest,
+	)
 	if err != nil {
 		httpStatus, code, kind := 0, harnessv2.ErrorCode(""), harnessv2.ClientErrorKind("")
 		if clientErr, ok := errors.AsType[*harnessv2.ClientError](err); ok {
@@ -2393,6 +2410,21 @@ func acpWorkspaceDeltaLimits(task *corev1alpha1.Task) harnessv2.WorkspaceDeltaLi
 	limits.RejectBinaryFiles = task.Spec.Workspace.RejectBinaryFiles
 	limits.RejectSecretLikeContent = task.Spec.Workspace.RejectSecretLikeContent
 	return limits
+}
+
+func createWorkspaceDeltaWithRetry(
+	ctx context.Context,
+	runtimeClient *harnessv2.Client,
+	runtimeSessionID harnessv2.RuntimeSessionID,
+	request harnessv2.CreateWorkspaceDeltaRequest,
+) (*harnessv2.CreateWorkspaceDeltaResponse, error) {
+	var response *harnessv2.CreateWorkspaceDeltaResponse
+	err := retry.OnError(retry.DefaultBackoff, retryableUnsentMutationCanRetry, func() error {
+		var err error
+		response, err = runtimeClient.CreateWorkspaceDelta(ctx, runtimeSessionID, request)
+		return err
+	})
+	return response, err
 }
 
 type runtimeSessionPublicationFinalization struct {
@@ -2956,6 +2988,12 @@ func taskScopedRuntimeSessionGeneration(attempt *store.PromptAttempt) (uint64, e
 		return 0, fmt.Errorf("reserved PromptAttempt is required for task-scoped RuntimeSession generation")
 	}
 	generation := uint64(attempt.Version)
+	if attempt.SessionLeaseGeneration > 0 {
+		if attempt.SessionUID == "" || attempt.RuntimeInstanceID == "" {
+			return 0, store.ValidationErrorf("preserved task-scoped RuntimeSession generation requires complete bindings")
+		}
+		generation = uint64(attempt.SessionLeaseGeneration)
+	}
 	if generation > maxControllerRuntimeSessionGeneration {
 		return 0, store.ValidationErrorf("task-scoped RuntimeSession generation is exhausted")
 	}
@@ -3521,9 +3559,7 @@ func updateRuntimePoolReservationStatusIfChanged(ctx context.Context, kubeClient
 }
 
 type acpDispatchTarget struct {
-	pool *corev1alpha1.RuntimePool
-	// external is retained only for terminal RuntimeSession cleanup and recovery.
-	// New Task dispatch must never construct an external target.
+	pool        *corev1alpha1.RuntimePool
 	external    *corev1alpha1.AgentRuntime
 	reservation *acpRuntimePoolReservationIdentity
 }
@@ -3605,8 +3641,15 @@ func (d *ACPDispatcher) settleQueuedTaskBeforeAdmission(ctx context.Context, que
 		}
 		return false, err
 	}
-	if task.Status.Execution == nil ||
+	if task.UID != queued.UID || task.Status.Execution == nil ||
 		(task.Status.Execution.State != corev1alpha1.TaskExecutionStateQueued && task.Status.Execution.State != corev1alpha1.TaskExecutionStateReserved) {
+		return false, nil
+	}
+	fence, err := d.Epochs.CurrentFence(ctx)
+	if err != nil {
+		return false, err
+	}
+	if task.Status.Execution.ControllerEpoch != fence.Epoch || acpTaskHasUnvalidatedSourceIdentity(task) {
 		return false, nil
 	}
 	if d.isActive(task.UID) {
@@ -3674,16 +3717,18 @@ func (d *ACPDispatcher) settleTaskBeforeRuntimeAdmission(ctx context.Context, ta
 				return true, err
 			}
 		}
-		identity := acpRuntimePoolReservationIdentity{
-			PoolKey: types.NamespacedName{Namespace: task.Namespace, Name: task.Status.Execution.RuntimePoolName},
-			PoolUID: types.UID(task.Status.Execution.RuntimePoolUID), TaskUID: task.UID,
-			Attempt: task.Status.Execution.Attempt, ControllerEpoch: task.Status.Execution.ControllerEpoch,
-		}
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		releaseErr := d.releaseRuntimePoolReservation(releaseCtx, identity)
-		cancel()
-		if releaseErr != nil {
-			return true, releaseErr
+		if strings.TrimSpace(task.Status.Execution.RuntimePoolName) != "" {
+			identity := acpRuntimePoolReservationIdentity{
+				PoolKey: types.NamespacedName{Namespace: task.Namespace, Name: task.Status.Execution.RuntimePoolName},
+				PoolUID: types.UID(task.Status.Execution.RuntimePoolUID), TaskUID: task.UID,
+				Attempt: task.Status.Execution.Attempt, ControllerEpoch: task.Status.Execution.ControllerEpoch,
+			}
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			releaseErr := d.releaseRuntimePoolReservation(releaseCtx, identity)
+			cancel()
+			if releaseErr != nil {
+				return true, releaseErr
+			}
 		}
 	}
 	if err := d.settlePreSubmissionCancellation(ctx, task, attemptID, fence, operation, reason, message); err != nil {
@@ -3712,11 +3757,15 @@ func (d *ACPDispatcher) reserveTask(ctx context.Context, queued *corev1alpha1.Ta
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: queued.Namespace, Name: queued.Name}, task); err != nil {
 		return nil, acpDispatchTarget{}, client.IgnoreNotFound(err)
 	}
-	if task.Status.Execution == nil || (task.Status.Execution.State != corev1alpha1.TaskExecutionStateQueued && task.Status.Execution.State != corev1alpha1.TaskExecutionStateReserved) {
+	if task.UID != queued.UID || task.Status.Execution == nil || (task.Status.Execution.State != corev1alpha1.TaskExecutionStateQueued && task.Status.Execution.State != corev1alpha1.TaskExecutionStateReserved) {
 		return nil, acpDispatchTarget{}, nil
 	}
-	if persistedExternalRuntimeDispatch(task) {
-		return nil, acpDispatchTarget{}, d.rejectPersistedExternalRuntimeDispatch(ctx, task)
+	fence, err := d.Epochs.CurrentFence(ctx)
+	if err != nil {
+		return nil, acpDispatchTarget{}, err
+	}
+	if task.Status.Execution.ControllerEpoch != fence.Epoch || acpTaskHasUnvalidatedSourceIdentity(task) {
+		return nil, acpDispatchTarget{}, nil
 	}
 	settled, err := d.settleTaskBeforeRuntimeAdmission(ctx, task)
 	if err != nil || settled {
@@ -3726,33 +3775,55 @@ func (d *ACPDispatcher) reserveTask(ctx context.Context, queued *corev1alpha1.Ta
 	if err != nil {
 		return nil, acpDispatchTarget{}, err
 	}
-	fence, err := d.Epochs.CurrentFence(ctx)
-	if err != nil {
-		return nil, acpDispatchTarget{}, err
-	}
 	var target acpDispatchTarget
-	residentSlots := int32(1)
-	if task.Spec.SessionRef != nil {
-		// Session planning is the authority for whether an existing resident
-		// RuntimeSession can be reused. Claim only prompt capacity until that
-		// plan proves a new resident slot is actually required.
-		residentSlots = 0
+	hasPool := strings.TrimSpace(task.Status.Execution.RuntimePoolName) != ""
+	hasExternal := strings.TrimSpace(task.Status.Execution.AgentRuntimeName) != ""
+	if hasPool == hasExternal {
+		return nil, acpDispatchTarget{}, errors.New("queued ACP Task must select exactly one runtime target")
 	}
-	pool, reservation, claimErr := d.claimRuntimePoolReservation(
-		ctx, task, task.Status.Execution.RuntimePoolName, fence, residentSlots,
-	)
-	if claimErr != nil {
-		if errors.Is(claimErr, errACPRuntimePoolAtCapacity) || errors.Is(claimErr, errACPRuntimePoolNotAdmitting) {
-			_ = d.patchExecution(ctx, task, func(status *corev1alpha1.TaskExecutionStatus) {
-				status.Reason = corev1alpha1.TaskExecutionReasonAtCapacity
-				status.Message = claimErr.Error()
-			})
-			return nil, acpDispatchTarget{}, nil
+	refreshTarget := func() (bool, error) {
+		if target.external != nil || hasExternal {
+			runtime, bound, refreshErr := d.refreshTaskExternalRuntimeBinding(ctx, task)
+			if isFrozenExternalRuntimeBindingDrift(refreshErr) {
+				return false, d.settleFrozenExternalRuntimeBindingDrift(ctx, task, attemptID, fence, refreshErr)
+			}
+			if refreshErr != nil || !bound {
+				return bound, refreshErr
+			}
+			target.external = runtime
+			return true, nil
 		}
-		return nil, acpDispatchTarget{}, claimErr
+		return d.refreshTaskRuntimePoolBinding(ctx, task, target.pool)
 	}
-	target.pool = pool
-	target.reservation = reservation
+	if hasExternal {
+		bound, refreshErr := refreshTarget()
+		if refreshErr != nil || !bound {
+			return nil, acpDispatchTarget{}, refreshErr
+		}
+	} else {
+		residentSlots := int32(1)
+		if task.Spec.SessionRef != nil {
+			// Session planning is the authority for whether an existing resident
+			// RuntimeSession can be reused. Claim only prompt capacity until that
+			// plan proves a new resident slot is actually required.
+			residentSlots = 0
+		}
+		pool, reservation, claimErr := d.claimRuntimePoolReservation(
+			ctx, task, task.Status.Execution.RuntimePoolName, fence, residentSlots,
+		)
+		if claimErr != nil {
+			if errors.Is(claimErr, errACPRuntimePoolAtCapacity) || errors.Is(claimErr, errACPRuntimePoolNotAdmitting) {
+				_ = d.patchExecution(ctx, task, func(status *corev1alpha1.TaskExecutionStatus) {
+					status.Reason = corev1alpha1.TaskExecutionReasonAtCapacity
+					status.Message = claimErr.Error()
+				})
+				return nil, acpDispatchTarget{}, nil
+			}
+			return nil, acpDispatchTarget{}, claimErr
+		}
+		target.pool = pool
+		target.reservation = reservation
+	}
 	releaseClaim := func() {
 		if target.reservation == nil {
 			return
@@ -3771,7 +3842,7 @@ func (d *ACPDispatcher) reserveTask(ctx context.Context, queued *corev1alpha1.Ta
 		}
 		return nil, acpDispatchTarget{}, err
 	}
-	bound, err := d.refreshTaskRuntimePoolBinding(ctx, task, pool)
+	bound, err := refreshTarget()
 	if err != nil {
 		releaseClaim()
 		return nil, acpDispatchTarget{}, err
@@ -3779,6 +3850,11 @@ func (d *ACPDispatcher) reserveTask(ctx context.Context, queued *corev1alpha1.Ta
 	if !bound {
 		releaseClaim()
 		return nil, acpDispatchTarget{}, nil
+	}
+	if hasExternal {
+		if err := d.AdmissionGate.Check(); err != nil {
+			return nil, acpDispatchTarget{}, err
+		}
 	}
 	ready, err := d.preparePromptAttemptReservation(ctx, task, attemptID, fence)
 	if err != nil {
@@ -3789,7 +3865,7 @@ func (d *ACPDispatcher) reserveTask(ctx context.Context, queued *corev1alpha1.Ta
 		releaseClaim()
 		return nil, acpDispatchTarget{}, nil
 	}
-	bound, err = d.refreshTaskRuntimePoolBinding(ctx, task, pool)
+	bound, err = refreshTarget()
 	if err != nil {
 		releaseClaim()
 		return nil, acpDispatchTarget{}, err
@@ -3808,7 +3884,7 @@ func (d *ACPDispatcher) reserveTask(ctx context.Context, queued *corev1alpha1.Ta
 		releaseClaim()
 		return nil, acpDispatchTarget{}, err
 	}
-	bound, err = d.refreshTaskRuntimePoolBinding(ctx, task, pool)
+	bound, err = refreshTarget()
 	if err != nil {
 		releaseClaim()
 		return nil, acpDispatchTarget{}, err
@@ -3818,6 +3894,25 @@ func (d *ACPDispatcher) reserveTask(ctx context.Context, queued *corev1alpha1.Ta
 		return nil, acpDispatchTarget{}, nil
 	}
 	return task, target, nil
+}
+
+func (d *ACPDispatcher) settleFrozenExternalRuntimeBindingDrift(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	attemptID string,
+	fence store.ControllerEpochFence,
+	drift error,
+) error {
+	message := boundACPStatusMessage("frozen external AgentRuntime binding is no longer valid: " + drift.Error())
+	reason := corev1alpha1.TaskExecutionReason("InvalidRuntimeProfile")
+	if err := d.transitionAttemptToFailed(
+		ctx, attemptID, fence, "external-runtime-binding-drift", reason, message,
+	); err != nil {
+		return err
+	}
+	return d.failTaskBeforeSessionBinding(
+		ctx, task, corev1alpha1.TaskExecutionStateFailed, corev1alpha1.TaskExecutionOutcomeFailed, reason, message,
+	)
 }
 
 func (d *ACPDispatcher) preparePromptAttemptReservation(
@@ -3949,6 +4044,57 @@ func (d *ACPDispatcher) refreshTaskRuntimePoolBinding(
 	task.Labels = current.Labels
 	task.Annotations = current.Annotations
 	return true, nil
+}
+
+func (d *ACPDispatcher) refreshTaskExternalRuntimeBinding(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+) (*corev1alpha1.AgentRuntime, bool, error) {
+	if task == nil || task.Status.Execution == nil || task.Status.AgentExecutionBinding == nil {
+		return nil, false, nil
+	}
+	verifier := TaskReconciler{
+		Client:                  d.Client,
+		APIReader:               d.APIReader,
+		ControllerEpochManager:  d.Epochs,
+		AgentExecutionSnapshots: d.Snapshots,
+	}
+	bound, err := verifier.loadVerifiedBoundExecution(ctx, task, task.Status.AgentExecutionBinding)
+	if err != nil {
+		return nil, false, err
+	}
+	current := bound.frozenTask
+	status := current.Status.Execution
+	if bound.binding.Backend != corev1alpha1.AgentExecutionBackendExternalEndpoint ||
+		bound.binding.RuntimeRef == nil || bound.externalRuntime == nil || status == nil ||
+		(status.State != corev1alpha1.TaskExecutionStateQueued && status.State != corev1alpha1.TaskExecutionStateReserved) ||
+		status.Attempt != task.Status.Execution.Attempt || status.PromptID != task.Status.Execution.PromptID ||
+		status.RequestDigest != task.Status.Execution.RequestDigest || status.RuntimePoolName != "" || status.RuntimePoolUID != "" ||
+		status.AgentRuntimeName != bound.binding.RuntimeRef.Name || status.AgentRuntimeUID != string(bound.binding.RuntimeRef.UID) ||
+		bound.externalRuntime.Name != status.AgentRuntimeName || string(bound.externalRuntime.UID) != status.AgentRuntimeUID {
+		return nil, false, nil
+	}
+	matches, err := acpQueuedTaskRequestMatchesBinding(bound, status)
+	if err != nil || !matches {
+		return nil, false, err
+	}
+	attemptID, err := promptAttemptIDFromTask(current)
+	if err != nil {
+		return nil, false, err
+	}
+	attempt, err := d.Store.GetPromptAttempt(ctx, attemptID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !queuedPromptAttemptMatchesTask(attempt, current) || attempt.BindingDigest != bound.binding.BindingDigest ||
+		attempt.SnapshotDigest != bound.snapshot.Digest ||
+		(attempt.ExecutionState != store.PromptExecutionQueued && attempt.ExecutionState != store.PromptExecutionReserved) {
+		return nil, false, nil
+	}
+	task.Status = current.Status
+	task.Labels = current.Labels
+	task.Annotations = current.Annotations
+	return bound.externalRuntime.DeepCopy(), true, nil
 }
 
 func (d *ACPDispatcher) handlePreSubmissionContextDone(
@@ -4135,9 +4281,14 @@ func (d *ACPDispatcher) transitionDelivery(ctx context.Context, id string, fence
 	return err
 }
 
-func (d *ACPDispatcher) runtimeClient(ctx context.Context, target acpDispatchTarget) (*harnessv2.Client, harnessv2.Fence, harnessv2.RuntimeProfile, int, error) {
+func (d *ACPDispatcher) runtimeClient(
+	ctx context.Context,
+	target acpDispatchTarget,
+	mcpConfiguration harnessv2.MCPPolicyConfiguration,
+	requireAdmission bool,
+) (*harnessv2.Client, harnessv2.Fence, harnessv2.RuntimeProfile, int, error) {
 	if target.external != nil {
-		return d.externalRuntimeClient(ctx, target.external)
+		return d.externalRuntimeClient(ctx, target.external, mcpConfiguration, requireAdmission)
 	}
 	if target.pool == nil {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("ACP runtime target is missing")
@@ -4213,15 +4364,28 @@ func (d *ACPDispatcher) runtimePoolClient(ctx context.Context, pool *corev1alpha
 	return runtimeClient, runtimeFence, profile, capabilities.Limits.MaxTerminalResultBytes, nil
 }
 
-func (d *ACPDispatcher) externalRuntimeClient(ctx context.Context, runtime *corev1alpha1.AgentRuntime) (*harnessv2.Client, harnessv2.Fence, harnessv2.RuntimeProfile, int, error) {
-	if reason := externalAgentRuntimeReadinessReason(nil, runtime); reason != "" {
-		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("%s", reason)
+func (d *ACPDispatcher) externalRuntimeClient(
+	ctx context.Context,
+	runtime *corev1alpha1.AgentRuntime,
+	mcpConfiguration harnessv2.MCPPolicyConfiguration,
+	requireAdmission bool,
+) (*harnessv2.Client, harnessv2.Fence, harnessv2.RuntimeProfile, int, error) {
+	if requireAdmission {
+		if reason := externalAgentRuntimeReadinessReason(nil, runtime); reason != "" {
+			return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("%s", reason)
+		}
 	}
 	currentFence, err := d.Epochs.CurrentFence(ctx)
 	if err != nil {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
 	}
 	observed := runtime.Status.ObservedCapabilities
+	if observed == nil {
+		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, errors.New("external AgentRuntime observed authority is incomplete")
+	}
+	if requireAdmission && observed.MCPToolDescriptorDigest != mcpConfiguration.ToolPolicy.DescriptorDigest {
+		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, errExternalAgentRuntimeMCPToolDescriptorsNotConformed
+	}
 	if observed.ControllerEpoch != currentFence.Epoch {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("external AgentRuntime is fenced to controller epoch %d, current epoch is %d", observed.ControllerEpoch, currentFence.Epoch)
 	}
@@ -4247,6 +4411,18 @@ func (d *ACPDispatcher) externalRuntimeClient(ctx context.Context, runtime *core
 		runtime.Status.ObservedOperationCapabilityRefResourceVersion != auth.capabilityResourceVersion {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("external AgentRuntime authentication material changed after conformance")
 	}
+	expectedAuthority, err := canonicalExternalRuntimeMutationAuthority(runtime)
+	if err != nil {
+		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
+	}
+	expectedRuntime := runtime.DeepCopy()
+	expectedPins := slices.Clone(serviceBackendPins)
+	requiresPermissions := harnessv2.MCPPolicyRequiresPermissionCapability(
+		mcpConfiguration.ToolPolicy, mcpConfiguration.ApprovalPolicy,
+	)
+	var expectedCapabilities []byte
+	var runtimeClient *harnessv2.Client
+	var cleanupAuthority *externalRuntimeCleanupAuthority
 	clientOptions := []harnessv2.ClientOption{
 		harnessv2.WithControlTimeout(runtimeSessionCreateTimeout(acpDispatchTarget{external: runtime})),
 		harnessv2.WithControllerBearerToken(auth.controllerBearerToken),
@@ -4255,25 +4431,37 @@ func (d *ACPDispatcher) externalRuntimeClient(ctx context.Context, runtime *core
 			RuntimeProfileDigest: harnessv2.ProfileDigest(runtime.Spec.Capabilities.Profile.Digest),
 			RuntimeInstanceID:    harnessv2.RuntimeInstanceID(runtime.Spec.Capabilities.RuntimeInstanceID),
 		}),
+		harnessv2.WithBeforeMutation(func(validateCtx context.Context, operation string) error {
+			if runtimeClient == nil || len(expectedCapabilities) == 0 {
+				return errors.New("external AgentRuntime pre-mutation authority is not initialized")
+			}
+			if externalRuntimeMutationUsesFrozenCleanupAuthority(operation) {
+				if cleanupAuthority == nil {
+					return errors.New("external AgentRuntime frozen cleanup authority is not initialized")
+				}
+				return d.revalidateExternalRuntimeCleanupMutation(validateCtx, cleanupAuthority)
+			}
+			return d.revalidateExternalRuntimeMutation(
+				validateCtx, expectedRuntime, expectedAuthority, expectedPins, auth, expectedCapabilities,
+				requiresPermissions, externalRuntimeMutationRequiresAdmission(operation), runtimeClient,
+			)
+		}),
 	}
 	// Pin the connection: a Service endpoint dials only its verified backend
 	// Pod IPs; a non-Service endpoint dialed from the controller's privileged
 	// position enforces the same per-dial public-address control conformance
 	// uses (a hostname that resolved publicly at conformance can rebind to an
 	// internal address).
-	dialTimeout := runtimeSessionCreateTimeout(acpDispatchTarget{external: runtime})
 	if len(serviceBackendPins) > 0 {
-		clientOptions = append(clientOptions, harnessv2.WithHTTPClient(&http.Client{
-			Timeout:   dialTimeout,
-			Transport: PinnedBackendDialTransport(serviceBackendPins),
-		}))
+		clientOptions = append(clientOptions, harnessv2.WithHTTPClient(
+			externalRuntimeHTTPClient(PinnedBackendDialTransport(serviceBackendPins)),
+		))
 	} else if agentRuntimeEndpointRequiresPublicDial(runtime.Spec.Deployment.Endpoint) {
-		clientOptions = append(clientOptions, harnessv2.WithHTTPClient(&http.Client{
-			Timeout:   dialTimeout,
-			Transport: v2conformance.PublicAddressDialTransport(),
-		}))
+		clientOptions = append(clientOptions, harnessv2.WithHTTPClient(
+			externalRuntimeHTTPClient(v2conformance.PublicAddressDialTransport()),
+		))
 	}
-	runtimeClient, err := harnessv2.NewClient(runtime.Spec.Deployment.Endpoint, clientOptions...)
+	runtimeClient, err = harnessv2.NewClient(runtime.Spec.Deployment.Endpoint, clientOptions...)
 	if err != nil {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
 	}
@@ -4281,22 +4469,27 @@ func (d *ACPDispatcher) externalRuntimeClient(ctx context.Context, runtime *core
 	if err != nil {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
 	}
-	if string(capabilities.RuntimeProfileDigest) != runtime.Spec.Capabilities.Profile.Digest || !capabilities.WorkspaceGovernance.Strict() {
-		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("external AgentRuntime capability identity/profile drifted after conformance")
+	profile, limits, err := validateExternalRuntimeCapabilities(runtime, capabilities, requiresPermissions)
+	if err != nil {
+		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
 	}
-	if runtime.Spec.Capabilities.Profile.WorkspaceIntent == corev1alpha1.WorkspaceIntentWrite && !capabilities.SupportsPublicationFinalization {
-		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("external AgentRuntime does not support controller-owned RuntimeSession publication finalization required for write workspaces")
+	expectedCapabilities, err = canonicalExternalRuntimeCapabilities(capabilities)
+	if err != nil {
+		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("canonicalize external AgentRuntime capabilities: %w", err)
 	}
 	status, err := runtimeClient.Status(ctx)
 	if err != nil {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
 	}
-	if string(status.Fence.RuntimeInstanceID) != observed.RuntimeInstanceID || string(status.Fence.SupervisorBootID) != observed.SupervisorBootID ||
-		int64(status.Fence.ControllerEpoch) != observed.ControllerEpoch || string(status.Fence.RuntimePoolUID) != observed.RuntimePoolUID ||
-		int64(status.Fence.RuntimePoolGeneration) != observed.RuntimePoolGeneration || string(status.Fence.RuntimeProfileDigest) != runtime.Spec.Capabilities.Profile.Digest {
-		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, fmt.Errorf("external AgentRuntime status fence drifted after conformance")
+	if err := validateExternalRuntimeStatus(runtime, currentFence, status, requireAdmission); err != nil {
+		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
 	}
-	profile, err := agentRuntimeProfile(*runtime.Spec.Capabilities.Profile)
+	cleanupAuthority, err = newExternalRuntimeCleanupAuthority(
+		runtime, runtime.DeepCopy(), auth, serviceBackendPins,
+		harnessv2.RuntimeInstanceID(observed.RuntimeInstanceID), harnessv2.SupervisorBootID(observed.SupervisorBootID),
+		harnessv2.RuntimePoolUID(observed.RuntimePoolUID), uint64(observed.RuntimePoolGeneration),
+		harnessv2.ProfileDigest(runtime.Spec.Capabilities.Profile.Digest), limits,
+	)
 	if err != nil {
 		return nil, harnessv2.Fence{}, harnessv2.RuntimeProfile{}, 0, err
 	}
@@ -4306,7 +4499,722 @@ func (d *ACPDispatcher) externalRuntimeClient(ctx context.Context, runtime *core
 		RuntimePoolGeneration: uint64(observed.RuntimePoolGeneration), RuntimeProfileDigest: harnessv2.ProfileDigest(runtime.Spec.Capabilities.Profile.Digest),
 		ProfileDigestSchemaVersion: harnessv2.ProfileDigestSchemaVersion,
 	}
-	return runtimeClient, fence, profile, capabilities.Limits.MaxTerminalResultBytes, nil
+	return runtimeClient, fence, profile, limits.MaxTerminalResultBytes, nil
+}
+
+// externalRuntimeCleanupAuthority retains the exact non-secret route and
+// credential identity that admitted a RuntimeSession. AgentRuntime spec changes
+// stop new admission, but cannot make an already-created resident session
+// impossible to cancel, settle, or delete while the same runtime instance still
+// proves ownership of it.
+type externalRuntimeCleanupAuthority struct {
+	runtimeKey            types.NamespacedName
+	runtimeUID            types.UID
+	frozenRuntime         *corev1alpha1.AgentRuntime
+	auth                  agentRuntimeAuthMaterial
+	serviceBackendPins    []string
+	runtimeInstanceID     harnessv2.RuntimeInstanceID
+	supervisorBootID      harnessv2.SupervisorBootID
+	runtimePoolUID        harnessv2.RuntimePoolUID
+	runtimePoolGeneration uint64
+	runtimeProfileDigest  harnessv2.ProfileDigest
+	protocolLimits        harnessv2.ProtocolLimits
+	reconformedAuth       bool
+	sessionCleanup        *sessionRuntimeCleanupFence
+	sessionCleanupAuth    *corev1.Secret
+}
+
+func newExternalRuntimeCleanupAuthority(
+	current *corev1alpha1.AgentRuntime,
+	frozenRuntime *corev1alpha1.AgentRuntime,
+	auth agentRuntimeAuthMaterial,
+	serviceBackendPins []string,
+	runtimeInstanceID harnessv2.RuntimeInstanceID,
+	supervisorBootID harnessv2.SupervisorBootID,
+	runtimePoolUID harnessv2.RuntimePoolUID,
+	runtimePoolGeneration uint64,
+	runtimeProfileDigest harnessv2.ProfileDigest,
+	protocolLimits harnessv2.ProtocolLimits,
+) (*externalRuntimeCleanupAuthority, error) {
+	if current == nil || frozenRuntime == nil || current.Namespace == "" || current.Name == "" || current.UID == "" ||
+		frozenRuntime.Namespace != current.Namespace || frozenRuntime.Name != current.Name || frozenRuntime.UID != current.UID {
+		return nil, errors.New("external AgentRuntime cleanup identity is incomplete")
+	}
+	if strings.TrimSpace(frozenRuntime.Spec.Deployment.Endpoint) == "" || runtimeInstanceID == "" || supervisorBootID == "" ||
+		runtimePoolUID == "" || runtimePoolGeneration < 1 || runtimeProfileDigest == "" {
+		return nil, errors.New("external AgentRuntime cleanup fence is incomplete")
+	}
+	if err := protocolLimits.Validate(); err != nil {
+		return nil, fmt.Errorf("external AgentRuntime frozen cleanup limits are invalid: %w", err)
+	}
+	if strings.TrimSpace(auth.controllerBearerToken) == "" || len(auth.operationCapabilitySecret) < harnessv2.MinCapabilitySecretBytes ||
+		auth.controllerSecretUID == "" || auth.capabilitySecretUID == "" ||
+		strings.TrimSpace(auth.controllerResourceVersion) == "" || strings.TrimSpace(auth.capabilityResourceVersion) == "" {
+		return nil, errors.New("external AgentRuntime frozen cleanup authentication is incomplete")
+	}
+	return &externalRuntimeCleanupAuthority{
+		runtimeKey:            types.NamespacedName{Namespace: current.Namespace, Name: current.Name},
+		runtimeUID:            current.UID,
+		frozenRuntime:         frozenRuntime.DeepCopy(),
+		auth:                  auth,
+		serviceBackendPins:    slices.Clone(serviceBackendPins),
+		runtimeInstanceID:     runtimeInstanceID,
+		supervisorBootID:      supervisorBootID,
+		runtimePoolUID:        runtimePoolUID,
+		runtimePoolGeneration: runtimePoolGeneration,
+		runtimeProfileDigest:  runtimeProfileDigest,
+		protocolLimits:        protocolLimits,
+	}, nil
+}
+
+func externalRuntimeMutationUsesFrozenCleanupAuthority(operation string) bool {
+	switch operation {
+	case "cancel_prompt", "create_workspace_delta", "finalize_runtime_session_publication", "delete_runtime_session":
+		return true
+	default:
+		return false
+	}
+}
+
+func externalRuntimeCleanupMutationAllowed(authority *externalRuntimeCleanupAuthority, operation string) bool {
+	if authority != nil && authority.sessionCleanup != nil {
+		return operation == "delete_runtime_session"
+	}
+	return externalRuntimeMutationUsesFrozenCleanupAuthority(operation)
+}
+
+func (d *ACPDispatcher) externalRuntimeCleanupClient(
+	ctx context.Context,
+	current *corev1alpha1.AgentRuntime,
+	frozen *agentExecutionSnapshotExternalRuntime,
+	runtimeProfileDigest harnessv2.ProfileDigest,
+	protocolLimits harnessv2.ProtocolLimits,
+	expectedRuntimeInstanceID harnessv2.RuntimeInstanceID,
+	expectedSupervisorBootID harnessv2.SupervisorBootID,
+	sessionCleanup *sessionRuntimeCleanupFence,
+) (*harnessv2.Client, harnessv2.Fence, error) {
+	if current == nil || frozen == nil {
+		return nil, harnessv2.Fence{}, errors.New("external AgentRuntime frozen cleanup target is required")
+	}
+	frozenRuntime, err := frozenAgentRuntimeForCleanup(current, frozen)
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	reconciler := &AgentRuntimeReconciler{Client: d.Client, APIReader: d.APIReader}
+	pins, err := reconciler.AgentRuntimeServiceBackendPins(ctx, frozenRuntime)
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	auth, err := reconciler.agentRuntimeAuthMaterial(ctx, frozenRuntime)
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	reconformedAuth, err := validateExternalRuntimeCleanupAuthentication(
+		current, frozenRuntime, frozen, auth, runtimeProfileDigest,
+	)
+	var cleanupAuth *corev1.Secret
+	if err != nil && sessionCleanup != nil &&
+		string(auth.controllerSecretUID) == frozen.ControllerAuth.UID &&
+		string(auth.capabilitySecretUID) == frozen.OperationCapability.UID {
+		cleanupAuth, err = d.sessionRuntimeCleanupAuthSnapshot(ctx, current, frozenRuntime, auth,
+			runtimeProfileDigest, expectedRuntimeInstanceID, expectedSupervisorBootID, sessionCleanup)
+	}
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	runtimeEpoch, err := d.externalRuntimeCleanupEpoch(ctx, sessionCleanup)
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	observed, err := validateExternalRuntimeCleanupIdentity(
+		current, types.NamespacedName{Namespace: current.Namespace, Name: current.Name}, current.UID,
+		expectedRuntimeInstanceID, expectedSupervisorBootID, "", 0, runtimeEpoch,
+	)
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	authority, err := newExternalRuntimeCleanupAuthority(
+		current, frozenRuntime, auth, pins, expectedRuntimeInstanceID, expectedSupervisorBootID,
+		harnessv2.RuntimePoolUID(observed.RuntimePoolUID), uint64(observed.RuntimePoolGeneration),
+		runtimeProfileDigest, protocolLimits,
+	)
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	authority.reconformedAuth = reconformedAuth
+	authority.sessionCleanup = sessionCleanup
+	authority.sessionCleanupAuth = cleanupAuth
+	runtimeClient, err := d.newExternalRuntimeCleanupHTTPClient(authority, harnessv2.ProfileDigest(observed.RuntimeProfileDigest), true)
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	status, err := runtimeClient.Status(ctx)
+	if err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	if err := validateExternalRuntimeCleanupStatus(authority, observed, runtimeEpoch, status); err != nil {
+		return nil, harnessv2.Fence{}, err
+	}
+	return runtimeClient, harnessv2.Fence{
+		RuntimeInstanceID: authority.runtimeInstanceID, SupervisorBootID: authority.supervisorBootID,
+		ControllerEpoch: runtimeEpoch, RuntimePoolUID: authority.runtimePoolUID,
+		RuntimePoolGeneration: authority.runtimePoolGeneration, RuntimeProfileDigest: authority.runtimeProfileDigest,
+		ProfileDigestSchemaVersion: harnessv2.ProfileDigestSchemaVersion,
+	}, nil
+}
+
+func frozenAgentRuntimeForCleanup(
+	current *corev1alpha1.AgentRuntime,
+	frozen *agentExecutionSnapshotExternalRuntime,
+) (*corev1alpha1.AgentRuntime, error) {
+	if current == nil || frozen == nil || frozen.Namespace != current.Namespace ||
+		len(frozen.ControllerAuth.Keys) != 1 || len(frozen.OperationCapability.Keys) != 1 {
+		return nil, errors.New("external AgentRuntime frozen cleanup authority is incomplete")
+	}
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	return &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Namespace: current.Namespace, Name: current.Name, UID: current.UID},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Deployment: corev1alpha1.AgentRuntimeDeploymentSpec{
+				Mode: corev1alpha1.AgentRuntimeDeploymentModeExternalEndpoint, Endpoint: frozen.Endpoint,
+			},
+			ClientAuth: corev1alpha1.AgentRuntimeClientAuth{
+				ControllerBearerTokenSecretRef: &corev1alpha1.AgentRuntimeSecretKeyReference{
+					Name: frozen.ControllerAuth.Name, Key: frozen.ControllerAuth.Keys[0],
+				},
+				OperationCapabilitySecretRef: &corev1alpha1.AgentRuntimeSecretKeyReference{
+					Name: frozen.OperationCapability.Name, Key: frozen.OperationCapability.Keys[0],
+				},
+			},
+		},
+	}, nil
+}
+
+func validateExternalRuntimeCleanupAuthentication(
+	current *corev1alpha1.AgentRuntime,
+	frozenRuntime *corev1alpha1.AgentRuntime,
+	frozen *agentExecutionSnapshotExternalRuntime,
+	auth agentRuntimeAuthMaterial,
+	expectedProfileDigest harnessv2.ProfileDigest,
+) (bool, error) {
+	if current == nil || frozenRuntime == nil || frozen == nil {
+		return false, errors.New("external AgentRuntime frozen cleanup authentication authority is incomplete")
+	}
+	if string(auth.controllerSecretUID) != frozen.ControllerAuth.UID ||
+		string(auth.capabilitySecretUID) != frozen.OperationCapability.UID {
+		return false, errors.New("external AgentRuntime frozen cleanup authentication Secret identity changed")
+	}
+	if auth.controllerResourceVersion == frozen.ControllerAuth.ResourceVersion &&
+		auth.capabilityResourceVersion == frozen.OperationCapability.ResourceVersion {
+		return false, nil
+	}
+	if err := validateExternalRuntimeReconformedCleanupAuthentication(
+		current, frozenRuntime, auth, expectedProfileDigest,
+	); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func validateExternalRuntimeReconformedCleanupAuthentication(
+	current *corev1alpha1.AgentRuntime,
+	frozenRuntime *corev1alpha1.AgentRuntime,
+	auth agentRuntimeAuthMaterial,
+	expectedProfileDigest harnessv2.ProfileDigest,
+) error {
+	if current == nil || frozenRuntime == nil ||
+		current.Spec.ClientAuth.ControllerBearerTokenSecretRef == nil ||
+		current.Spec.ClientAuth.OperationCapabilitySecretRef == nil ||
+		frozenRuntime.Spec.ClientAuth.ControllerBearerTokenSecretRef == nil ||
+		frozenRuntime.Spec.ClientAuth.OperationCapabilitySecretRef == nil ||
+		expectedProfileDigest == "" {
+		return errors.New("external AgentRuntime reconformed cleanup authentication authority is incomplete")
+	}
+	controllerRef := current.Spec.ClientAuth.ControllerBearerTokenSecretRef
+	capabilityRef := current.Spec.ClientAuth.OperationCapabilitySecretRef
+	frozenControllerRef := frozenRuntime.Spec.ClientAuth.ControllerBearerTokenSecretRef
+	frozenCapabilityRef := frozenRuntime.Spec.ClientAuth.OperationCapabilitySecretRef
+	if strings.TrimSpace(current.Spec.Deployment.Endpoint) != strings.TrimSpace(frozenRuntime.Spec.Deployment.Endpoint) ||
+		controllerRef.Name != frozenControllerRef.Name || controllerRef.Key != frozenControllerRef.Key ||
+		capabilityRef.Name != frozenCapabilityRef.Name || capabilityRef.Key != frozenCapabilityRef.Key {
+		return errors.New("external AgentRuntime cleanup endpoint or authentication references changed after binding")
+	}
+	observed := current.Status.ObservedCapabilities
+	if !current.Status.Ready || current.Status.ObservedGeneration != current.Generation ||
+		current.Status.ObservedControllerAuthRefResourceVersion != auth.controllerResourceVersion ||
+		current.Status.ObservedOperationCapabilityRefResourceVersion != auth.capabilityResourceVersion ||
+		!agentRuntimeObservedStatusIdentityComplete(observed) ||
+		observed.RuntimeProfileDigest != string(expectedProfileDigest) {
+		return errors.New("external AgentRuntime rotated cleanup authentication has not been observed for the current registration")
+	}
+	return nil
+}
+
+func (d *ACPDispatcher) newExternalRuntimeCleanupHTTPClient(
+	authority *externalRuntimeCleanupAuthority,
+	statusProfileDigest harnessv2.ProfileDigest,
+	withMutationRevalidation bool,
+) (*harnessv2.Client, error) {
+	if authority == nil || authority.frozenRuntime == nil || statusProfileDigest == "" {
+		return nil, errors.New("external AgentRuntime cleanup client authority is incomplete")
+	}
+	options := []harnessv2.ClientOption{
+		harnessv2.WithControlTimeout(runtimeSessionCreateTimeout(acpDispatchTarget{external: authority.frozenRuntime})),
+		harnessv2.WithControllerBearerToken(authority.auth.controllerBearerToken),
+		harnessv2.WithOperationCapabilitySecret(authority.auth.operationCapabilitySecret),
+		harnessv2.WithProtocolLimits(authority.protocolLimits),
+		harnessv2.WithStatusCapabilityBinding(harnessv2.StatusCapabilityBinding{
+			RuntimeProfileDigest: statusProfileDigest, RuntimeInstanceID: authority.runtimeInstanceID,
+		}),
+	}
+	if len(authority.serviceBackendPins) > 0 {
+		options = append(options, harnessv2.WithHTTPClient(
+			externalRuntimeHTTPClient(PinnedBackendDialTransport(authority.serviceBackendPins)),
+		))
+	} else if agentRuntimeEndpointRequiresPublicDial(authority.frozenRuntime.Spec.Deployment.Endpoint) {
+		options = append(options, harnessv2.WithHTTPClient(
+			externalRuntimeHTTPClient(v2conformance.PublicAddressDialTransport()),
+		))
+	}
+	if withMutationRevalidation {
+		options = append(options, harnessv2.WithBeforeMutation(func(validateCtx context.Context, operation string) error {
+			if !externalRuntimeCleanupMutationAllowed(authority, operation) {
+				return errors.New("external AgentRuntime cleanup client cannot perform admission or non-cleanup mutations")
+			}
+			return d.revalidateExternalRuntimeCleanupMutation(validateCtx, authority)
+		}))
+	}
+	return harnessv2.NewClient(authority.frozenRuntime.Spec.Deployment.Endpoint, options...)
+}
+
+func (d *ACPDispatcher) revalidateExternalRuntimeCleanupMutation(
+	ctx context.Context,
+	authority *externalRuntimeCleanupAuthority,
+) error {
+	if authority == nil || authority.frozenRuntime == nil {
+		return errors.New("external AgentRuntime frozen cleanup authority is incomplete")
+	}
+	reader := d.APIReader
+	if reader == nil {
+		reader = d.Client
+	}
+	current := &corev1alpha1.AgentRuntime{}
+	if err := reader.Get(ctx, authority.runtimeKey, current); err != nil {
+		return markExternalRuntimeMutationReadRetryable(fmt.Errorf("re-read external AgentRuntime before cleanup mutation: %w", err))
+	}
+	runtimeEpoch, err := d.externalRuntimeCleanupEpoch(ctx, authority.sessionCleanup)
+	if err != nil {
+		return err
+	}
+	observed, err := validateExternalRuntimeCleanupIdentity(
+		current, authority.runtimeKey, authority.runtimeUID, authority.runtimeInstanceID, authority.supervisorBootID,
+		authority.runtimePoolUID, authority.runtimePoolGeneration, runtimeEpoch,
+	)
+	if err != nil {
+		return err
+	}
+	reconciler := &AgentRuntimeReconciler{Client: d.Client, APIReader: d.APIReader}
+	currentPins, err := reconciler.AgentRuntimeServiceBackendPins(ctx, authority.frozenRuntime)
+	if err != nil {
+		return markExternalRuntimeMutationReadRetryable(err)
+	}
+	if !slices.Equal(currentPins, authority.serviceBackendPins) {
+		return errors.New("external AgentRuntime frozen cleanup backend set changed before mutation")
+	}
+	currentAuth, err := reconciler.agentRuntimeAuthMaterial(ctx, authority.frozenRuntime)
+	if err != nil {
+		return markExternalRuntimeMutationReadRetryable(err)
+	}
+	if currentAuth.controllerSecretUID != authority.auth.controllerSecretUID ||
+		currentAuth.capabilitySecretUID != authority.auth.capabilitySecretUID ||
+		currentAuth.controllerResourceVersion != authority.auth.controllerResourceVersion ||
+		currentAuth.capabilityResourceVersion != authority.auth.capabilityResourceVersion ||
+		currentAuth.controllerBearerToken != authority.auth.controllerBearerToken ||
+		!bytes.Equal(currentAuth.operationCapabilitySecret, authority.auth.operationCapabilitySecret) {
+		return errors.New("external AgentRuntime frozen cleanup authentication changed before mutation")
+	}
+	if authority.sessionCleanupAuth != nil {
+		if err := d.revalidateSessionRuntimeCleanupAuthSnapshot(ctx, current, authority); err != nil {
+			return err
+		}
+	} else if authority.reconformedAuth {
+		if err := validateExternalRuntimeReconformedCleanupAuthentication(
+			current, authority.frozenRuntime, currentAuth, authority.runtimeProfileDigest,
+		); err != nil {
+			return err
+		}
+	}
+	probe, err := d.newExternalRuntimeCleanupHTTPClient(
+		authority, harnessv2.ProfileDigest(observed.RuntimeProfileDigest), false,
+	)
+	if err != nil {
+		return err
+	}
+	status, err := probe.Status(ctx)
+	if err != nil {
+		return markExternalRuntimeMutationReadRetryable(err)
+	}
+	if err := validateExternalRuntimeCleanupStatus(authority, observed, runtimeEpoch, status); err != nil {
+		return err
+	}
+	if authority.sessionCleanup != nil {
+		_, err = d.externalRuntimeCleanupEpoch(ctx, authority.sessionCleanup)
+	}
+	return err
+}
+
+func validateExternalRuntimeCleanupIdentity(
+	current *corev1alpha1.AgentRuntime,
+	expectedKey types.NamespacedName,
+	expectedUID types.UID,
+	expectedRuntimeInstanceID harnessv2.RuntimeInstanceID,
+	expectedSupervisorBootID harnessv2.SupervisorBootID,
+	expectedRuntimePoolUID harnessv2.RuntimePoolUID,
+	expectedRuntimePoolGeneration uint64,
+	runtimeEpoch uint64,
+) (*corev1alpha1.AgentRuntimeObservedCapabilities, error) {
+	if current == nil || current.Namespace != expectedKey.Namespace || current.Name != expectedKey.Name ||
+		current.UID == "" || current.UID != expectedUID {
+		return nil, errors.New("external AgentRuntime identity changed before cleanup mutation")
+	}
+	observed := current.Status.ObservedCapabilities
+	if observed == nil || strings.TrimSpace(observed.RuntimeInstanceID) == "" ||
+		strings.TrimSpace(observed.SupervisorBootID) == "" || strings.TrimSpace(observed.RuntimePoolUID) == "" ||
+		observed.RuntimePoolGeneration < 1 || strings.TrimSpace(observed.RuntimeProfileDigest) == "" ||
+		observed.ProfileDigestSchemaVersion != int32(harnessv2.ProfileDigestSchemaVersion) {
+		return nil, errors.New("external AgentRuntime cleanup observation is incomplete")
+	}
+	if observed.RuntimeInstanceID != string(expectedRuntimeInstanceID) ||
+		observed.SupervisorBootID != string(expectedSupervisorBootID) ||
+		observed.ControllerEpoch < 1 || uint64(observed.ControllerEpoch) != runtimeEpoch {
+		return nil, errors.New("external AgentRuntime runtime instance, boot, or controller fence changed before cleanup mutation")
+	}
+	if expectedRuntimePoolUID != "" && observed.RuntimePoolUID != string(expectedRuntimePoolUID) {
+		return nil, errors.New("external AgentRuntime runtime pool fence changed before cleanup mutation")
+	}
+	if expectedRuntimePoolGeneration > 0 && uint64(observed.RuntimePoolGeneration) != expectedRuntimePoolGeneration {
+		return nil, errors.New("external AgentRuntime runtime pool fence changed before cleanup mutation")
+	}
+	return observed, nil
+}
+
+func validateExternalRuntimeCleanupStatus(
+	authority *externalRuntimeCleanupAuthority,
+	observed *corev1alpha1.AgentRuntimeObservedCapabilities,
+	runtimeEpoch uint64,
+	status *harnessv2.StatusResponse,
+) error {
+	if authority == nil || observed == nil || status == nil ||
+		status.Fence.RuntimeInstanceID != authority.runtimeInstanceID ||
+		status.Fence.SupervisorBootID != authority.supervisorBootID ||
+		status.Fence.ControllerEpoch != runtimeEpoch ||
+		status.Fence.RuntimePoolUID != authority.runtimePoolUID ||
+		status.Fence.RuntimePoolGeneration != authority.runtimePoolGeneration ||
+		string(status.Fence.RuntimeProfileDigest) != observed.RuntimeProfileDigest ||
+		status.Fence.ProfileDigestSchemaVersion != harnessv2.ProfileDigestSchemaVersion {
+		return errors.New("external AgentRuntime authenticated cleanup status fence changed")
+	}
+	return nil
+}
+
+func externalRuntimeHTTPClient(transport http.RoundTripper) *http.Client {
+	// Client.Timeout includes response-body reads, so setting it here would cut
+	// off long-running prompt streams. The harness client applies its control
+	// timeout to unary operations, while StartPrompt inherits the Task context.
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+//nolint:gocyclo // Live capability validation compares the complete registered and observed v2 contract in one audit point.
+func validateExternalRuntimeCapabilities(
+	runtime *corev1alpha1.AgentRuntime,
+	capabilities *harnessv2.CapabilitiesResponse,
+	requiresPermissions bool,
+) (harnessv2.RuntimeProfile, harnessv2.ProtocolLimits, error) {
+	if runtime == nil || runtime.Spec.Capabilities == nil || runtime.Spec.Capabilities.Profile == nil ||
+		runtime.Spec.Capabilities.Limits == nil || runtime.Spec.Capabilities.WorkspaceGovernance == nil ||
+		runtime.Status.ObservedCapabilities == nil || runtime.Status.ObservedCapabilities.Limits == nil ||
+		runtime.Status.ObservedCapabilities.WorkspaceGovernance == nil || capabilities == nil {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime capability authority is incomplete")
+	}
+	registered := runtime.Spec.Capabilities
+	observed := runtime.Status.ObservedCapabilities
+	profile, err := agentRuntimeProfile(*registered.Profile)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, err
+	}
+	limits, err := agentRuntimeProtocolLimits(*registered.Limits)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, err
+	}
+	observedLimits, err := agentRuntimeProtocolLimits(*observed.Limits)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime observed protocol limits are invalid")
+	}
+	governance, err := agentRuntimeWorkspaceGovernance(*registered.WorkspaceGovernance)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, err
+	}
+	observedGovernance, err := agentRuntimeWorkspaceGovernance(*observed.WorkspaceGovernance)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime observed workspace governance is invalid")
+	}
+	profileDigest, err := harnessv2.CanonicalProfileDigest(profile)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, fmt.Errorf("canonicalize external AgentRuntime profile: %w", err)
+	}
+	if capabilities.Protocol != harnessv2.ProtocolVersion || capabilities.Protocol != observed.ProtocolVersion ||
+		capabilities.Transport != "http+ndjson" || capabilities.Transport != observed.Transport ||
+		capabilities.ACPVersion != profile.ACPProfile || capabilities.ACPVersion != observed.ACPVersion ||
+		capabilities.RuntimeProfileDigest != profileDigest || string(profileDigest) != registered.Profile.Digest ||
+		string(capabilities.RuntimeProfileDigest) != observed.RuntimeProfileDigest ||
+		capabilities.ProfileDigestSchemaVersion != harnessv2.ProfileDigestSchemaVersion ||
+		int32(capabilities.ProfileDigestSchemaVersion) != registered.Profile.DigestSchemaVersion ||
+		int32(capabilities.ProfileDigestSchemaVersion) != observed.ProfileDigestSchemaVersion {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime protocol or profile capability drifted after conformance")
+	}
+	if !maps.Equal(capabilities.AdapterDigests, profile.AdapterDigests) ||
+		len(profile.AdapterDigests) != 1 || observed.AdapterName != registered.Profile.AdapterName ||
+		observed.AdapterDigest != registered.Profile.AdapterDigest {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime adapter capability drifted after conformance")
+	}
+	if capabilities.Limits != limits || observedLimits != limits {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime protocol limits drifted after conformance")
+	}
+	if capabilities.WorkspaceGovernance != governance || observedGovernance != governance || !governance.Strict() {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime workspace governance drifted after conformance")
+	}
+	if capabilities.SupportsAgentSessionConfiguration {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime Agent session configuration capability drifted after conformance")
+	}
+	if capabilities.SupportsDrain != registered.SupportsDrain || observed.SupportsDrain != registered.SupportsDrain ||
+		capabilities.SupportsPublicationFinalization != registered.SupportsPublicationFinalization ||
+		observed.SupportsPublicationFinalization != registered.SupportsPublicationFinalization {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime lifecycle capability drifted after conformance")
+	}
+	if !slices.Contains(capabilities.Provider.ProviderKinds, profile.ProviderKind) ||
+		!slices.Contains(capabilities.Provider.Models, profile.Model) ||
+		observed.ProviderKind != profile.ProviderKind || observed.Model != profile.Model ||
+		!capabilities.Provider.SupportsCancel || !capabilities.Provider.SupportsTools ||
+		(requiresPermissions && !capabilities.Provider.SupportsPermissions) {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime provider capability drifted after conformance")
+	}
+	if profile.WorkspaceIntent == harnessv2.WorkspaceIntentWrite && !capabilities.SupportsPublicationFinalization {
+		return harnessv2.RuntimeProfile{}, harnessv2.ProtocolLimits{}, errors.New("external AgentRuntime does not support controller-owned RuntimeSession publication finalization required for write workspaces")
+	}
+	return profile, limits, nil
+}
+
+func validateExternalRuntimeStatus(
+	runtime *corev1alpha1.AgentRuntime,
+	controllerFence store.ControllerEpochFence,
+	status *harnessv2.StatusResponse,
+	requireAdmission bool,
+) error {
+	if runtime == nil || runtime.Spec.Capabilities == nil || runtime.Spec.Capabilities.Profile == nil ||
+		runtime.Status.ObservedCapabilities == nil || status == nil {
+		return errors.New("external AgentRuntime status authority is incomplete")
+	}
+	observed := runtime.Status.ObservedCapabilities
+	if observed.ControllerEpoch != controllerFence.Epoch ||
+		string(status.Fence.RuntimeInstanceID) != runtime.Spec.Capabilities.RuntimeInstanceID ||
+		string(status.Fence.RuntimeInstanceID) != observed.RuntimeInstanceID ||
+		string(status.Fence.SupervisorBootID) != observed.SupervisorBootID ||
+		int64(status.Fence.ControllerEpoch) != observed.ControllerEpoch ||
+		string(status.Fence.RuntimePoolUID) != observed.RuntimePoolUID ||
+		int64(status.Fence.RuntimePoolGeneration) != observed.RuntimePoolGeneration ||
+		string(status.Fence.RuntimeProfileDigest) != runtime.Spec.Capabilities.Profile.Digest ||
+		string(status.Fence.RuntimeProfileDigest) != observed.RuntimeProfileDigest ||
+		status.Fence.ProfileDigestSchemaVersion != harnessv2.ProfileDigestSchemaVersion ||
+		int32(status.Fence.ProfileDigestSchemaVersion) != observed.ProfileDigestSchemaVersion {
+		return errors.New("external AgentRuntime authenticated status fence drifted after conformance")
+	}
+	if requireAdmission && (status.Lifecycle != harnessv2.SupervisorLifecycleReady || status.Drain.Requested || !status.Drain.AcceptingNewSessions) {
+		return errors.New("external AgentRuntime is not ready to accept new sessions")
+	}
+	return nil
+}
+
+func externalRuntimeMutationRequiresAdmission(operation string) bool {
+	switch operation {
+	case "renew_prompt_lease", "resolve_permission", "cancel_prompt", "create_workspace_delta",
+		"finalize_runtime_session_publication", "delete_runtime_session", "drain":
+		return false
+	default:
+		// Unknown mutations fail closed as admissions. This also covers the two
+		// current admission operations: create_runtime_session and start_prompt.
+		return true
+	}
+}
+
+func canonicalExternalRuntimeMutationAuthority(runtime *corev1alpha1.AgentRuntime) ([]byte, error) {
+	if runtime == nil {
+		return nil, errors.New("external AgentRuntime is required")
+	}
+	authority := struct {
+		Namespace                     string                                         `json:"namespace"`
+		Name                          string                                         `json:"name"`
+		UID                           types.UID                                      `json:"uid"`
+		Generation                    int64                                          `json:"generation"`
+		Spec                          corev1alpha1.AgentRuntimeRegistrySpec          `json:"spec"`
+		ObservedGeneration            int64                                          `json:"observedGeneration"`
+		ObservedCapabilities          *corev1alpha1.AgentRuntimeObservedCapabilities `json:"observedCapabilities"`
+		ControllerAuthResourceVersion string                                         `json:"controllerAuthResourceVersion"`
+		CapabilityAuthResourceVersion string                                         `json:"capabilityAuthResourceVersion"`
+	}{
+		Namespace: runtime.Namespace, Name: runtime.Name, UID: runtime.UID, Generation: runtime.Generation,
+		Spec: runtime.Spec, ObservedGeneration: runtime.Status.ObservedGeneration,
+		ObservedCapabilities:          runtime.Status.ObservedCapabilities,
+		ControllerAuthResourceVersion: runtime.Status.ObservedControllerAuthRefResourceVersion,
+		CapabilityAuthResourceVersion: runtime.Status.ObservedOperationCapabilityRefResourceVersion,
+	}
+	encoded, err := harnessv2.CanonicalValue(authority)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize external AgentRuntime mutation authority: %w", err)
+	}
+	return encoded, nil
+}
+
+func (d *ACPDispatcher) revalidateExternalRuntimeMutation(
+	ctx context.Context,
+	expectedRuntime *corev1alpha1.AgentRuntime,
+	expectedAuthority []byte,
+	expectedPins []string,
+	expectedAuth agentRuntimeAuthMaterial,
+	expectedCapabilities []byte,
+	requiresPermissions bool,
+	requireAdmission bool,
+	runtimeClient *harnessv2.Client,
+) error {
+	if expectedRuntime == nil || runtimeClient == nil {
+		return errors.New("external AgentRuntime mutation authority is incomplete")
+	}
+	reader := d.APIReader
+	if reader == nil {
+		reader = d.Client
+	}
+	current := &corev1alpha1.AgentRuntime{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: expectedRuntime.Namespace, Name: expectedRuntime.Name}, current); err != nil {
+		return markExternalRuntimeMutationReadRetryable(fmt.Errorf("re-read external AgentRuntime before mutation: %w", err))
+	}
+	if requireAdmission {
+		if reason := externalAgentRuntimeReadinessReason(nil, current); reason != "" {
+			return errors.New(reason)
+		}
+	}
+	currentAuthority, err := canonicalExternalRuntimeMutationAuthority(current)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(currentAuthority, expectedAuthority) {
+		return errors.New("external AgentRuntime registration or observed authority changed before mutation")
+	}
+	reconciler := &AgentRuntimeReconciler{Client: d.Client, APIReader: d.APIReader}
+	currentPins, err := reconciler.AgentRuntimeServiceBackendPins(ctx, current)
+	if err != nil {
+		return markExternalRuntimeMutationReadRetryable(err)
+	}
+	if !slices.Equal(currentPins, expectedPins) {
+		return errors.New("external AgentRuntime verified backend set changed before mutation")
+	}
+	currentAuth, err := reconciler.agentRuntimeAuthMaterial(ctx, current)
+	if err != nil {
+		return markExternalRuntimeMutationReadRetryable(err)
+	}
+	if currentAuth.controllerSecretUID != expectedAuth.controllerSecretUID ||
+		currentAuth.capabilitySecretUID != expectedAuth.capabilitySecretUID ||
+		currentAuth.controllerResourceVersion != expectedAuth.controllerResourceVersion ||
+		currentAuth.capabilityResourceVersion != expectedAuth.capabilityResourceVersion ||
+		currentAuth.controllerBearerToken != expectedAuth.controllerBearerToken ||
+		!bytes.Equal(currentAuth.operationCapabilitySecret, expectedAuth.operationCapabilitySecret) {
+		return errors.New("external AgentRuntime authentication authority changed before mutation")
+	}
+	capabilities, err := runtimeClient.Capabilities(ctx)
+	if err != nil {
+		return markExternalRuntimeMutationReadRetryable(err)
+	}
+	if _, _, err := validateExternalRuntimeCapabilities(current, capabilities, requiresPermissions); err != nil {
+		return err
+	}
+	if err := validateFrozenExternalRuntimeCapabilities(expectedCapabilities, capabilities); err != nil {
+		return err
+	}
+	controllerFence, err := d.Epochs.CurrentFence(ctx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, store.ErrConflict) && !errors.Is(err, store.ErrValidation) {
+			return harnessv2.MarkPreMutationRetryable(err)
+		}
+		return err
+	}
+	status, err := runtimeClient.Status(ctx)
+	if err != nil {
+		return markExternalRuntimeMutationReadRetryable(err)
+	}
+	return validateExternalRuntimeStatus(current, controllerFence, status, requireAdmission)
+}
+
+func markExternalRuntimeMutationReadRetryable(err error) error {
+	if !externalRuntimeMutationReadRetryable(err) {
+		return err
+	}
+	return harnessv2.MarkPreMutationRetryable(err)
+}
+
+func externalRuntimeMutationReadRetryable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || apierrors.IsNotFound(err) ||
+		apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err) || apierrors.IsInvalid(err) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) ||
+		apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsInternalError(err) {
+		return true
+	}
+	if clientErr, ok := errors.AsType[*harnessv2.ClientError](err); ok {
+		switch clientErr.Kind {
+		case harnessv2.ClientErrorTransport, harnessv2.ClientErrorStream:
+			return true
+		case harnessv2.ClientErrorHTTP:
+			return clientErr.Retryable || clientErr.StatusCode == http.StatusRequestTimeout ||
+				clientErr.StatusCode == http.StatusTooManyRequests || clientErr.StatusCode >= http.StatusInternalServerError
+		case harnessv2.ClientErrorProtocol:
+			return clientErr.StatusCode >= http.StatusInternalServerError
+		default:
+			return false
+		}
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func validateFrozenExternalRuntimeCapabilities(expected []byte, current *harnessv2.CapabilitiesResponse) error {
+	if len(expected) == 0 || current == nil {
+		return errors.New("external AgentRuntime frozen capability envelope is incomplete")
+	}
+	encoded, err := canonicalExternalRuntimeCapabilities(current)
+	if err != nil {
+		return fmt.Errorf("canonicalize current external AgentRuntime capabilities: %w", err)
+	}
+	if !bytes.Equal(encoded, expected) {
+		return errors.New("external AgentRuntime live capability envelope changed before mutation")
+	}
+	return nil
+}
+
+func canonicalExternalRuntimeCapabilities(capabilities *harnessv2.CapabilitiesResponse) ([]byte, error) {
+	if capabilities == nil {
+		return nil, errors.New("external AgentRuntime capabilities are required")
+	}
+	normalized := *capabilities
+	normalized.Provider.ProviderKinds = slices.Clone(capabilities.Provider.ProviderKinds)
+	normalized.Provider.Models = slices.Clone(capabilities.Provider.Models)
+	slices.Sort(normalized.Provider.ProviderKinds)
+	slices.Sort(normalized.Provider.Models)
+	return harnessv2.CanonicalValue(&normalized)
 }
 
 func (d *ACPDispatcher) runtimeAuthSecret(ctx context.Context, pool *corev1alpha1.RuntimePool) (*corev1.Secret, error) {
@@ -4376,6 +5284,7 @@ func (d *ACPDispatcher) buildPromptRequest(
 	mcpConfiguration harnessv2.MCPPolicyConfiguration,
 	bootstrap string,
 	userPrompt string,
+	limits harnessv2.ProtocolLimits,
 	admissionRetry int,
 ) (harnessv2.StartPromptRequest, error) {
 	if fence.RuntimeSessionUID == "" {
@@ -4385,15 +5294,19 @@ func (d *ACPDispatcher) buildPromptRequest(
 		fence.RuntimeSessionGeneration = 1
 	}
 	now := time.Now().UTC()
-	lease := harnessv2.PromptLease{Generation: 1, IssuedAt: now, ExpiresAt: now.Add(90 * time.Second)}
+	lease := harnessv2.PromptLease{Generation: 1, IssuedAt: now, ExpiresAt: now.Add(promptLeaseDuration(limits))}
 	operation := "start-prompt"
 	if admissionRetry > 0 {
 		operation += "-retry-" + strconv.Itoa(admissionRetry)
 	}
-	metadata := mutationMetadata(fence, task, operation, true, now.Add(60*time.Second))
+	requestExpiry := now.Add(60 * time.Second)
+	if lease.ExpiresAt.Before(requestExpiry) {
+		requestExpiry = lease.ExpiresAt
+	}
+	metadata := mutationMetadata(fence, task, operation, true, requestExpiry)
 	content := acpPromptInputContent(bootstrap, userPrompt)
 	authorization, err := buildPromptMCPAuthorization(
-		mcpConfiguration, fence, profile, metadata, lease, now.Add(60*time.Second),
+		mcpConfiguration, fence, profile, metadata, lease, requestExpiry,
 	)
 	if err != nil {
 		return harnessv2.StartPromptRequest{}, err
@@ -4403,6 +5316,19 @@ func (d *ACPDispatcher) buildPromptRequest(
 		MCPAuthorization: authorization,
 		Input:            harnessv2.PromptInput{Content: content},
 	}, nil
+}
+
+func promptLeaseDuration(limits harnessv2.ProtocolLimits) time.Duration {
+	duration := defaultPromptLeaseDuration
+	minimum := time.Duration(limits.MinPromptLeaseMillis) * time.Millisecond
+	maximum := time.Duration(limits.MaxPromptLeaseMillis) * time.Millisecond
+	if duration < minimum {
+		return minimum
+	}
+	if duration > maximum {
+		return maximum
+	}
+	return duration
 }
 
 func acpPromptInputContent(bootstrap, userPrompt string) []harnessv2.ContentBlock {
@@ -4537,6 +5463,7 @@ func (d *ACPDispatcher) publishTaskResultReference(ctx context.Context, task *co
 
 func (d *ACPDispatcher) renewPromptLeaseLoop(
 	ctx context.Context,
+	admitted <-chan struct{},
 	cancelRuntime context.CancelFunc,
 	runtimeClient *harnessv2.Client,
 	sessionID harnessv2.RuntimeSessionID,
@@ -4544,8 +5471,14 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 	fence harnessv2.Fence,
 	lease harnessv2.PromptLease,
 	authorization harnessv2.PromptMCPAuthorization,
+	limits harnessv2.ProtocolLimits,
 ) {
 	log := logf.FromContext(ctx).WithValues("namespace", task.Namespace, "task", task.Name)
+	select {
+	case <-ctx.Done():
+		return
+	case <-admitted:
+	}
 	retryDelay := time.Duration(0)
 	// pending is the exact sealed mutation of a renewal whose outcome is
 	// ambiguous (transient failure after the request may have been written).
@@ -4554,9 +5487,15 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 	// digest_conflict on a rebuilt request with fresh timestamps.
 	var pending *harnessv2.RenewPromptLeaseRequest
 	for {
-		wait := max(time.Until(lease.ExpiresAt)/2, 5*time.Second)
+		now := time.Now().UTC()
+		remaining := lease.ExpiresAt.Sub(now)
+		if remaining <= 0 {
+			cancelRuntime()
+			return
+		}
+		wait := promptLeaseRenewalDelay(now, lease.ExpiresAt, authorization.ExpiresAt)
 		if retryDelay > 0 {
-			wait = retryDelay
+			wait = min(wait, retryDelay)
 			retryDelay = 0
 		}
 		timer := time.NewTimer(wait)
@@ -4566,7 +5505,7 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 			return
 		case <-timer.C:
 		}
-		now := time.Now().UTC()
+		now = time.Now().UTC()
 		var request harnessv2.RenewPromptLeaseRequest
 		switch {
 		case pending != nil && pending.Metadata.ExpiresAt.After(now.Add(promptLeaseRenewalRetryMargin)):
@@ -4583,7 +5522,11 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 			cancelRuntime()
 			return
 		default:
-			proposed := harnessv2.PromptLease{Generation: lease.Generation + 1, IssuedAt: now, ExpiresAt: now.Add(90 * time.Second)}
+			proposed := harnessv2.PromptLease{
+				Generation: lease.Generation + 1,
+				IssuedAt:   now,
+				ExpiresAt:  now.Add(promptLeaseDuration(limits)),
+			}
 			authorization.LeaseGeneration = proposed.Generation
 			authorization.ExpiresAt = proposed.ExpiresAt
 			if maximum := now.Add(60 * time.Second); authorization.ExpiresAt.After(maximum) {
@@ -4653,6 +5596,15 @@ func (d *ACPDispatcher) renewPromptLeaseLoop(
 	}
 }
 
+func promptLeaseRenewalDelay(now, leaseExpiresAt, authorizationExpiresAt time.Time) time.Duration {
+	leaseRemaining := leaseExpiresAt.Sub(now)
+	authorizationRemaining := authorizationExpiresAt.Sub(now)
+	if authorizationRemaining <= 0 {
+		return 0
+	}
+	return min(leaseRemaining/2, authorizationRemaining/2)
+}
+
 const (
 	// promptLeaseRenewalRetryDelay bounds how soon a transiently failed lease
 	// renewal is retried; promptLeaseRenewalRetryMargin is the remaining lease
@@ -4708,6 +5660,8 @@ func promptLeaseRenewalRetryable(err error) bool {
 			return clientErr.Retryable || clientErr.StatusCode >= http.StatusInternalServerError
 		case harnessv2.ClientErrorTransport, harnessv2.ClientErrorProtocol, harnessv2.ClientErrorStream:
 			return true
+		case harnessv2.ClientErrorValidation:
+			return clientErr.Retryable && clientErr.WriteEvidence.SafeToResendSameIdentity()
 		default:
 			return false
 		}
@@ -4715,18 +5669,20 @@ func promptLeaseRenewalRetryable(err error) bool {
 	return true
 }
 
-func (d *ACPDispatcher) resolvePromptPermission(ctx context.Context, runtimeClient *harnessv2.Client, sessionID harnessv2.RuntimeSessionID, task *corev1alpha1.Task, fence harnessv2.Fence, event harnessv2.Event) error {
+func (d *ACPDispatcher) resolvePromptPermission(
+	ctx context.Context,
+	runtimeClient *harnessv2.Client,
+	sessionID harnessv2.RuntimeSessionID,
+	task *corev1alpha1.Task,
+	fence harnessv2.Fence,
+	mcpConfiguration harnessv2.MCPPolicyConfiguration,
+	event harnessv2.Event,
+) error {
 	permission := event.PermissionRequested
 	if permission == nil {
 		return nil
 	}
-	decision := harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionCancelled}
-	for _, option := range permission.Options {
-		if option.Kind == harnessv2.PermissionOptionRejectOnce {
-			decision = harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionSelected, OptionID: option.OptionID}
-			break
-		}
-	}
+	decision := frozenMCPPermissionDecision(mcpConfiguration.ToolPolicy, permission)
 	request := harnessv2.ResolvePermissionRequest{
 		Protocol:  harnessv2.ProtocolVersion,
 		Metadata:  mutationMetadata(fence, task, "permission-"+string(permission.RequestID), true, time.Now().UTC().Add(30*time.Second)),
@@ -4739,10 +5695,47 @@ func (d *ACPDispatcher) resolvePromptPermission(ctx context.Context, runtimeClie
 	return err
 }
 
+func frozenMCPPermissionDecision(
+	toolPolicy harnessv2.MCPToolPolicy,
+	permission *harnessv2.PermissionRequestedEvent,
+) harnessv2.PermissionDecision {
+	cancelled := harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionCancelled}
+	if permission == nil {
+		return cancelled
+	}
+	descriptor, allowed := toolPolicy.Descriptor(permission.ToolName)
+	if allowed && descriptor.Source == harnessv2.MCPToolSourceProviderNative {
+		for _, option := range permission.Options {
+			if option.Kind == harnessv2.PermissionOptionAllowOnce {
+				return harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionSelected, OptionID: option.OptionID}
+			}
+		}
+	}
+	for _, option := range permission.Options {
+		if option.Kind == harnessv2.PermissionOptionRejectOnce {
+			return harnessv2.PermissionDecision{Outcome: harnessv2.PermissionDecisionSelected, OptionID: option.OptionID}
+		}
+	}
+	return cancelled
+}
+
 func isACPRateLimitedClientError(err error) bool {
 	var clientErr *harnessv2.ClientError
 	return errors.As(err, &clientErr) && clientErr.StatusCode == 429 &&
 		clientErr.Code == harnessv2.ErrorCodeRateLimited && clientErr.Retryable
+}
+
+func retryableUnsentPromptCanRequeue(
+	accepted bool,
+	summary harnessv2.PromptStreamSummary,
+	runtimeContextErr error,
+	err error,
+) bool {
+	if accepted || summary.Accepted || runtimeContextErr != nil || !summary.WriteEvidence.SafeToResendSameIdentity() {
+		return false
+	}
+	clientErr, ok := errors.AsType[*harnessv2.ClientError](err)
+	return ok && clientErr.Retryable && clientErr.WriteEvidence.SafeToResendSameIdentity()
 }
 
 func (d *ACPDispatcher) requeuePreSubmissionTask(
@@ -4791,7 +5784,66 @@ func (d *ACPDispatcher) requeuePreSubmissionTaskWithRuntimeBinding(
 		status.ControllerEpoch = fence.Epoch
 		applyRuntimeSessionBindingToExecution(status, runtimeBinding)
 		status.Reason = corev1alpha1.TaskExecutionReasonAtCapacity
-		status.Message = "RuntimePool admission will be retried"
+		status.Message = "runtime admission will be retried"
+		status.LastTransitionTime = nowMeta()
+	})
+}
+
+func (d *ACPDispatcher) requeueProvenNotAcceptedPromptAdmission(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	attemptID string,
+	fence store.ControllerEpochFence,
+	cause error,
+	runtimeBinding *ACPRuntimeSessionBinding,
+	preserveBindings bool,
+) error {
+	clientErr, ok := errors.AsType[*harnessv2.ClientError](cause)
+	retryableUnsent := ok && clientErr.Retryable && clientErr.WriteEvidence.SafeToResendSameIdentity()
+	rateLimited := ok && isACPRateLimitedClientError(cause)
+	if preserveBindings && !retryableUnsent {
+		return fmt.Errorf("prompt admission binding preservation requires retryable zero-write proof: %w", cause)
+	}
+	if !preserveBindings && !rateLimited {
+		return fmt.Errorf("prompt admission requeue requires an authoritative retryable rate-limit rejection: %w", cause)
+	}
+	attempt, err := d.Store.GetPromptAttempt(ctx, attemptID)
+	if err != nil {
+		return err
+	}
+	if attempt.ExecutionState != store.PromptExecutionSubmitting {
+		return fmt.Errorf("prompt attempt %s cannot requeue rejected admission from state %s: %w", attemptID, attempt.ExecutionState, cause)
+	}
+	proof := "rate_limited_rejection"
+	message := "external runtime prompt admission was rate limited and will be retried"
+	if preserveBindings {
+		proof = "retryable_zero_write"
+		message = "runtime prompt submission was not sent and will be retried"
+	}
+	digest, err := acpDomainDigest("proven-unaccepted-prompt-admission-recovery", map[string]any{
+		"attemptID": attempt.ID, "state": attempt.ExecutionState, "version": attempt.Version, "epoch": fence.Epoch,
+		"statusCode": clientErr.StatusCode, "code": clientErr.Code, acpCancelLogKeyKind: clientErr.Kind,
+		"retryable": clientErr.Retryable, "writeState": clientErr.WriteEvidence.State, "proof": proof,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := d.Store.RecoverPromptAttemptPreSubmission(ctx, store.PromptAttemptPreSubmissionRecovery{
+		ID: attempt.ID, Fence: fence, ExpectedVersion: attempt.Version, ExpectedState: attempt.ExecutionState,
+		ProvenNotAccepted: true, PreserveBindings: preserveBindings,
+		OperationID:     "requeue-proven-not-accepted-" + strconv.FormatInt(attempt.Version, 10),
+		OperationDigest: digest, RecoveredAt: time.Now().UTC(),
+	}); err != nil {
+		return err
+	}
+	return d.patchExecution(ctx, task, func(status *corev1alpha1.TaskExecutionStatus) {
+		status.State = corev1alpha1.TaskExecutionStateReserved
+		status.ControllerEpoch = fence.Epoch
+		if runtimeBinding != nil || !preserveBindings {
+			applyRuntimeSessionBindingToExecution(status, runtimeBinding)
+		}
+		status.Reason = corev1alpha1.TaskExecutionReasonAtCapacity
+		status.Message = message
 		status.LastTransitionTime = nowMeta()
 	})
 }
@@ -4984,6 +6036,11 @@ func runtimeSessionCreationMayHaveApplied(err error) bool {
 		}
 	}
 	return !clientErr.WriteEvidence.SafeToResendSameIdentity()
+}
+
+func retryableUnsentMutationCanRetry(err error) bool {
+	clientErr, ok := errors.AsType[*harnessv2.ClientError](err)
+	return ok && clientErr.Retryable && clientErr.WriteEvidence.SafeToResendSameIdentity()
 }
 
 func runtimeSessionStartDiagnostic(err error) (int, harnessv2.ErrorCode, string) {
@@ -5765,7 +6822,7 @@ func (d *ACPDispatcher) requeueReservedTask(
 	// credential errors are not a safe status surface.
 	return d.patchExecution(ctx, task, func(status *corev1alpha1.TaskExecutionStatus) {
 		status.Reason = corev1alpha1.TaskExecutionReasonAtCapacity
-		status.Message = fmt.Sprintf("RuntimePool admission will be retried (stage: %s)", stage)
+		status.Message = fmt.Sprintf("runtime admission will be retried (stage: %s)", stage)
 	})
 }
 

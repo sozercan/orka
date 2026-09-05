@@ -15,9 +15,25 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
+	"github.com/orka-agents/orka/internal/harness/v2/conformance/conformancetest"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/tools"
 )
+
+func TestDeterministicProfileMatchesExplicitEmptyExternalMCPPolicy(t *testing.T) {
+	profile, err := conformancetest.DeterministicProfile("fixture-runtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := &corev1alpha1.AgentRuntimeMCPPolicySpec{
+		AllowedTools:          []string{},
+		DisallowedTools:       []string{},
+		ApprovalRequiredTools: []string{},
+	}
+	if err := validateAgentRuntimeMCPPolicyClaims(policy, profile); err != nil {
+		t.Fatalf("explicit empty fixture policy does not match its deterministic profile: %v", err)
+	}
+}
 
 func TestBuildRuntimeSessionMCPConfigurationInjectsJournaledChildMessagingTools(t *testing.T) {
 	registry := tools.NewRegistry()
@@ -74,6 +90,70 @@ func TestBuildRuntimeSessionMCPConfigurationInjectsJournaledChildMessagingTools(
 		if descriptor.Effect != harnessv2.MCPToolEffectConsequential {
 			t.Fatalf("descriptor %q effect = %q, want consequential", name, descriptor.Effect)
 		}
+	}
+}
+
+func TestBuildExternalRuntimeSessionMCPConfigurationClassifiesToolPolicyMismatchPermanent(t *testing.T) {
+	policy := testAgentRuntimeMCPPolicy()
+	profile, _, _ := testAgentRuntimeProfileClaimsAndLimits()
+	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{
+		AgentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{"web_search"}},
+	}}
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+		Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-v2"},
+		},
+	}}
+	externalRuntime := &corev1alpha1.AgentRuntime{Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+		Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{MCPPolicy: &policy},
+	}}
+
+	_, err := buildExternalRuntimeSessionMCPConfigurationWithRegistry(
+		context.Background(), nil, task, agent, externalRuntime, profile, tools.NewRegistry(),
+	)
+	if err == nil || !isPermanentACPAgentConfigurationError(err) ||
+		!strings.Contains(err.Error(), "allowedTools do not exactly match") {
+		t.Fatalf("tool policy mismatch error = %v, permanent=%t", err, isPermanentACPAgentConfigurationError(err))
+	}
+}
+
+func TestBuildExternalRuntimeSessionMCPConfigurationRequiresExplicitAllowedTools(t *testing.T) {
+	policy := testAgentRuntimeMCPPolicy()
+	profile, _, _ := testAgentRuntimeProfileClaimsAndLimits()
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
+		Runtime: &corev1alpha1.AgentCLIRuntime{
+			RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-v2"},
+		},
+	}}
+	externalRuntime := &corev1alpha1.AgentRuntime{Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+		Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{MCPPolicy: &policy},
+	}}
+	tests := []struct {
+		name         string
+		agentRuntime *corev1alpha1.AgentRuntimeSpec
+		wantError    bool
+	}{
+		{name: "agentRuntime omitted", wantError: true},
+		{name: "allowedTools omitted", agentRuntime: &corev1alpha1.AgentRuntimeSpec{}, wantError: true},
+		{name: "explicit empty allowedTools", agentRuntime: &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{AgentRuntime: test.agentRuntime}}
+			_, err := buildExternalRuntimeSessionMCPConfigurationWithRegistry(
+				context.Background(), nil, task, agent, externalRuntime, profile, tools.NewRegistry(),
+			)
+			if !test.wantError {
+				if err != nil {
+					t.Fatalf("explicit allowedTools rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !isPermanentACPAgentConfigurationError(err) ||
+				!strings.Contains(err.Error(), "allowedTools must be an explicit list") {
+				t.Fatalf("missing allowedTools error = %v, permanent=%t", err, isPermanentACPAgentConfigurationError(err))
+			}
+		})
 	}
 }
 
@@ -395,7 +475,6 @@ func TestBuildRuntimeSessionMCPConfigurationDeliversCanonicalToolDescriptors(t *
 				Type:            corev1alpha1.AgentRuntimeClaude,
 				ContractVersion: new(corev1alpha1.AgentRuntimeContractHarnessV2),
 			},
-			Coordination: &corev1alpha1.CoordinationConfig{ApprovalRequiredTools: []string{"dispatch_work"}},
 		},
 	}
 	plan, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Claude: "docker.io/example/claude@sha256:" + strings.Repeat("a", 64)})
@@ -425,9 +504,6 @@ func TestBuildRuntimeSessionMCPConfigurationDeliversCanonicalToolDescriptors(t *
 	if byName["dispatch_work"].Source != harnessv2.MCPToolSourceBrokeredCustom || byName["dispatch_work"].Effect != harnessv2.MCPToolEffectConsequential {
 		t.Fatalf("custom descriptor = %#v", byName["dispatch_work"])
 	}
-	if !configuration.ApprovalPolicy.Requires("dispatch_work") {
-		t.Fatal("custom approval-required tool was not frozen into the policy")
-	}
 	if configuration.ToolPolicy.DescriptorDigest == "" {
 		t.Fatal("descriptor digest is empty")
 	}
@@ -441,6 +517,16 @@ func TestBuildRuntimeSessionMCPConfigurationDeliversCanonicalToolDescriptors(t *
 	}
 	if err := decoded.ValidateProfile(plan.Profile); err != nil {
 		t.Fatalf("JSON round-trip ValidateProfile() error = %v", err)
+	}
+
+	agent.Spec.Coordination = &corev1alpha1.CoordinationConfig{ApprovalRequiredTools: []string{"dispatch_work"}}
+	approvalPlan, err := PlanACPRuntime(task, agent, ACPRuntimeImages{Claude: "docker.io/example/claude@sha256:" + strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = buildRuntimeSessionMCPConfiguration(context.Background(), reader, task, agent, approvalPlan.Profile)
+	if err == nil || !strings.Contains(err.Error(), "controller-owned permission review") {
+		t.Fatalf("approval-required MCP configuration error = %v", err)
 	}
 }
 

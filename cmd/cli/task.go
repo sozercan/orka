@@ -24,6 +24,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/cli/client"
 )
 
@@ -191,6 +192,35 @@ func newTaskCreateCmd() *cobra.Command {
 			workspace, err := workspaceOptions.build(cmd, taskType)
 			if err != nil {
 				return err
+			}
+			var externalRuntimePolicy *resolvedAgentRuntimePolicy
+			if agent != "" && taskType == cliTaskTypeAgent {
+				policy, err := resolveAgentRuntimePolicy(cmd.Context(), c, agent)
+				if err != nil {
+					return err
+				}
+				if policy != nil {
+					req.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{AllowedTools: policy.allowedTools}
+					externalRuntimePolicy = policy
+				}
+			}
+			if externalRuntimePolicy != nil && externalRuntimePolicy.requireWorkspaceIntentMatch {
+				taskIntent := corev1alpha1.WorkspaceIntentRead
+				if workspace != nil {
+					intent, ok := workspace["intent"].(string)
+					if !ok {
+						return fmt.Errorf("prepare external AgentRuntime workspace intent: workspace intent is missing")
+					}
+					taskIntent = corev1alpha1.WorkspaceIntent(intent)
+				}
+				if externalRuntimePolicy.workspaceIntent != taskIntent {
+					return fmt.Errorf(
+						"AgentRuntime %q profile workspace intent %q does not match Task intent %q",
+						externalRuntimePolicy.runtimeName,
+						externalRuntimePolicy.workspaceIntent,
+						taskIntent,
+					)
+				}
 			}
 			body, err := json.Marshal(req)
 			if err != nil {
@@ -604,9 +634,84 @@ func formatAge(timestamp string) string {
 }
 
 const (
-	cliProvidersAPIPath = "/api/v1/providers"
-	cliNamespaceQuery   = "namespace"
+	cliProvidersAPIPath     = "/api/v1/providers"
+	cliAgentRuntimesAPIPath = "/api/v1/agent-runtimes"
+	cliNamespaceQuery       = "namespace"
 )
+
+type resolvedAgentRuntimePolicy struct {
+	runtimeName                 string
+	allowedTools                []string
+	workspaceIntent             corev1alpha1.WorkspaceIntent
+	requireWorkspaceIntentMatch bool
+}
+
+// resolveAgentRuntimePolicy loads the task policy for a runtimeRef Agent.
+// Harness v1 requires an explicit empty task allowlist, while harness v2 uses
+// the registered MCP policy and workspace intent. A nil result means the Agent
+// is missing, built-in, or has no classified harness contract. An explicit
+// empty allowedTools result is a deny-all policy and must be serialized as [].
+func resolveAgentRuntimePolicy(ctx context.Context, c *client.Client, agentName string) (*resolvedAgentRuntimePolicy, error) {
+	agentPath := "/api/v1/agents/" + url.PathEscape(strings.TrimSpace(agentName))
+	body, _, err := c.GetRaw(ctx, agentPath, map[string]string{cliNamespaceQuery: c.Namespace})
+	if err != nil {
+		if strings.Contains(err.Error(), "HTTP 404") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q: %w", agentName, err)
+	}
+	var agent *corev1alpha1.Agent
+	if err := json.Unmarshal(body, &agent); err != nil || agent == nil || strings.TrimSpace(agent.Name) == "" {
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q: invalid Agent response", agentName)
+	}
+	if agent.Spec.Runtime == nil || agent.Spec.Runtime.RuntimeRef == nil {
+		return nil, nil
+	}
+	runtimeName := strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name)
+	if runtimeName == "" {
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q: runtimeRef.name is required", agentName)
+	}
+
+	runtimePath := cliAgentRuntimesAPIPath + "/" + url.PathEscape(runtimeName)
+	body, _, err = c.GetRaw(ctx, runtimePath, map[string]string{cliNamespaceQuery: c.Namespace})
+	if err != nil {
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q from %q: %w", agentName, runtimeName, err)
+	}
+	var runtime *corev1alpha1.AgentRuntime
+	if err := json.Unmarshal(body, &runtime); err != nil || runtime == nil || strings.TrimSpace(runtime.Name) == "" {
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q from %q: invalid AgentRuntime response", agentName, runtimeName)
+	}
+	switch runtime.RegisteredContractVersion() {
+	case corev1alpha1.AgentRuntimeContractHarnessV1:
+		return &resolvedAgentRuntimePolicy{
+			runtimeName:  runtimeName,
+			allowedTools: []string{},
+		}, nil
+	case corev1alpha1.AgentRuntimeContractHarnessV2:
+	default:
+		return nil, nil
+	}
+	if runtime.Spec.Capabilities == nil || runtime.Spec.Capabilities.MCPPolicy == nil {
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q from %q: capabilities.mcpPolicy is required", agentName, runtimeName)
+	}
+	allowedTools := runtime.Spec.Capabilities.MCPPolicy.AllowedTools
+	if allowedTools == nil {
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q from %q: capabilities.mcpPolicy.allowedTools must be an explicit list", agentName, runtimeName)
+	}
+	if runtime.Spec.Capabilities.Profile == nil {
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q from %q: capabilities.profile is required", agentName, runtimeName)
+	}
+	workspaceIntent := runtime.Spec.Capabilities.Profile.WorkspaceIntent
+	if workspaceIntent != corev1alpha1.WorkspaceIntentRead && workspaceIntent != corev1alpha1.WorkspaceIntentWrite {
+		return nil, fmt.Errorf("resolve AgentRuntime policy for --agent %q from %q: capabilities.profile.workspaceIntent must be read or write", agentName, runtimeName)
+	}
+	return &resolvedAgentRuntimePolicy{
+		runtimeName:                 runtimeName,
+		allowedTools:                append([]string{}, allowedTools...),
+		workspaceIntent:             workspaceIntent,
+		requireWorkspaceIntentMatch: true,
+	}, nil
+}
 
 // resolveAgentTaskType decides whether --agent names an ACP runtime Agent
 // (task type "agent") or a native AI Agent (task type "ai") by reading the

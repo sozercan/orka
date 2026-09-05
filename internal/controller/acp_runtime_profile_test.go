@@ -85,6 +85,35 @@ func TestEffectiveACPAllowedToolsPreservesOpenCodeExplicitEmptyChildPolicy(t *te
 	}
 }
 
+func TestEffectiveACPAllowedToolsUsesMaterializedRuntimeRefPolicyForDelegatedChild(t *testing.T) {
+	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
+		RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-runtime"},
+	}}}
+	for _, tt := range []struct {
+		name    string
+		allowed []string
+	}{
+		{name: "registered messaging tools", allowed: []string{"check_messages", "send_message"}},
+		{name: "registered deny all", allowed: []string{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &corev1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labels.LabelParentTask: "parent"}},
+				Spec: corev1alpha1.TaskSpec{AgentRuntime: &corev1alpha1.AgentRuntimeSpec{
+					AllowedTools: append([]string{}, tt.allowed...),
+				}},
+			}
+			got := effectiveACPAllowedTools(task, agent)
+			if !slices.Equal(got, tt.allowed) {
+				t.Fatalf("effectiveACPAllowedTools() = %#v, want %#v", got, tt.allowed)
+			}
+			if got == nil {
+				t.Fatal("effectiveACPAllowedTools() = nil, want explicit list")
+			}
+		})
+	}
+}
+
 func TestPlanACPRuntimeHashesNormalizedDenyOnlyProviderNativePolicy(t *testing.T) {
 	tests := []struct {
 		name           string

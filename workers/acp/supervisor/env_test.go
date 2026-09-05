@@ -199,6 +199,52 @@ func TestClaudeProviderSessionProjection(t *testing.T) {
 	}
 }
 
+func TestClaudeProviderEffortProjection(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		model  string
+		effort string
+	}{
+		{name: "gateway model default", model: "claude-haiku-4.5"},
+		{name: "canonical non-effort model", model: "claude-haiku-4-5"},
+		{name: "recognized effort model default", model: "claude-sonnet-4-6"},
+		{name: "explicit medium", model: "claude-sonnet-4-6", effort: "medium"},
+		{name: "explicit max", model: "claude-opus-4-6", effort: "max"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			paths := acp.SessionPaths{Home: "/sessions/private/home"}
+			proxy := ProviderProxyBinding{BaseURL: "http://127.0.0.1:43210/_orka/provider/session", Credential: "test-auth-token"}
+			claude, err := providerProfile(providerKindClaude, tt.model, harnessv2.WorkspaceIntentRead)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := testProviderProjectionRequest(t, providerKindClaude, tt.model, "", tt.effort, nil, nil, true)
+			projection, err := claude.ProjectSession(request, paths, proxy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			environment, err := claude.EnvironmentForSession(request, paths, proxy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			maps.Copy(environment, projection.Environment)
+			if environment["ANTHROPIC_MODEL"] != tt.model {
+				t.Fatalf("model changed to %q", environment["ANTHROPIC_MODEL"])
+			}
+			options := projection.NewSessionMeta["claudeCode"].(map[string]any)["options"].(map[string]any)
+			if tt.effort == "" {
+				if _, ok := options["effort"]; ok || environment["CLAUDE_CODE_EFFORT_LEVEL"] != "unset" {
+					t.Fatal("unspecified effort must suppress the CLI default without adding SDK effort")
+				}
+			} else {
+				if _, ok := environment["CLAUDE_CODE_EFFORT_LEVEL"]; ok || options["effort"] != tt.effort {
+					t.Fatalf("explicit effort %q must reach the SDK without an environment override", tt.effort)
+				}
+			}
+		})
+	}
+}
+
 func TestCopilotProviderSessionProjection(t *testing.T) {
 	paths := acp.SessionPaths{Home: "/sessions/private/home"}
 	proxy := ProviderProxyBinding{BaseURL: "http://127.0.0.1:43210/_orka/provider/session", Credential: "test-auth-token"}
@@ -463,6 +509,28 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		copilotCfg.Capabilities.AdapterDigests["copilot-cli-linux-arm64"] != "sha256:"+acp.CopilotCLILinuxARM64SHA256 {
 		t.Fatalf("unexpected Copilot adapter digests: %#v", copilotCfg.Capabilities.AdapterDigests)
 	}
+
+	t.Setenv(EnvProvider, providerKindAgentKit)
+	t.Setenv(EnvAgentKitAdapterDigest, testAgentKitAdapterDigest)
+	agentKitCfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agentKitCfg.Provider.Kind != providerKindAgentKit || agentKitCfg.Provider.AdapterName != agentKitAdapterName ||
+		agentKitCfg.Provider.AdapterDigest != testAgentKitAdapterDigest ||
+		len(agentKitCfg.Capabilities.AdapterDigests) != 1 ||
+		agentKitCfg.Capabilities.AdapterDigests[agentKitAdapterName] != testAgentKitAdapterDigest {
+		t.Fatalf("unexpected AgentKit provider: provider=%#v capabilities=%#v", agentKitCfg.Provider, agentKitCfg.Capabilities)
+	}
+	if agentKitCfg.ProviderProxy.UpstreamBaseURL != "http://vekil.vekil-system.svc:1337/v1" {
+		t.Fatalf("AgentKit provider proxy base URL = %q", agentKitCfg.ProviderProxy.UpstreamBaseURL)
+	}
+	if agentKitCfg.Capabilities.SupportsAgentSessionConfiguration ||
+		agentKitCfg.Capabilities.Provider.SupportsImages || agentKitCfg.Capabilities.Provider.SupportsAudio ||
+		agentKitCfg.Capabilities.Provider.SupportsEmbeddedResources ||
+		agentKitCfg.Capabilities.Provider.SupportsPermissions || !agentKitCfg.Capabilities.Provider.SupportsTools {
+		t.Fatalf("unexpected AgentKit provider capabilities: %#v", agentKitCfg.Capabilities.Provider)
+	}
 }
 
 func TestLoadConfigFromEnvBootstrapSecrets(t *testing.T) {
@@ -537,6 +605,7 @@ func TestDefaultProtocolLimitsUseProviderSpecificUpdateRates(t *testing.T) {
 		{provider: providerKindClaude, want: runtimeMaxUpdateEventsPerSecond},
 		{provider: providerKindCopilot, want: runtimeMaxUpdateEventsPerSecond},
 		{provider: providerKindOpencode, want: runtimeMaxUpdateEventsPerSecond},
+		{provider: providerKindAgentKit, want: runtimeMaxUpdateEventsPerSecond},
 	}
 	for _, test := range tests {
 		t.Run(test.provider, func(t *testing.T) {
@@ -553,6 +622,9 @@ func TestProviderUpstreamBaseURLPreservesProviderSemantics(t *testing.T) {
 	}
 	if got := providerUpstreamBaseURL(providerKindCopilot, "http://vekil:1337/v1"); got != "http://vekil:1337/v1" {
 		t.Fatalf("Copilot upstream base URL = %q", got)
+	}
+	if got := providerUpstreamBaseURL(providerKindAgentKit, "http://vekil:1337"); got != "http://vekil:1337/v1" {
+		t.Fatalf("AgentKit upstream base URL = %q", got)
 	}
 	if got := providerUpstreamBaseURL("claude", "http://vekil:1337/"); got != "http://vekil:1337" {
 		t.Fatalf("Claude upstream base URL = %q", got)

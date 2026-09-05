@@ -13,6 +13,10 @@ import (
 func TestTaskCreateWritesCanonicalWorkspaceCredentialRoles(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/agents/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
@@ -73,6 +77,10 @@ func TestTaskCreateWritesCanonicalWorkspaceCredentialRoles(t *testing.T) {
 func TestTaskCreateLeavesCredentialKeyOmittedForAPIDefault(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/agents/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
@@ -102,6 +110,10 @@ func TestTaskCreateLeavesCredentialKeyOmittedForAPIDefault(t *testing.T) {
 func TestTaskCreateOmitsWorkspaceForPromptOnlyAgentTask(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/agents/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
@@ -126,6 +138,10 @@ func TestTaskCreateOmitsWorkspaceForPromptOnlyAgentTask(t *testing.T) {
 func TestTaskCreateOmitsWorkspaceForExplicitReadIntentWithoutFields(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/agents/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
@@ -305,6 +321,10 @@ func TestTaskCreateRejectsMismatchedRepositoryIdentitiesAndInvalidPublicationBra
 func TestTaskCreateCanonicalizesSSHRepositoryURL(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/agents/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}

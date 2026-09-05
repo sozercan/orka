@@ -114,6 +114,265 @@ func TestACPArtifactAuthorizationBrokerIssuesExactUploadCapability(t *testing.T)
 	}
 }
 
+func TestACPArtifactAuthorizationBrokerExternalRuntimeUsesFrozenAuthority(t *testing.T) {
+	const maxWorkspaceDeltaBytes = int64(16)
+	tests := []struct {
+		name                    string
+		rotateSecrets           bool
+		draining                bool
+		frozenMaxWorkspaceBytes int64
+		artifactSizeBytes       int64
+		wantStatus              int
+	}{
+		{
+			name: "artifact at frozen byte limit", frozenMaxWorkspaceBytes: maxWorkspaceDeltaBytes,
+			artifactSizeBytes: maxWorkspaceDeltaBytes, wantStatus: http.StatusOK,
+		},
+		{
+			name: "draining runtime with exact frozen authority", draining: true,
+			frozenMaxWorkspaceBytes: maxWorkspaceDeltaBytes, artifactSizeBytes: maxWorkspaceDeltaBytes,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "artifact exceeds frozen byte limit", frozenMaxWorkspaceBytes: maxWorkspaceDeltaBytes,
+			artifactSizeBytes: maxWorkspaceDeltaBytes + 1, wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "invalid zero frozen byte limit", frozenMaxWorkspaceBytes: 0,
+			artifactSizeBytes: 1, wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "post-binding Secret rotation", rotateSecrets: true,
+			frozenMaxWorkspaceBytes: maxWorkspaceDeltaBytes, artifactSizeBytes: maxWorkspaceDeltaBytes,
+			wantStatus: http.StatusForbidden,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExternalArtifactAuthorizationFixture(
+				t, test.rotateSecrets, test.draining, test.frozenMaxWorkspaceBytes, test.artifactSizeBytes,
+			)
+			response, err := fixture.server.app.Test(fixture.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.StatusCode, test.wantStatus)
+			}
+			wantReservations := 0
+			if test.wantStatus == http.StatusOK {
+				wantReservations = 1
+			}
+			if len(fixture.reservations.requests) != wantReservations {
+				t.Fatalf("capability reservations = %d, want %d", len(fixture.reservations.requests), wantReservations)
+			}
+		})
+	}
+}
+
+type externalArtifactAuthorizationFixture struct {
+	server       *Server
+	request      *http.Request
+	reservations *recordingCapabilityReservations
+}
+
+func newExternalArtifactAuthorizationFixture(
+	t *testing.T,
+	rotateSecrets bool,
+	draining bool,
+	frozenMaxWorkspaceBytes int64,
+	artifactSizeBytes int64,
+) externalArtifactAuthorizationFixture {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		namespace       = "default"
+		runtimeName     = "external-v2"
+		runtimeUID      = "external-runtime-uid"
+		externalPoolUID = "external-pool-uid"
+		controllerName  = "external-controller-auth"
+		controllerKey   = "token"
+		capabilityName  = "external-capability-auth"
+		capabilityKey   = "secret"
+	)
+	profileDigest := "sha256:" + strings.Repeat("b", 64)
+	contract := corev1alpha1.AgentRuntimeContractHarnessV2
+	governance := &corev1alpha1.AgentRuntimeWorkspaceGovernanceCapabilities{
+		Mode:                     corev1alpha1.AgentRuntimeWorkspaceGovernanceStrict,
+		OrkaOwnedWorkspaceDeltas: true, PromptScopedBrokerAuthorization: true,
+		NoDirectSCMPublication: true, OrkaOwnedCleanRoomPublication: true,
+		ExactInstanceFencing: true, DuplicateSafeMutations: true, CancellationSettlement: true,
+	}
+	runtimeObject := &corev1alpha1.AgentRuntime{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: runtimeName, UID: runtimeUID, Generation: 1},
+		Spec: corev1alpha1.AgentRuntimeRegistrySpec{
+			ContractVersion: &contract,
+			Deployment: corev1alpha1.AgentRuntimeDeploymentSpec{
+				Mode: corev1alpha1.AgentRuntimeDeploymentModeExternalEndpoint, Endpoint: "https://runtime.example",
+			},
+			ClientAuth: corev1alpha1.AgentRuntimeClientAuth{
+				ControllerBearerTokenSecretRef: &corev1alpha1.AgentRuntimeSecretKeyReference{Name: controllerName, Key: controllerKey},
+				OperationCapabilitySecretRef:   &corev1alpha1.AgentRuntimeSecretKeyReference{Name: capabilityName, Key: capabilityKey},
+			},
+			Capabilities: &corev1alpha1.AgentRuntimeCapabilitiesSpec{
+				RuntimeInstanceID: "runtime-1",
+				Profile: &corev1alpha1.AgentRuntimeProfileSpec{
+					Digest: profileDigest, DigestSchemaVersion: int32(harnessv2.ProfileDigestSchemaVersion),
+					WorkspaceIntent: corev1alpha1.WorkspaceIntentWrite,
+				},
+				WorkspaceGovernance: governance, SupportsPublicationFinalization: true,
+			},
+		},
+		Status: corev1alpha1.AgentRuntimeStatus{
+			Ready: true, ObservedGeneration: 1,
+			ObservedControllerAuthRefResourceVersion:      "1",
+			ObservedOperationCapabilityRefResourceVersion: "1",
+			ObservedCapabilities: &corev1alpha1.AgentRuntimeObservedCapabilities{
+				ProtocolVersion: harnessv2.ProtocolVersion, RuntimeInstanceID: "runtime-1", SupervisorBootID: "boot-1",
+				ControllerEpoch: 1, RuntimePoolUID: externalPoolUID, RuntimePoolGeneration: 1,
+				RuntimeProfileDigest: profileDigest, ProfileDigestSchemaVersion: int32(harnessv2.ProfileDigestSchemaVersion),
+				SupportsPublicationFinalization: true,
+			},
+		},
+	}
+	controllerToken := []byte(strings.Repeat("t", 32))
+	operationSecret := []byte(strings.Repeat("s", 32))
+	controllerSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: controllerName, UID: "controller-secret-uid", ResourceVersion: "1"},
+		Data:       map[string][]byte{controllerKey: controllerToken},
+	}
+	capabilitySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: capabilityName, UID: "capability-secret-uid", ResourceVersion: "1"},
+		Data:       map[string][]byte{capabilityKey: operationSecret},
+	}
+
+	taskUID := types.UID("external-task-uid")
+	frozenLimits := harnessv2.DefaultProtocolLimits()
+	frozenLimits.MaxWorkspaceDeltaBytes = frozenMaxWorkspaceBytes
+	frozen := acpArtifactExecutionSnapshot{
+		SchemaVersion:   store.AgentExecutionSnapshotSchemaVersion,
+		ContractVersion: string(corev1alpha1.AgentRuntimeContractHarnessV2),
+		Backend:         string(corev1alpha1.AgentExecutionBackendExternalEndpoint), ProfileDigest: profileDigest,
+		ExternalRuntime: &acpArtifactExternalRuntimeExecutionSnapshot{
+			Namespace: namespace, Endpoint: runtimeObject.Spec.Deployment.Endpoint, RuntimeInstanceID: "runtime-1",
+			Limits: frozenLimits, SupportsPublicationFinalization: true,
+			ControllerAuth: acpArtifactExecutionSnapshotSecretRef{
+				Role: "controller-auth", Namespace: namespace, Name: controllerName,
+				UID: string(controllerSecret.UID), ResourceVersion: controllerSecret.ResourceVersion, Keys: []string{controllerKey},
+			},
+			OperationCapability: acpArtifactExecutionSnapshotSecretRef{
+				Role: "operation-capability", Namespace: namespace, Name: capabilityName,
+				UID: string(capabilitySecret.UID), ResourceVersion: capabilitySecret.ResourceVersion, Keys: []string{capabilityKey},
+			},
+		},
+	}
+	snapshotBody, err := harnessv2.CanonicalValue(frozen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotDigest := store.CanonicalAgentExecutionSnapshotDigest(snapshotBody)
+	task := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "external-task", UID: taskUID, Generation: 1},
+		Status: corev1alpha1.TaskStatus{
+			AgentExecutionBinding: &corev1alpha1.AgentExecutionBinding{
+				SchemaVersion: 1, ContractVersion: corev1alpha1.AgentRuntimeContractHarnessV2,
+				Backend: corev1alpha1.AgentExecutionBackendExternalEndpoint,
+				Task:    corev1alpha1.AgentExecutionBindingTaskRef{UID: taskUID, BoundSpecGeneration: 1},
+				Snapshot: corev1alpha1.AgentExecutionSnapshotRef{
+					ID:     (store.AgentExecutionSnapshotKey{TaskUID: string(taskUID), Digest: snapshotDigest}).ID(),
+					Digest: snapshotDigest, SchemaVersion: store.AgentExecutionSnapshotSchemaVersion,
+				},
+				RuntimeRef:           &corev1alpha1.AgentExecutionRuntimeRef{Name: runtimeName, UID: runtimeUID, Generation: 1},
+				RuntimeProfileDigest: profileDigest, RuntimeProfileDigestSchemaVersion: int32(harnessv2.ProfileDigestSchemaVersion),
+			},
+			Execution: &corev1alpha1.TaskExecutionStatus{
+				State: corev1alpha1.TaskExecutionStateRunning, Attempt: 1, PromptID: "prompt-1",
+				AgentRuntimeName: runtimeName, AgentRuntimeUID: runtimeUID, RuntimeInstanceID: "runtime-1",
+				RuntimeSessionUID: "session-1", RuntimeSessionGeneration: 1, ControllerEpoch: 1,
+			},
+		},
+	}
+	snapshotStore := &fixedAgentExecutionSnapshotStore{snapshot: &store.AgentExecutionSnapshot{
+		TaskUID: string(taskUID), Digest: snapshotDigest, SchemaVersion: store.AgentExecutionSnapshotSchemaVersion, Body: snapshotBody,
+	}}
+	if rotateSecrets {
+		controllerToken = []byte(strings.Repeat("r", 32))
+		operationSecret = []byte(strings.Repeat("n", 32))
+		controllerSecret.UID = "rotated-controller-secret-uid"
+		controllerSecret.ResourceVersion = "2"
+		controllerSecret.Data[controllerKey] = controllerToken
+		capabilitySecret.UID = "rotated-capability-secret-uid"
+		capabilitySecret.ResourceVersion = "2"
+		capabilitySecret.Data[capabilityKey] = operationSecret
+		runtimeObject.Status.ObservedControllerAuthRefResourceVersion = "2"
+		runtimeObject.Status.ObservedOperationCapabilityRefResourceVersion = "2"
+	}
+	if draining {
+		runtimeObject.Status.Ready = false
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(runtimeObject, controllerSecret, capabilitySecret, task).Build()
+	reservations := &recordingCapabilityReservations{}
+	app := fiber.New()
+	server := &Server{app: app, client: kubeClient, config: ServerConfig{
+		APIReader: kubeClient, ArtifactReservations: reservations, AgentExecutionSnapshots: snapshotStore,
+		ControllerEpochs: publisherEpochSourceForTest(),
+	}}
+	server.installACPArtifactAuthorizationBroker()
+
+	artifactSecret := []byte(strings.Repeat("a", 32))
+	writeAPISecretFile(t, envACPArtifactSecretFile, "external-artifact", artifactSecret)
+	artifactData := bytes.Repeat([]byte("d"), int(artifactSizeBytes))
+	digest := artifactcap.DigestBytes(artifactData)
+	artifactID, err := artifactcap.ArtifactIDForDigest(digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := harnessv2.MutationMetadata{
+		Fence: harnessv2.Fence{
+			RuntimeInstanceID: "runtime-1", SupervisorBootID: "boot-1", ControllerEpoch: 1,
+			RuntimePoolUID: externalPoolUID, RuntimePoolGeneration: 1,
+			RuntimeSessionUID: "session-1", RuntimeSessionGeneration: 1,
+			RuntimeProfileDigest: harnessv2.ProfileDigest(profileDigest), ProfileDigestSchemaVersion: harnessv2.ProfileDigestSchemaVersion,
+		},
+		TaskUID: harnessv2.TaskUID(taskUID), TaskAttempt: 1, PromptID: "prompt-1", OperationID: "authorize-external-delta-1",
+		RequestDigestSchemaVersion: harnessv2.RequestDigestSchemaVersion, ExpiresAt: time.Now().UTC().Add(time.Minute),
+	}
+	requestBody := acpArtifactAuthorizationRequest{
+		Namespace: namespace, Metadata: metadata,
+		Artifact: harnessv2.ArtifactReference{
+			ArtifactID: harnessv2.ArtifactID(artifactID), Digest: digest,
+			SizeBytes: int64(len(artifactData)), MediaType: artifactcap.MediaTypeWorkspaceDelta,
+		},
+	}
+	requestDigest, err := harnessv2.CanonicalRequestDigest(requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBody.Metadata.RequestDigest = requestDigest
+	capability, err := harnessv2.SignOperationCapability(operationSecret, harnessv2.ClaimsForMutation(requestBody.Metadata))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpRequest := httptest.NewRequest(http.MethodPost, acpArtifactAuthorizationPath, bytes.NewReader(body))
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Authorization", "Bearer "+string(controllerToken))
+	httpRequest.Header.Set(harnessv2.OperationCapabilityHeader, capability)
+	httpRequest.Header.Set(harnessv2.MCPBrokerPoolNamespaceHeader, namespace)
+	httpRequest.Header.Set(harnessv2.MCPBrokerPoolUIDHeader, externalPoolUID)
+	return externalArtifactAuthorizationFixture{server: server, request: httpRequest, reservations: reservations}
+}
+
 func TestACPArtifactAuthorizationBrokerAuthenticatesBeforeBody(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1alpha1.AddToScheme(scheme); err != nil {
@@ -1005,6 +1264,41 @@ func publisherEffectReaderForTest(effects ...*corev1alpha1.ExternalEffect) store
 type fixedControllerEpochFenceSource struct {
 	fence store.ControllerEpochFence
 	err   error
+}
+
+type fixedAgentExecutionSnapshotStore struct {
+	snapshot *store.AgentExecutionSnapshot
+	err      error
+}
+
+func (s *fixedAgentExecutionSnapshotStore) PersistAgentExecutionSnapshot(context.Context, store.AgentExecutionSnapshot) error {
+	return errors.New("unexpected snapshot persistence")
+}
+
+func (s *fixedAgentExecutionSnapshotStore) GetAgentExecutionSnapshot(
+	_ context.Context,
+	key store.AgentExecutionSnapshotKey,
+) (*store.AgentExecutionSnapshot, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.snapshot == nil || s.snapshot.TaskUID != key.TaskUID || s.snapshot.Digest != key.Digest {
+		return nil, store.ErrNotFound
+	}
+	copy := *s.snapshot
+	copy.Body = append([]byte(nil), s.snapshot.Body...)
+	return &copy, nil
+}
+
+func (s *fixedAgentExecutionSnapshotStore) ListAgentExecutionSnapshotKeys(
+	context.Context,
+	string,
+) ([]store.AgentExecutionSnapshotKey, error) {
+	return nil, errors.New("unexpected snapshot listing")
+}
+
+func (s *fixedAgentExecutionSnapshotStore) DeleteAgentExecutionSnapshots(context.Context, string) error {
+	return errors.New("unexpected snapshot deletion")
 }
 
 type failingPublisherAuthorizationReader struct {

@@ -42,7 +42,7 @@ func setupTestOpenAIHandler(objs ...runtime.Object) (*OpenAICompatHandler, *fibe
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 	config := DefaultChatConfig()
 	resolver := NewProviderResolver(fakeClient, config)
-	handler := NewOpenAICompatHandler(fakeClient, "default", false, config, resolver, nil)
+	handler := NewOpenAICompatHandler(fakeClient, nil, "default", false, config, resolver, nil)
 
 	app := fiber.New()
 	return handler, app

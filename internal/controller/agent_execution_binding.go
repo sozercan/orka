@@ -29,6 +29,7 @@ import (
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/tools"
 )
 
 // The binding stage implements the coexistence plan's write-once execution
@@ -38,6 +39,25 @@ import (
 // a controller that cannot prove either one never queues executor demand.
 
 const agentExecutionBindingConflictReason = "BindingConflict"
+
+var errExternalAgentRuntimeMCPToolDescriptorsNotConformed = errors.New("external AgentRuntime MCP tool descriptors do not match current conformance")
+
+type frozenExternalRuntimeBindingDriftError struct{ err error }
+
+func (e *frozenExternalRuntimeBindingDriftError) Error() string { return e.err.Error() }
+func (e *frozenExternalRuntimeBindingDriftError) Unwrap() error { return e.err }
+
+func frozenExternalRuntimeBindingDrift(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &frozenExternalRuntimeBindingDriftError{err: err}
+}
+
+func isFrozenExternalRuntimeBindingDrift(err error) bool {
+	var drift *frozenExternalRuntimeBindingDriftError
+	return errors.As(err, &drift)
+}
 
 // agentExecutionCandidate is the pure resolution product: the prospective
 // binding plus the plaintext snapshot body it references. Resolution performs
@@ -52,28 +72,46 @@ type agentExecutionCandidate struct {
 // record frozen into the immutable snapshot. Credentials remain references
 // only; raw credential values and TxTokens never enter this structure.
 type agentExecutionSnapshotBody struct {
-	SchemaVersion    int32                             `json:"schemaVersion"`
-	ContractVersion  string                            `json:"contractVersion"`
-	Backend          string                            `json:"backend"`
-	RuntimeType      string                            `json:"runtimeType"`
-	Agent            agentExecutionSnapshotAgent       `json:"agent"`
-	Configuration    agentExecutionSnapshotConfig      `json:"configuration"`
-	RuntimeImage     string                            `json:"runtimeImage"`
-	RuntimeProfile   harnessv2.RuntimeProfile          `json:"runtimeProfile"`
-	ProfileDigest    string                            `json:"profileDigest"`
-	PoolName         string                            `json:"poolName"`
-	MCPConfiguration *harnessv2.MCPPolicyConfiguration `json:"mcpConfiguration,omitempty"`
-	Prompt           string                            `json:"prompt"`
-	Timeout          string                            `json:"timeout,omitempty"`
-	RetryPolicy      *corev1alpha1.RetryPolicy         `json:"retryPolicy,omitempty"`
-	SessionRef       *corev1alpha1.SessionReference    `json:"sessionRef,omitempty"`
-	Workspace        *corev1alpha1.WorkspaceConfig     `json:"workspace,omitempty"`
-	RuntimeOverride  *corev1alpha1.AgentRuntimeSpec    `json:"runtimeOverride,omitempty"`
-	DefaultTools     *agentExecutionSnapshotToolPolicy `json:"defaultTools,omitempty"`
-	HarnessV1        *agentExecutionSnapshotHarnessV1  `json:"harnessV1,omitempty"`
+	SchemaVersion    int32                                  `json:"schemaVersion"`
+	ContractVersion  string                                 `json:"contractVersion"`
+	Backend          string                                 `json:"backend"`
+	RuntimeType      string                                 `json:"runtimeType"`
+	Agent            agentExecutionSnapshotAgent            `json:"agent"`
+	Configuration    agentExecutionSnapshotConfig           `json:"configuration"`
+	RuntimeImage     string                                 `json:"runtimeImage"`
+	RuntimeProfile   harnessv2.RuntimeProfile               `json:"runtimeProfile"`
+	ProfileDigest    string                                 `json:"profileDigest"`
+	PoolName         string                                 `json:"poolName"`
+	MCPConfiguration *harnessv2.MCPPolicyConfiguration      `json:"mcpConfiguration,omitempty"`
+	Prompt           string                                 `json:"prompt"`
+	Timeout          string                                 `json:"timeout,omitempty"`
+	RetryPolicy      *corev1alpha1.RetryPolicy              `json:"retryPolicy,omitempty"`
+	SessionRef       *corev1alpha1.SessionReference         `json:"sessionRef,omitempty"`
+	Workspace        *corev1alpha1.WorkspaceConfig          `json:"workspace,omitempty"`
+	RuntimeOverride  *corev1alpha1.AgentRuntimeSpec         `json:"runtimeOverride,omitempty"`
+	DefaultTools     *agentExecutionSnapshotToolPolicy      `json:"defaultTools,omitempty"`
+	HarnessV1        *agentExecutionSnapshotHarnessV1       `json:"harnessV1,omitempty"`
+	ExternalRuntime  *agentExecutionSnapshotExternalRuntime `json:"externalRuntime,omitempty"`
 	// ExecutionWorkspace freezes the resolved execution-workspace binding for
 	// workspace-provider-backed RuntimePools. It is absent for plain pools.
 	ExecutionWorkspace *agentExecutionSnapshotWorkspaceBinding `json:"executionWorkspace,omitempty"`
+}
+
+// agentExecutionSnapshotExternalRuntime freezes the non-secret registration
+// and authentication authority used by one external v2 binding. The runtime's
+// live status fence is re-read immediately before dispatch because controller
+// epochs and supervisor boots may change without changing the registered
+// endpoint or profile.
+type agentExecutionSnapshotExternalRuntime struct {
+	Namespace                       string                                    `json:"namespace"`
+	Endpoint                        string                                    `json:"endpoint"`
+	RuntimeInstanceID               string                                    `json:"runtimeInstanceID"`
+	Limits                          harnessv2.ProtocolLimits                  `json:"limits"`
+	WorkspaceGovernance             harnessv2.WorkspaceGovernanceCapabilities `json:"workspaceGovernance"`
+	SupportsDrain                   bool                                      `json:"supportsDrain"`
+	SupportsPublicationFinalization bool                                      `json:"supportsPublicationFinalization"`
+	ControllerAuth                  agentExecutionSnapshotSecretRef           `json:"controllerAuth"`
+	OperationCapability             agentExecutionSnapshotSecretRef           `json:"operationCapability"`
 }
 
 // agentExecutionSnapshotWorkspaceBinding freezes the canonical, provider-neutral
@@ -209,6 +247,7 @@ type verifiedAgentExecution struct {
 	promptAttempt    *store.PromptAttempt
 	body             agentExecutionSnapshotBody
 	plan             ACPRuntimePlan
+	externalRuntime  *corev1alpha1.AgentRuntime
 	frozenTask       *corev1alpha1.Task
 	configuration    harnessv2.AgentSessionConfiguration
 	mcpConfiguration harnessv2.MCPPolicyConfiguration
@@ -237,6 +276,13 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 	}
 	if task == nil || task.UID == "" || task.Generation < 1 {
 		return nil, errors.New("task UID and positive spec generation are required for execution binding")
+	}
+	if agent != nil && agent.Spec.Runtime != nil && agent.Spec.Runtime.RuntimeRef != nil &&
+		strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name) != "" {
+		if strings.TrimSpace(workspaceSessionUID) != "" || taskRequestsExecutionWorkspace(task) {
+			return nil, permanentACPAgentConfiguration(errors.New("external v2 AgentRuntime bindings do not support Task.spec.execution.workspace"))
+		}
+		return r.resolveExternalAgentExecutionCandidate(ctx, task, agent)
 	}
 	reader := r.APIReader
 	if reader == nil {
@@ -428,6 +474,224 @@ func (r *TaskReconciler) resolveAgentExecutionCandidateWithWorkspaceSessionUID(
 	}, nil
 }
 
+func (r *TaskReconciler) resolveExternalAgentExecutionCandidate(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	agent *corev1alpha1.Agent,
+) (*agentExecutionCandidate, error) {
+	if task == nil || task.UID == "" || task.Generation < 1 || agent == nil || agent.UID == "" || agent.Generation < 1 {
+		return nil, errors.New("task and Agent immutable identities are required for an external v2 binding")
+	}
+	if agent.Spec.Runtime == nil || agent.Spec.Runtime.RuntimeRef == nil || strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name) == "" {
+		return nil, permanentACPAgentConfiguration(errors.New("external v2 binding requires Agent.spec.runtime.runtimeRef"))
+	}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if reader == nil {
+		return nil, errors.New("API reader is required for external v2 binding")
+	}
+
+	namespace := &corev1.Namespace{}
+	if err := reader.Get(ctx, types.NamespacedName{Name: task.Namespace}, namespace); err != nil {
+		return nil, fmt.Errorf("resolve Task namespace identity: %w", err)
+	}
+	runtime := &corev1alpha1.AgentRuntime{}
+	runtimeName := strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name)
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: runtimeName}, runtime); err != nil {
+		return nil, fmt.Errorf("resolve external AgentRuntime %q: %w", runtimeName, err)
+	}
+	if runtime.UID == "" || runtime.Generation < 1 {
+		return nil, errors.New("external AgentRuntime immutable identity is incomplete")
+	}
+	profile, external, err := r.resolveExternalAgentRuntimeSnapshot(ctx, task, runtime)
+	if err != nil {
+		return nil, err
+	}
+	registry := r.MCPRegistry
+	if registry == nil {
+		registry = tools.DefaultRegistry
+	}
+	mcpConfiguration, err := buildExternalRuntimeSessionMCPConfigurationWithRegistry(
+		ctx, reader, task, agent, runtime, profile, registry,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve frozen external v2 MCP configuration: %w", err)
+	}
+	if runtime.Status.ObservedCapabilities.MCPToolDescriptorDigest != mcpConfiguration.ToolPolicy.DescriptorDigest {
+		return nil, errors.New("external AgentRuntime MCP tool descriptors have not passed current conformance")
+	}
+
+	body := agentExecutionSnapshotBody{
+		SchemaVersion:   store.AgentExecutionSnapshotSchemaVersion,
+		ContractVersion: string(corev1alpha1.AgentRuntimeContractHarnessV2),
+		Backend:         string(corev1alpha1.AgentExecutionBackendExternalEndpoint),
+		Agent: agentExecutionSnapshotAgent{
+			Namespace: agent.Namespace, Name: agent.Name, UID: string(agent.UID), Generation: agent.Generation,
+		},
+		RuntimeProfile:   profile,
+		ProfileDigest:    runtime.Spec.Capabilities.Profile.Digest,
+		MCPConfiguration: &mcpConfiguration,
+		Prompt:           task.Spec.Prompt,
+		RetryPolicy:      task.Spec.RetryPolicy.DeepCopy(),
+		SessionRef:       task.Spec.SessionRef.DeepCopy(),
+		Workspace:        task.Spec.Workspace.DeepCopy(),
+		RuntimeOverride:  task.Spec.AgentRuntime.DeepCopy(),
+		ExternalRuntime:  external,
+	}
+	if task.Spec.Timeout != nil {
+		body.Timeout = task.Spec.Timeout.Duration.String()
+	}
+	if agent.Spec.Runtime.DefaultAllowedTools != nil || agent.Spec.Runtime.DefaultAllowBash != nil {
+		body.DefaultTools = &agentExecutionSnapshotToolPolicy{
+			AllowedToolsOmitted: agent.Spec.Runtime.DefaultAllowedTools == nil,
+			AllowedTools:        append([]string(nil), agent.Spec.Runtime.DefaultAllowedTools...),
+			AllowBash:           agent.Spec.Runtime.DefaultAllowBash,
+		}
+	}
+	encoded, err := canonicalAgentExecutionSnapshotBody(body)
+	if err != nil {
+		return nil, err
+	}
+	snapshotDigest := store.CanonicalAgentExecutionSnapshotDigest(encoded)
+	binding := corev1alpha1.AgentExecutionBinding{
+		SchemaVersion:   1,
+		ContractVersion: corev1alpha1.AgentRuntimeContractHarnessV2,
+		Backend:         corev1alpha1.AgentExecutionBackendExternalEndpoint,
+		Task: corev1alpha1.AgentExecutionBindingTaskRef{
+			NamespaceUID: namespace.UID, UID: task.UID, BoundSpecGeneration: task.Generation,
+		},
+		Agent: &corev1alpha1.AgentExecutionAgentRef{
+			Namespace: agent.Namespace, Name: agent.Name, UID: agent.UID, Generation: agent.Generation,
+		},
+		Snapshot: corev1alpha1.AgentExecutionSnapshotRef{
+			ID: string(task.UID) + "/" + snapshotDigest, Digest: snapshotDigest,
+			SchemaVersion: store.AgentExecutionSnapshotSchemaVersion,
+		},
+		RuntimeRef: &corev1alpha1.AgentExecutionRuntimeRef{
+			Name: runtime.Name, UID: runtime.UID, Generation: runtime.Generation,
+		},
+		RuntimeProfileDigest:              runtime.Spec.Capabilities.Profile.Digest,
+		RuntimeProfileDigestSchemaVersion: int32(harnessv2.ProfileDigestSchemaVersion),
+	}
+	binding.BindingDigest, err = canonicalAgentExecutionBindingDigest(binding)
+	if err != nil {
+		return nil, err
+	}
+	binding.BoundAt = metav1.Now()
+	return &agentExecutionCandidate{binding: binding, snapshotBody: encoded}, nil
+}
+
+//nolint:gocyclo // External runtime admission keeps every registered, observed, and secret-authority check in one fail-closed boundary.
+func (r *TaskReconciler) resolveExternalAgentRuntimeSnapshot(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	runtime *corev1alpha1.AgentRuntime,
+) (harnessv2.RuntimeProfile, *agentExecutionSnapshotExternalRuntime, error) {
+	return r.resolveExternalAgentRuntimeSnapshotWithReadyRequirement(ctx, task, runtime, true)
+}
+
+//nolint:gocyclo // This keeps the existing fail-closed registration, observation, epoch, and Secret checks in one boundary while varying only admission readiness.
+func (r *TaskReconciler) resolveExternalAgentRuntimeSnapshotWithReadyRequirement(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	runtime *corev1alpha1.AgentRuntime,
+	requireReady bool,
+) (harnessv2.RuntimeProfile, *agentExecutionSnapshotExternalRuntime, error) {
+	if runtime == nil {
+		return harnessv2.RuntimeProfile{}, nil, errors.New("external AgentRuntime is required")
+	}
+	if err := validateAgentRuntimeSpec(runtime); err != nil {
+		return harnessv2.RuntimeProfile{}, nil, permanentACPAgentConfiguration(err)
+	}
+	if err := externalAgentRuntimeConformanceError(task, runtime, requireReady); err != nil {
+		return harnessv2.RuntimeProfile{}, nil, err
+	}
+	capabilities := runtime.Spec.Capabilities
+	observed := runtime.Status.ObservedCapabilities
+	if capabilities == nil || capabilities.Profile == nil || capabilities.Limits == nil ||
+		capabilities.WorkspaceGovernance == nil || observed == nil || observed.Limits == nil || observed.WorkspaceGovernance == nil {
+		return harnessv2.RuntimeProfile{}, nil, errors.New("external AgentRuntime current-generation conformance record is incomplete")
+	}
+	currentFence, err := r.ControllerEpochManager.CurrentFence(ctx)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, nil, fmt.Errorf("resolve current controller epoch for external AgentRuntime binding: %w", err)
+	}
+	if observed.ControllerEpoch != currentFence.Epoch {
+		return harnessv2.RuntimeProfile{}, nil, fmt.Errorf(
+			"external AgentRuntime is fenced to controller epoch %d, current epoch is %d",
+			observed.ControllerEpoch, currentFence.Epoch,
+		)
+	}
+	profile, err := agentRuntimeProfile(*capabilities.Profile)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, nil, permanentACPAgentConfiguration(err)
+	}
+	limits, err := agentRuntimeProtocolLimits(*capabilities.Limits)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, nil, permanentACPAgentConfiguration(err)
+	}
+	observedLimits, err := agentRuntimeProtocolLimits(*observed.Limits)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, nil, errors.New("external AgentRuntime observed protocol limits are invalid")
+	}
+	governance, err := agentRuntimeWorkspaceGovernance(*capabilities.WorkspaceGovernance)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, nil, permanentACPAgentConfiguration(err)
+	}
+	observedGovernance, err := agentRuntimeWorkspaceGovernance(*observed.WorkspaceGovernance)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, nil, errors.New("external AgentRuntime observed workspace governance is invalid")
+	}
+	if observed.ProtocolVersion != harnessv2.ProtocolVersion || observed.Transport != "http+ndjson" ||
+		observed.ACPVersion != harnessv2.ACPProfileV1 || observed.RuntimeInstanceID != capabilities.RuntimeInstanceID ||
+		observed.RuntimeProfileDigest != capabilities.Profile.Digest ||
+		observed.ProfileDigestSchemaVersion != capabilities.Profile.DigestSchemaVersion ||
+		observed.AdapterName != capabilities.Profile.AdapterName || observed.AdapterDigest != capabilities.Profile.AdapterDigest ||
+		observed.ProviderKind != capabilities.Profile.ProviderKind || observed.Model != capabilities.Profile.Model ||
+		observedLimits != limits || observedGovernance != governance ||
+		observed.SupportsDrain != capabilities.SupportsDrain ||
+		observed.SupportsPublicationFinalization != capabilities.SupportsPublicationFinalization {
+		return harnessv2.RuntimeProfile{}, nil, errors.New("external AgentRuntime observed capabilities do not exactly match its registered v2 claims")
+	}
+	if !governance.Strict() {
+		return harnessv2.RuntimeProfile{}, nil, errors.New("external AgentRuntime does not provide strict workspace governance")
+	}
+	if err := capabilities.ValidateStrictWorkspaceIntent(corev1alpha1.WorkspaceIntent(profile.WorkspaceIntent)); err != nil {
+		return harnessv2.RuntimeProfile{}, nil, permanentACPAgentConfiguration(err)
+	}
+	reconciler := &AgentRuntimeReconciler{Client: r.Client, APIReader: r.APIReader}
+	auth, err := reconciler.agentRuntimeAuthMaterial(ctx, runtime)
+	if err != nil {
+		return harnessv2.RuntimeProfile{}, nil, err
+	}
+	if runtime.Status.ObservedControllerAuthRefResourceVersion != auth.controllerResourceVersion ||
+		runtime.Status.ObservedOperationCapabilityRefResourceVersion != auth.capabilityResourceVersion {
+		return harnessv2.RuntimeProfile{}, nil, errors.New("external AgentRuntime authentication material changed after conformance")
+	}
+	controllerRef := runtime.Spec.ClientAuth.ControllerBearerTokenSecretRef
+	capabilityRef := runtime.Spec.ClientAuth.OperationCapabilitySecretRef
+	external := &agentExecutionSnapshotExternalRuntime{
+		Namespace:                       runtime.Namespace,
+		Endpoint:                        strings.TrimSpace(runtime.Spec.Deployment.Endpoint),
+		RuntimeInstanceID:               capabilities.RuntimeInstanceID,
+		Limits:                          limits,
+		WorkspaceGovernance:             governance,
+		SupportsDrain:                   capabilities.SupportsDrain,
+		SupportsPublicationFinalization: capabilities.SupportsPublicationFinalization,
+		ControllerAuth: agentExecutionSnapshotSecretRef{
+			Role: "controller-auth", Namespace: runtime.Namespace, Name: controllerRef.Name,
+			UID: string(auth.controllerSecretUID), ResourceVersion: auth.controllerResourceVersion, Keys: []string{controllerRef.Key},
+		},
+		OperationCapability: agentExecutionSnapshotSecretRef{
+			Role: "operation-capability", Namespace: runtime.Namespace, Name: capabilityRef.Name,
+			UID: string(auth.capabilitySecretUID), ResourceVersion: auth.capabilityResourceVersion, Keys: []string{capabilityRef.Key},
+		},
+	}
+	return profile, external, nil
+}
+
 func permanentACPWorkspaceSessionPlanningError(err error) bool {
 	return errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrValidation)
 }
@@ -596,18 +860,6 @@ func validateAgentExecutionSnapshot(
 		body.Agent.UID != string(binding.Agent.UID) || body.Agent.Generation != binding.Agent.Generation {
 		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("execution snapshot route or Agent identity does not exactly match the binding")
 	}
-	configuration := harnessv2.AgentSessionConfiguration{
-		AgentUID: body.Configuration.AgentUID, AgentGeneration: body.Configuration.AgentGeneration,
-		ProviderKind: body.Configuration.ProviderKind, Model: body.Configuration.Model,
-		MaxTurns: body.Configuration.MaxTurns, ReasoningEffort: body.Configuration.ReasoningEffort,
-		SystemPrompt: body.Configuration.SystemPrompt,
-	}
-	if configuration.AgentUID != body.Agent.UID || configuration.AgentGeneration != body.Agent.Generation {
-		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("execution snapshot configuration Agent identity is inconsistent")
-	}
-	if body.RuntimeType != body.Configuration.ProviderKind || body.RuntimeType != body.RuntimeProfile.ProviderKind {
-		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("execution snapshot runtime type is inconsistent with the frozen configuration/profile")
-	}
 	if body.Timeout != "" {
 		if _, err := time.ParseDuration(body.Timeout); err != nil {
 			return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("validate frozen Task timeout: %w", err)
@@ -615,9 +867,6 @@ func validateAgentExecutionSnapshot(
 	}
 	if err := body.RuntimeProfile.Validate(); err != nil {
 		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("validate frozen RuntimeProfile: %w", err)
-	}
-	if err := configuration.ValidateProfile(body.RuntimeProfile); err != nil {
-		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("validate frozen Agent configuration: %w", err)
 	}
 	if body.MCPConfiguration == nil {
 		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("execution snapshot is missing the frozen MCP policy configuration")
@@ -632,6 +881,31 @@ func validateAgentExecutionSnapshot(
 	}
 	if string(profileDigest) != body.ProfileDigest || body.ProfileDigest != binding.RuntimeProfileDigest {
 		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("frozen RuntimeProfile digest does not exactly match the binding")
+	}
+	if binding.Backend == corev1alpha1.AgentExecutionBackendExternalEndpoint {
+		if err := validateExternalAgentExecutionSnapshot(binding, body); err != nil {
+			return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, err
+		}
+		return ACPRuntimePlan{Profile: body.RuntimeProfile, Digest: profileDigest},
+			harnessv2.AgentSessionConfiguration{}, mcpConfiguration, nil
+	}
+	if binding.Backend != corev1alpha1.AgentExecutionBackendRuntimePool || binding.RuntimeRef != nil || body.ExternalRuntime != nil {
+		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("execution snapshot has an unsupported or inconsistent ACP backend")
+	}
+	configuration := harnessv2.AgentSessionConfiguration{
+		AgentUID: body.Configuration.AgentUID, AgentGeneration: body.Configuration.AgentGeneration,
+		ProviderKind: body.Configuration.ProviderKind, Model: body.Configuration.Model,
+		MaxTurns: body.Configuration.MaxTurns, ReasoningEffort: body.Configuration.ReasoningEffort,
+		SystemPrompt: body.Configuration.SystemPrompt,
+	}
+	if configuration.AgentUID != body.Agent.UID || configuration.AgentGeneration != body.Agent.Generation {
+		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("execution snapshot configuration Agent identity is inconsistent")
+	}
+	if body.RuntimeType != body.Configuration.ProviderKind || body.RuntimeType != body.RuntimeProfile.ProviderKind {
+		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("execution snapshot runtime type is inconsistent with the frozen configuration/profile")
+	}
+	if err := configuration.ValidateProfile(body.RuntimeProfile); err != nil {
+		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, fmt.Errorf("validate frozen Agent configuration: %w", err)
 	}
 	if !ACPRuntimeImageAvailable(body.RuntimeImage) {
 		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("frozen runtime image is not digest pinned")
@@ -663,6 +937,51 @@ func validateAgentExecutionSnapshot(
 		PoolName: body.PoolName, Image: body.RuntimeImage, Profile: body.RuntimeProfile, Digest: profileDigest,
 		Workspace: workspaceBinding,
 	}, configuration, mcpConfiguration, nil
+}
+
+func validateExternalAgentExecutionSnapshot(
+	binding *corev1alpha1.AgentExecutionBinding,
+	body agentExecutionSnapshotBody,
+) error {
+	external := body.ExternalRuntime
+	if binding == nil || binding.RuntimeRef == nil || external == nil {
+		return errors.New("external v2 execution snapshot is missing its frozen AgentRuntime authority")
+	}
+	if binding.RuntimeType != "" || body.RuntimeType != "" || body.RuntimeImage != "" || body.PoolName != "" ||
+		body.ExecutionWorkspace != nil || body.HarnessV1 != nil || body.Configuration != (agentExecutionSnapshotConfig{}) {
+		return errors.New("external v2 execution snapshot carries RuntimePool or adapter-owned configuration")
+	}
+	if strings.TrimSpace(binding.RuntimeRef.Name) == "" || binding.RuntimeRef.UID == "" || binding.RuntimeRef.Generation < 1 {
+		return errors.New("external v2 execution binding has an incomplete AgentRuntime identity")
+	}
+	if strings.TrimSpace(external.Namespace) == "" || strings.TrimSpace(external.Endpoint) == "" ||
+		strings.TrimSpace(external.RuntimeInstanceID) == "" {
+		return errors.New("external v2 execution snapshot has an incomplete endpoint or runtime identity")
+	}
+	if err := validateAgentRuntimeEndpointSpec(external.Endpoint); err != nil {
+		return fmt.Errorf("validate frozen external AgentRuntime endpoint: %w", err)
+	}
+	if err := external.Limits.Validate(); err != nil {
+		return fmt.Errorf("validate frozen external AgentRuntime limits: %w", err)
+	}
+	if !external.WorkspaceGovernance.Strict() {
+		return errors.New("external v2 execution snapshot does not provide strict workspace governance")
+	}
+	if body.RuntimeProfile.WorkspaceIntent == harnessv2.WorkspaceIntentWrite && !external.SupportsPublicationFinalization {
+		return errors.New("external v2 execution snapshot does not support controller-owned publication finalization")
+	}
+	if err := validateExternalAgentRuntimeSnapshotSecret(external.Namespace, "controller-auth", external.ControllerAuth); err != nil {
+		return err
+	}
+	return validateExternalAgentRuntimeSnapshotSecret(external.Namespace, "operation-capability", external.OperationCapability)
+}
+
+func validateExternalAgentRuntimeSnapshotSecret(namespace, role string, ref agentExecutionSnapshotSecretRef) error {
+	if ref.Role != role || ref.Namespace != namespace || strings.TrimSpace(ref.Name) == "" || strings.TrimSpace(ref.UID) == "" ||
+		strings.TrimSpace(ref.ResourceVersion) == "" || len(ref.Keys) != 1 || strings.TrimSpace(ref.Keys[0]) == "" {
+		return fmt.Errorf("frozen external AgentRuntime %s Secret identity is incomplete", role)
+	}
+	return nil
 }
 
 // snapshotWorkspaceClassFromBinding freezes the class binding into its
@@ -874,6 +1193,27 @@ func (r *TaskReconciler) loadVerifiedBoundExecution(
 	task *corev1alpha1.Task,
 	binding *corev1alpha1.AgentExecutionBinding,
 ) (*verifiedAgentExecution, error) {
+	return r.loadVerifiedBoundExecutionWithReadyRequirement(ctx, task, binding, true)
+}
+
+// loadVerifiedBoundExecutionForActiveSession preserves the immutable binding
+// checks for already-admitted work without requiring the runtime to keep
+// accepting new sessions while it drains.
+func (r *TaskReconciler) loadVerifiedBoundExecutionForActiveSession(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	binding *corev1alpha1.AgentExecutionBinding,
+) (*verifiedAgentExecution, error) {
+	return r.loadVerifiedBoundExecutionWithReadyRequirement(ctx, task, binding, false)
+}
+
+//nolint:gocyclo // This keeps the existing immutable binding and snapshot verification in one boundary while varying only external admission readiness.
+func (r *TaskReconciler) loadVerifiedBoundExecutionWithReadyRequirement(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	binding *corev1alpha1.AgentExecutionBinding,
+	requireExternalRuntimeReady bool,
+) (*verifiedAgentExecution, error) {
 	if r.AgentExecutionSnapshots == nil {
 		return nil, errors.New("encrypted agent execution snapshot store is required; execution fails closed")
 	}
@@ -894,6 +1234,12 @@ func (r *TaskReconciler) loadVerifiedBoundExecution(
 	if !current.DeletionTimestamp.IsZero() {
 		return nil, fmt.Errorf("task began deleting after binding; dispatch is cancelled")
 	}
+	if !requireExternalRuntimeReady && (current.Status.Execution == nil ||
+		(current.Status.Execution.State != corev1alpha1.TaskExecutionStateSubmitting &&
+			current.Status.Execution.State != corev1alpha1.TaskExecutionStateAccepted &&
+			current.Status.Execution.State != corev1alpha1.TaskExecutionStateRunning)) {
+		return nil, errors.New("active external RuntimeSession execution is unavailable")
+	}
 	persisted := current.Status.AgentExecutionBinding
 	if persisted == nil || persisted.BindingDigest != binding.BindingDigest {
 		return nil, fmt.Errorf("persisted binding does not match the verified candidate; refusing to dispatch")
@@ -912,7 +1258,9 @@ func (r *TaskReconciler) loadVerifiedBoundExecution(
 	if namespace.UID == "" || namespace.UID != persisted.Task.NamespaceUID {
 		return nil, errors.New("task namespace identity no longer exactly matches the immutable binding")
 	}
-	if persisted.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 || persisted.Backend != corev1alpha1.AgentExecutionBackendRuntimePool {
+	if persisted.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 ||
+		(persisted.Backend != corev1alpha1.AgentExecutionBackendRuntimePool &&
+			persisted.Backend != corev1alpha1.AgentExecutionBackendExternalEndpoint) {
 		return nil, fmt.Errorf("binding route %s/%s is not dispatchable by the ACP executor", persisted.ContractVersion, persisted.Backend)
 	}
 	snapshot, err := r.AgentExecutionSnapshots.GetAgentExecutionSnapshot(ctx, store.AgentExecutionSnapshotKey{
@@ -929,9 +1277,64 @@ func (r *TaskReconciler) loadVerifiedBoundExecution(
 	if err != nil {
 		return nil, err
 	}
+	var externalRuntime *corev1alpha1.AgentRuntime
+	if persisted.Backend == corev1alpha1.AgentExecutionBackendExternalEndpoint {
+		if persisted.RuntimeRef == nil || body.ExternalRuntime == nil || body.ExternalRuntime.Namespace != current.Namespace {
+			return nil, errors.New("external v2 binding does not match the Task namespace")
+		}
+		runtime := &corev1alpha1.AgentRuntime{}
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: persisted.RuntimeRef.Name}, runtime); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, frozenExternalRuntimeBindingDrift(fmt.Errorf("load frozen external AgentRuntime: %w", err))
+			}
+			return nil, fmt.Errorf("load frozen external AgentRuntime: %w", err)
+		}
+		if runtime.Name != persisted.RuntimeRef.Name || runtime.UID != persisted.RuntimeRef.UID ||
+			runtime.Generation != persisted.RuntimeRef.Generation {
+			return nil, frozenExternalRuntimeBindingDrift(errors.New("external AgentRuntime identity or generation changed after binding"))
+		}
+		observed := runtime.Status.ObservedCapabilities
+		if observed == nil || observed.MCPToolDescriptorDigest != mcpConfiguration.ToolPolicy.DescriptorDigest {
+			return nil, frozenExternalRuntimeBindingDrift(errExternalAgentRuntimeMCPToolDescriptorsNotConformed)
+		}
+		reconciler := &AgentRuntimeReconciler{Client: r.Client, APIReader: r.APIReader}
+		currentAuth, err := reconciler.agentRuntimeAuthMaterial(ctx, runtime)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, frozenExternalRuntimeBindingDrift(errors.New("external AgentRuntime authentication authority changed after binding"))
+			}
+			return nil, fmt.Errorf("revalidate frozen external AgentRuntime authentication authority: %w", err)
+		}
+		if string(currentAuth.controllerSecretUID) != body.ExternalRuntime.ControllerAuth.UID ||
+			currentAuth.controllerResourceVersion != body.ExternalRuntime.ControllerAuth.ResourceVersion ||
+			string(currentAuth.capabilitySecretUID) != body.ExternalRuntime.OperationCapability.UID ||
+			currentAuth.capabilityResourceVersion != body.ExternalRuntime.OperationCapability.ResourceVersion {
+			return nil, frozenExternalRuntimeBindingDrift(errors.New("external AgentRuntime authentication authority changed after binding"))
+		}
+		currentProfile, currentExternal, err := r.resolveExternalAgentRuntimeSnapshotWithReadyRequirement(
+			ctx, current, runtime, requireExternalRuntimeReady,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("revalidate frozen external AgentRuntime: %w", err)
+		}
+		currentProfileDigest, err := harnessv2.CanonicalProfileDigest(currentProfile)
+		if err != nil || currentProfileDigest != plan.Digest {
+			return nil, frozenExternalRuntimeBindingDrift(errors.New("external AgentRuntime profile changed after binding"))
+		}
+		frozenAuthority, err := harnessv2.CanonicalValue(body.ExternalRuntime)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize frozen external AgentRuntime authority: %w", err)
+		}
+		currentAuthority, err := harnessv2.CanonicalValue(currentExternal)
+		if err != nil || !bytes.Equal(frozenAuthority, currentAuthority) {
+			return nil, frozenExternalRuntimeBindingDrift(errors.New("external AgentRuntime endpoint, capabilities, or authentication authority changed after binding"))
+		}
+		externalRuntime = runtime.DeepCopy()
+	}
 	return &verifiedAgentExecution{
 		binding: persisted.DeepCopy(), snapshot: snapshot, body: body, plan: plan,
-		frozenTask: frozenTaskFromAgentExecutionSnapshot(current, persisted, body), configuration: configuration,
+		externalRuntime: externalRuntime,
+		frozenTask:      frozenTaskFromAgentExecutionSnapshot(current, persisted, body), configuration: configuration,
 		mcpConfiguration: mcpConfiguration,
 	}, nil
 }
@@ -945,6 +1348,21 @@ func (r *TaskReconciler) verifyBoundExecution(
 ) error {
 	_, err := r.loadVerifiedBoundExecution(ctx, task, binding)
 	return err
+}
+
+func (r *TaskReconciler) handleAgentExecutionBindingVerificationFailure(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	err error,
+	logMessage string,
+) (ctrl.Result, error) {
+	if task.Status.Execution == nil && isFrozenExternalRuntimeBindingDrift(err) {
+		return r.failACPPlanningTask(
+			ctx, task, corev1alpha1.TaskExecutionReason("InvalidRuntimeProfile"), err.Error(),
+		)
+	}
+	logf.FromContext(ctx).Error(err, logMessage)
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 // ensureAgentExecutionBinding runs the binding stage for the ACP execution
@@ -980,8 +1398,10 @@ func (r *TaskReconciler) ensureAgentExecutionBinding(
 	}
 	if existing := task.Status.AgentExecutionBinding; existing != nil {
 		if err := r.verifyBoundExecution(ctx, task, existing); err != nil {
-			log.Error(err, "bound execution verification failed")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, true
+			result, handleErr := r.handleAgentExecutionBindingVerificationFailure(
+				ctx, task, err, "bound execution verification failed",
+			)
+			return result, handleErr, true
 		}
 		return ctrl.Result{}, nil, false
 	}
@@ -1040,8 +1460,10 @@ func (r *TaskReconciler) ensureAgentExecutionBinding(
 	}
 	task.Status.AgentExecutionBinding = binding
 	if err := r.verifyBoundExecution(ctx, task, binding); err != nil {
-		log.Error(err, "bound execution verification failed after binding")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil, true
+		result, handleErr := r.handleAgentExecutionBindingVerificationFailure(
+			ctx, task, err, "bound execution verification failed after binding",
+		)
+		return result, handleErr, true
 	}
 	return ctrl.Result{}, nil, false
 }

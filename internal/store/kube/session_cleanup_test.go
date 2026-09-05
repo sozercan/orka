@@ -463,26 +463,29 @@ func seedPublishedSessionCleanupState(
 	if err != nil {
 		t.Fatalf("CanonicalID(): %v", err)
 	}
+	projectionID := controlstore.CanonicalControlID("outbox", turnID, "TaskTerminalStatus")
+	payloadDigest := controlstore.CanonicalBytesDigest([]byte(`{}`))
 	if _, err := db.ExecContext(ctx, `INSERT INTO session_turns(
 		id, namespace, session_name, session_uid, lease_generation, task_uid, attempt, prompt_id,
 		prompt_attempt_id, request_digest, user_prompt, state, terminal_kind, terminal_content,
 		finalization_digest, publication_id, controller_epoch_name, controller_epoch, version,
-		created_at, finalized_at, updated_at
+		created_at, finalized_at, updated_at, projection_id, projection_kind, projection_digest
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publish', 'Finalized', 'AssistantResult', 'published', ?,
-		'publication-cleanup', ?, ?, 2, ?, ?, ?)`,
+		'publication-cleanup', ?, ?, 2, ?, ?, ?, ?, 'TaskTerminalStatus', ?)`,
 		turnID, control.Namespace, control.SessionName, key.SessionUID, key.LeaseGeneration, key.TaskUID, key.Attempt, key.PromptID,
 		"attempt-published", testDigest("published-turn"), testDigest("published-finalization"),
 		fence.Name, fence.Epoch, testNow, testNow.Add(time.Minute), testNow.Add(time.Minute),
+		projectionID, payloadDigest,
 	); err != nil {
 		t.Fatalf("insert published SessionTurn: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO outbox_projections(
 		id, aggregate_kind, aggregate_id, projection_kind, payload_digest, payload, state,
 		initial_available_at, available_at, controller_epoch_name, controller_epoch, version,
-		created_at, updated_at, delivered_at
-	) VALUES ('session-cleanup-projection', ?, ?, 'TaskTerminalStatus', ?, '{}', 'Delivered', ?, ?, ?, ?, 1, ?, ?, ?)`,
-		sessionTurnAggregateKind, turnID, testDigest("published-projection"), testNow, testNow,
-		fence.Name, fence.Epoch, testNow, testNow, testNow,
+		created_at, updated_at, delivered_at, delivery_digest
+	) VALUES (?, ?, ?, 'TaskTerminalStatus', ?, '{}', 'Delivered', ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+		projectionID, sessionTurnAggregateKind, turnID, payloadDigest, testNow, testNow,
+		fence.Name, fence.Epoch, testNow, testNow, testNow, testDigest("published-projection-delivery"),
 	); err != nil {
 		t.Fatalf("insert delivered projection: %v", err)
 	}

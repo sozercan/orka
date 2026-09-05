@@ -98,6 +98,14 @@ func (r *AgentReconciler) validateAgent(ctx context.Context, agent *corev1alpha1
 			return fmt.Errorf("either providerRef or model.provider must be specified")
 		}
 	} else {
+		if agent.Spec.Runtime.RuntimeRef != nil {
+			if strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name) == "" {
+				return fmt.Errorf("runtimeRef.name is required")
+			}
+			if err := validateRuntimeRefAgentTaskRestrictions(nil, agent); err != nil {
+				return err
+			}
+		}
 		if err := validateACPAgentModelControls(agent.Spec.Runtime, agent.Spec.Model); err != nil {
 			return err
 		}

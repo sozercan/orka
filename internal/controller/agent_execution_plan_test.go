@@ -8,6 +8,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -16,6 +17,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	sandboxextv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
@@ -58,7 +61,36 @@ func TestPlanAgentExecutionMatrix(t *testing.T) {
 			wantReason: "no fallback execution path",
 		},
 		{
-			name: "conformant external runtimeRef remains fail-closed",
+			name: "conformant external runtimeRef uses ACP external dispatch",
+			mutateAgent: func(agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
+					RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-v2"},
+				}
+			},
+			objects:           []client.Object{plannerExternalRuntime()},
+			acpRuntimeEnabled: true,
+			wantPath:          agentExecutionPathExternal,
+		},
+		{
+			name: "transaction-scoped external runtimeRef uses ACP external dispatch",
+			mutateTask: func(task *corev1alpha1.Task) {
+				task.Spec.Transaction = &corev1alpha1.TaskTransaction{ID: "txn-1"}
+			},
+			mutateAgent: func(agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
+					RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-v2"},
+				}
+			},
+			objects:           []client.Object{plannerExternalRuntime()},
+			acpRuntimeEnabled: true,
+			wantPath:          agentExecutionPathExternal,
+		},
+		{
+			name: "external runtimeRef rejects task maxTurns",
+			mutateTask: func(task *corev1alpha1.Task) {
+				maxTurns := int32(20)
+				task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{MaxTurns: &maxTurns}
+			},
 			mutateAgent: func(agent *corev1alpha1.Agent) {
 				agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
 					RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-v2"},
@@ -67,7 +99,7 @@ func TestPlanAgentExecutionMatrix(t *testing.T) {
 			objects:           []client.Object{plannerExternalRuntime()},
 			acpRuntimeEnabled: true,
 			wantPath:          agentExecutionPathRejected,
-			wantReason:        "Task dispatch is not supported until the v2 dispatcher is wired",
+			wantReason:        "do not support maxTurns",
 		},
 		{
 			name: "OpenCode uses ACP RuntimePool",
@@ -307,6 +339,32 @@ func TestPlanAgentExecutionMatrix(t *testing.T) {
 	}
 }
 
+func TestPlanAgentExecutionRetriesTransientRuntimeRefRead(t *testing.T) {
+	scheme := newTestScheme()
+	transient := errors.New("temporary AgentRuntime read failure")
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			return transient
+		},
+	}).Build()
+	r := newUnitReconciler(scheme)
+	r.APIReader = reader
+
+	plan := r.planAgentExecution(context.Background(), validPlannerTask(), plannerRuntimeRefAgent())
+	if plan.path != agentExecutionPathRejected || !errors.Is(plan.transientError, transient) || plan.rejectionReason != "" {
+		t.Fatalf("plan = %#v, want retryable rejected plan wrapping the read error", plan)
+	}
+}
+
+func TestPlanAgentExecutionRejectsMissingRuntimeRef(t *testing.T) {
+	r := newUnitReconciler(newTestScheme())
+
+	plan := r.planAgentExecution(context.Background(), validPlannerTask(), plannerRuntimeRefAgent())
+	if plan.path != agentExecutionPathRejected || plan.transientError != nil || !strings.Contains(plan.rejectionReason, "not found") {
+		t.Fatalf("plan = %#v, want terminal missing AgentRuntime rejection", plan)
+	}
+}
+
 func plannerExternalRuntime() *corev1alpha1.AgentRuntime {
 	digest := func(char string) string { return "sha256:" + strings.Repeat(char, 64) }
 	governance := corev1alpha1.AgentRuntimeWorkspaceGovernanceCapabilities{
@@ -332,6 +390,14 @@ func plannerExternalRuntime() *corev1alpha1.AgentRuntime {
 			RuntimeInstanceID: "external-instance", RuntimeProfileDigest: profile.Digest, WorkspaceGovernance: &governance,
 		}},
 	}
+}
+
+func plannerRuntimeRefAgent() *corev1alpha1.Agent {
+	agent := validPlannerAgent()
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
+		RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-v2"},
+	}
+	return agent
 }
 
 // plannerWorkspaceTask enables a canonical agent-sandbox execution workspace

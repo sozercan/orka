@@ -201,30 +201,14 @@ func TestValidateAgent_BuiltInRuntimeRejectsCredentialSecretRef(t *testing.T) {
 	}
 }
 
-func TestValidateAgent_CredentialSecretRefRemainsValidOutsideBuiltInACPRuntimes(t *testing.T) {
+func TestValidateAgent_CredentialSecretRefRemainsValidForProviderBackedAgent(t *testing.T) {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-creds", Namespace: testNS}}
-	for _, tt := range []struct {
-		name    string
-		runtime *corev1alpha1.AgentCLIRuntime
-	}{
-		{name: "provider-backed agent"},
-		{
-			name: "custom runtimeRef agent",
-			runtime: &corev1alpha1.AgentCLIRuntime{
-				RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "custom-runtime"},
-			},
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			r := setupAgentReconciler(secret.DeepCopy())
-			agent := baseAgent(tt.name)
-			agent.Spec.Runtime = tt.runtime
-			agent.Spec.SecretRef = &corev1.LocalObjectReference{Name: secret.Name}
+	r := setupAgentReconciler(secret.DeepCopy())
+	agent := baseAgent("provider-backed-agent")
+	agent.Spec.SecretRef = &corev1.LocalObjectReference{Name: secret.Name}
 
-			if err := r.validateAgent(context.Background(), agent); err != nil {
-				t.Fatalf("validateAgent() error = %v", err)
-			}
-		})
+	if err := r.validateAgent(context.Background(), agent); err != nil {
+		t.Fatalf("validateAgent() error = %v", err)
 	}
 }
 
@@ -301,6 +285,75 @@ func TestValidateAgent_ModelControlsRemainValidOutsideBuiltInACPRuntimes(t *test
 
 			if err := r.validateAgent(context.Background(), agent); err != nil {
 				t.Fatalf("validateAgent() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateAgent_RuntimeRefRequiresName(t *testing.T) {
+	agent := baseAgent("missing-runtime-ref-name")
+	agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
+		RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "  "},
+	}
+
+	err := setupAgentReconciler().validateAgent(context.Background(), agent)
+	if err == nil || !strings.Contains(err.Error(), "runtimeRef.name is required") {
+		t.Fatalf("validateAgent() error = %v, want runtimeRef.name rejection", err)
+	}
+}
+
+func TestValidateAgent_RuntimeRefRejectsUnsupportedAgentPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		configure func(*corev1alpha1.Agent)
+		wantError string
+	}{
+		{
+			name: "default allowed tools",
+			configure: func(agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime.DefaultAllowedTools = []string{"read"}
+			},
+			wantError: "defaultAllowedTools",
+		},
+		{
+			name: "explicitly empty default allowed tools",
+			configure: func(agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime.DefaultAllowedTools = []string{}
+			},
+			wantError: "defaultAllowedTools",
+		},
+		{
+			name: "default allow bash",
+			configure: func(agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime.DefaultAllowBash = new(false)
+			},
+			wantError: "defaultAllowBash",
+		},
+		{
+			name: "default reasoning effort",
+			configure: func(agent *corev1alpha1.Agent) {
+				agent.Spec.Runtime.DefaultReasoningEffort = "high"
+			},
+			wantError: "defaultReasoningEffort",
+		},
+		{
+			name: "credential",
+			configure: func(agent *corev1alpha1.Agent) {
+				agent.Spec.SecretRef = &corev1.LocalObjectReference{Name: "runtime-credential"}
+			},
+			wantError: "agent secretRef credential delivery",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := baseAgent(tt.name)
+			agent.Spec.Runtime = &corev1alpha1.AgentCLIRuntime{
+				RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "custom-runtime"},
+			}
+			tt.configure(agent)
+
+			err := setupAgentReconciler().validateAgent(context.Background(), agent)
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("validateAgent() error = %v, want %q", err, tt.wantError)
 			}
 		})
 	}

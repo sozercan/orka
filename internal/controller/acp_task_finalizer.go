@@ -84,7 +84,7 @@ func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1a
 		if errors.Is(err, store.ErrNotFound) {
 			// The final attempt may already have been removed by a prepared
 			// reclamation. Let the store validate its durable marker on retry.
-			return true, nil
+			return r.acpTaskSessionDeletionReady(ctx, task, nil)
 		}
 		return false, err
 	}
@@ -95,6 +95,9 @@ func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1a
 	}
 	if !store.IsTerminalPromptExecutionState(attempt.ExecutionState) || !store.IsTerminalPromptDeliveryState(attempt.DeliveryState) {
 		return false, nil
+	}
+	if ready, err := r.acpTaskSessionDeletionReady(ctx, task, attempt); err != nil || !ready {
+		return ready, err
 	}
 	publicationID := publicationIDForTaskUID(task, acpTaskControlUID(task))
 	if task.Spec.Workspace != nil && task.Spec.Workspace.Intent == corev1alpha1.WorkspaceIntentWrite {
@@ -117,6 +120,17 @@ func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1a
 		return false, err
 	}
 	projection, err := r.DurableControlStore.GetOutboxProjection(ctx, projectionID)
+	if errors.Is(err, store.ErrNotFound) {
+		receipt, receiptErr := r.acpTaskSessionCleanupReceipt(ctx, task, attempt)
+		if receiptErr == nil {
+			if receipt.ProjectionID != projectionID {
+				return false, fmt.Errorf("%w: Session cleanup receipt does not match Task terminal projection", store.ErrConflict)
+			}
+			projection, err = receipt.OutboxProjection(), nil
+		} else {
+			err = receiptErr
+		}
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return false, nil
@@ -124,6 +138,34 @@ func (r *TaskReconciler) acpTaskDeletionReady(ctx context.Context, task *corev1a
 		return false, err
 	}
 	return projection.State == store.OutboxProjectionDelivered, nil
+}
+
+func (r *TaskReconciler) acpTaskSessionDeletionReady(ctx context.Context, task *corev1alpha1.Task, attempt *store.PromptAttempt) (bool, error) {
+	if task.DeletionTimestamp.IsZero() || task.Spec.SessionRef == nil {
+		return true, nil
+	}
+	bound := task.Status.Execution.RuntimeSessionUID != "" || task.Status.Execution.RuntimeSessionGeneration != 0
+	if attempt != nil {
+		var err error
+		bound, err = promptAttemptSessionBound(attempt)
+		if err != nil {
+			return false, err
+		}
+	}
+	if !bound {
+		return true, nil
+	}
+	// Runtime retirement precedes the Session archival transaction. Keep the
+	// Task's frozen cleanup authority until the archive is durable, so a
+	// crash between those steps can still resume the Session cleanup intent.
+	receipt, err := r.acpTaskSessionCleanupReceipt(ctx, task, attempt)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return receipt.ProjectionState == store.OutboxProjectionDelivered, nil
 }
 
 func acpTaskTerminalBeforeDurableAttempt(task *corev1alpha1.Task) bool {
@@ -214,6 +256,18 @@ func (r *TaskReconciler) acpTaskTerminalProjectionID(
 	if task.Spec.SessionRef == nil || !bound {
 		return standaloneTaskTerminalProjectionIDForUID(task.Namespace, acpTaskControlUID(task), task.Status.Execution.Attempt), nil
 	}
+	if attempt == nil {
+		// After reclamation removes the attempt, the Task's runtime incarnation
+		// generation cannot reconstruct its per-prompt mutation lease. The
+		// archived receipt still binds the exact attempt to its finalized turn.
+		receipt, err := r.acpTaskSessionCleanupReceipt(ctx, task, nil)
+		if err == nil {
+			return receipt.ProjectionID, nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return "", err
+		}
+	}
 	if sessionUID == "" || leaseGeneration < 1 {
 		return "", fmt.Errorf("session-backed ACP attempt lacks a frozen SessionTurn identity")
 	}
@@ -226,6 +280,13 @@ func (r *TaskReconciler) acpTaskTerminalProjectionID(
 		return "", err
 	}
 	turn, err := r.DurableControlStore.GetSessionTurn(ctx, turnID)
+	if errors.Is(err, store.ErrNotFound) {
+		receipt, receiptErr := r.acpTaskSessionCleanupReceipt(ctx, task, attempt)
+		if receiptErr != nil {
+			return "", receiptErr
+		}
+		turn, err = receipt.SessionTurn(), nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -233,6 +294,45 @@ func (r *TaskReconciler) acpTaskTerminalProjectionID(
 		return "", fmt.Errorf("SessionTurn %s is not finalized", turnID)
 	}
 	return store.CanonicalControlID("outbox", turnID, "TaskTerminalStatus"), nil
+}
+
+func (r *TaskReconciler) acpTaskSessionCleanupReceipt(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	attempt *store.PromptAttempt,
+) (*store.SessionTurnCleanupReceipt, error) {
+	reader, ok := r.DurableControlStore.(store.SessionTurnCleanupReceiptStore)
+	if !ok || task.Spec.SessionRef == nil || task.Status.Execution == nil {
+		return nil, store.ErrNotFound
+	}
+	key := store.SessionTurnKey{
+		SessionUID: task.Status.Execution.RuntimeSessionUID, LeaseGeneration: task.Status.Execution.RuntimeSessionGeneration,
+		TaskUID: string(acpTaskControlUID(task)), Attempt: int64(task.Status.Execution.Attempt), PromptID: task.Status.Execution.PromptID,
+	}
+	if attempt != nil {
+		key.SessionUID, key.LeaseGeneration = attempt.SessionUID, attempt.SessionLeaseGeneration
+	}
+	attemptID, err := promptAttemptIDFromTaskUID(task, acpTaskControlUID(task))
+	if err != nil {
+		return nil, err
+	}
+	receipt, err := reader.GetSessionTurnCleanupReceipt(ctx, task.Namespace, task.Spec.SessionRef.Name, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	if receipt == nil || receipt.PromptAttemptID != attemptID {
+		return nil, fmt.Errorf("%w: Session cleanup receipt does not match Task attempt", store.ErrConflict)
+	}
+	if err := receipt.Validate(task.Namespace, task.Spec.SessionRef.Name, receipt.TurnID); err != nil {
+		return nil, err
+	}
+	if attempt == nil {
+		key.LeaseGeneration = receipt.Key.LeaseGeneration
+	}
+	if receipt.Key != key || attempt != nil && receipt.PromptAttemptID != attempt.ID {
+		return nil, fmt.Errorf("%w: Session cleanup receipt does not match Task attempt", store.ErrConflict)
+	}
+	return receipt, nil
 }
 
 func (r *TaskReconciler) reclaimACPTaskPublicationBundles(ctx context.Context, task *corev1alpha1.Task) (bool, error) {

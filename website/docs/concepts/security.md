@@ -30,7 +30,7 @@ Built-in `type: agent` Tasks run as private RuntimeSessions inside one controlle
 
 A shared pool is a same-administrative-trust-domain density boundary, not a hard tenant sandbox. Users who can mutate or exec into the runtime Pod, namespace administrators, node administrators, and sibling sessions in the same pool are trusted relative to that boundary.
 
-Per-Task `spec.execution`, custom resources, and `spec.execution.workspace` are not supported by the current ACP path. Runtime isolation and resources are selected by reviewed RuntimePool profiles.
+ACP Tasks reject custom resources and per-Task execution placement fields. Provider-backed `spec.execution.workspace` is supported for built-in runtimes only when workspace dispatch and the selected provider are enabled; it binds a dedicated RuntimePool. External `runtimeRef` dispatch rejects execution workspaces. Runtime isolation and resources otherwise come from reviewed RuntimePool profiles.
 
 ### Workspace/Publisher
 
@@ -68,7 +68,7 @@ operations reserve a durable `ExternalEffect` identity before execution.
 
 ### Current ACP constraints
 
-- External `AgentRuntime` v2 registration and conformance are supported, but `runtimeRef` Task dispatch remains fail-closed until the external v2 dispatcher support boundary is enabled.
+- External `AgentRuntime` v2 dispatch is admitted only for a current-generation ready, strict-governed registration. Orka freezes and revalidates the endpoint, authentication authority, profile, and observed runtime identity before each mutation; drift fails closed.
 - Non-empty write delivery uses the clean-room publisher and is successful only with a terminal independently verified `status.delivery` receipt.
 - Codex, Claude, Copilot, and OpenCode are supported built-in RuntimePool profiles.
 

@@ -132,7 +132,7 @@ func newTestResultStore(t *testing.T) store.ResultStore {
 func newTestChatHandler(t *testing.T, c client.Client, ss store.SessionStore, rs store.ResultStore, cfg ChatConfig) *ChatHandler {
 	t.Helper()
 	resolver := NewProviderResolver(c, cfg)
-	return NewChatHandler(c, nil, cfg, "", false, ss, rs, resolver)
+	return NewChatHandler(c, nil, nil, cfg, "", false, ss, rs, resolver)
 }
 
 // providerCRD creates a Provider CRD + matching Secret for tests.
@@ -1207,7 +1207,7 @@ func TestHandleChat(t *testing.T) {
 		ss := newTestSessionStore(t)
 		rs := newTestResultStore(t)
 		cfg := DefaultChatConfig()
-		ch := NewChatHandler(fakeClient, nil, cfg, "restricted-ns", false, ss, rs, NewProviderResolver(fakeClient, cfg))
+		ch := NewChatHandler(fakeClient, nil, nil, cfg, "restricted-ns", false, ss, rs, NewProviderResolver(fakeClient, cfg))
 
 		app := fiber.New()
 		app.Post("/api/v1/chat", ch.HandleChat)

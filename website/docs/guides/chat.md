@@ -117,7 +117,7 @@ The live suite verifies transport behavior, session creation/persistence, and us
 |------|-------------|
 | `create_ai_task` | Create an AI/LLM-powered task |
 | `create_container_task` | Create a container task for shell commands |
-| `create_agent_task` | Create a built-in Codex, Claude, Copilot, or OpenCode ACP Task. External-v2 `runtimeRef` Task dispatch remains fail-closed. |
+| `create_agent_task` | Create an ACP Task using an existing Agent configured with a built-in runtime or a ready external-v2 `runtimeRef`. |
 | `check_task_progress` | Get task phase/status conditions |
 | `fetch_task_output` | Get completed task result (truncated to 2K chars) |
 | `wait_for_task` | Wait for task completion (max 60s per call, non-blocking) |

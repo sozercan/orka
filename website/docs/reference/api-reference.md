@@ -163,7 +163,7 @@ Common list query parameters: `namespace`, `taskName`, `agentName`, `type`, `sta
 | `/api/v1/agent-runtimes/:name` | PUT | Replace an external registration. |
 | `/api/v1/agent-runtimes/:name` | DELETE | Delete an external registration. |
 
-RuntimePools are controller-owned for built-in Codex, OpenCode, Claude, and Copilot Tasks; the public API is read-only. External registrations can be probed and conformance-tested, but `Agent.spec.runtime.runtimeRef` Task dispatch remains fail-closed until the external v2 dispatcher support boundary is enabled.
+RuntimePools are controller-owned for built-in Codex, OpenCode, Claude, and Copilot Tasks; the public API is read-only. A current-generation ready, strict-governed external registration can be selected through `Agent.spec.runtime.runtimeRef`. Orka revalidates its frozen endpoint, profile, authentication authority, and observed instance before dispatch and recovery mutations.
 
 ## Agents
 

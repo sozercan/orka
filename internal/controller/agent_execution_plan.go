@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -23,6 +24,7 @@ type agentExecutionPath string
 const (
 	agentExecutionPathACP       agentExecutionPath = "acp-runtime-pool"
 	agentExecutionPathHarnessV1 agentExecutionPath = "harness-v1"
+	agentExecutionPathExternal  agentExecutionPath = "acp-external-runtime"
 	agentExecutionPathRejected  agentExecutionPath = "rejected"
 )
 
@@ -59,10 +61,10 @@ func rejectAgentExecutionPlanWithWorkspaceStatus(reason string, err error) agent
 // Tasks. Built-in Codex, Claude, Copilot, and OpenCode runtimes use only the ACP v2
 // RuntimePool path; a Task.spec.execution.workspace request additionally binds
 // that path to a workspace-provider-backed RuntimePool when enabled and fails
-// closed otherwise. External runtimeRef registrations and conformance remain
-// available, but Task dispatch fails closed until the v2 dispatcher support
-// boundary is enabled. There is no legacy turn or Job fallback, and no
-// cross-mode harness-v1 fallback for workspace-backed v2 work.
+// closed otherwise. Strict-governed external runtimeRef registrations use the
+// same ACP Task and RuntimeSession state machines without becoming managed
+// RuntimePools. There is no legacy turn or Job fallback, and no cross-mode
+// harness-v1 fallback for v2 work.
 func (r *TaskReconciler) planAgentExecution(
 	ctx context.Context,
 	task *corev1alpha1.Task,
@@ -81,6 +83,12 @@ func (r *TaskReconciler) planAgentExecution(
 		}
 		runtime := &corev1alpha1.AgentRuntime{}
 		if err := reader.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: name}, runtime); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return agentExecutionPlan{
+					path:           agentExecutionPathRejected,
+					transientError: fmt.Errorf("resolve AgentRuntime %q: %w", name, err),
+				}
+			}
 			return rejectAgentExecutionPlan(fmt.Sprintf("resolve AgentRuntime %q: %v", name, err))
 		}
 		switch runtime.RegisteredContractVersion() {
@@ -95,10 +103,22 @@ func (r *TaskReconciler) planAgentExecution(
 			return agentHarnessV1Plan(name)
 		case corev1alpha1.AgentRuntimeContractHarnessV2:
 			if workspaceRequested {
-				err := fmt.Errorf("Task.spec.execution.workspace is not supported for external AgentRuntime dispatch; %s", externalAgentRuntimeDispatchUnsupportedReason(name)) //nolint:staticcheck // Field path begins the user-facing validation message.
+				err := errors.New("Task.spec.execution.workspace is not supported for external AgentRuntime dispatch; repository access uses Task.spec.workspace") //nolint:staticcheck // Field path begins the user-facing validation message.
 				return rejectAgentExecutionPlanWithWorkspaceStatus(err.Error(), err)
 			}
-			return rejectAgentExecutionPlan(externalAgentRuntimeDispatchUnsupportedReason(name))
+			if task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.MaxTurns != nil {
+				return rejectAgentExecutionPlan("runtimeRef custom runtimes do not support maxTurns; iteration limits are fixed by the registered runtime profile")
+			}
+			if reason := agentV2RuntimeUnsupportedReason(task, agent); reason != "" {
+				return rejectAgentExecutionPlan(reason)
+			}
+			if task.Spec.PriorTaskRef != nil {
+				return rejectAgentExecutionPlan("priorTaskRef continuation is not supported by external v2 runtimes; use sessionRef")
+			}
+			if !r.ACPRuntimeEnabled {
+				return rejectAgentExecutionPlan("ACP core runtime is disabled; external v2 agent runtimes have no fallback execution path")
+			}
+			return agentExecutionPlan{path: agentExecutionPathExternal, externalRuntimeName: name}
 		default:
 			return rejectAgentExecutionPlan(fmt.Sprintf("AgentRuntime %q is unclassified; a missing selector is never protocol evidence", name))
 		}
@@ -214,35 +234,56 @@ func (r *TaskReconciler) rejectUnsupportedACPWorkspacePlan(ctx context.Context, 
 	return agentExecutionPlan{}, false
 }
 
-func externalAgentRuntimeDispatchUnsupportedReason(name string) string {
-	return fmt.Sprintf("external AgentRuntime %q Task dispatch is not supported until the v2 dispatcher is wired", strings.TrimSpace(name))
+func externalAgentRuntimeReadinessReason(task *corev1alpha1.Task, runtime *corev1alpha1.AgentRuntime) string {
+	return externalAgentRuntimeConformanceReason(task, runtime, true)
 }
 
-func externalAgentRuntimeReadinessReason(task *corev1alpha1.Task, runtime *corev1alpha1.AgentRuntime) string {
-	if runtime == nil || runtime.RegisteredContractVersion() != corev1alpha1.AgentRuntimeContractHarnessV2 {
-		return "external AgentRuntime must use orka.harness.v2"
+func externalAgentRuntimeConformanceReason(
+	task *corev1alpha1.Task,
+	runtime *corev1alpha1.AgentRuntime,
+	requireReady bool,
+) string {
+	if err := externalAgentRuntimeConformanceError(task, runtime, requireReady); err != nil {
+		return err.Error()
 	}
-	if !runtime.Status.Ready || runtime.Status.ObservedGeneration != runtime.Generation || runtime.Status.ObservedCapabilities == nil {
-		return fmt.Sprintf("external AgentRuntime %q has not passed current-generation v2 conformance", runtime.Name)
+	return ""
+}
+
+func externalAgentRuntimeConformanceError(
+	task *corev1alpha1.Task,
+	runtime *corev1alpha1.AgentRuntime,
+	requireReady bool,
+) error {
+	if runtime == nil || runtime.RegisteredContractVersion() != corev1alpha1.AgentRuntimeContractHarnessV2 {
+		return errors.New("external AgentRuntime must use orka.harness.v2")
+	}
+	if requireReady && !runtime.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("external AgentRuntime %q is deleting and cannot accept new sessions", runtime.Name)
+	}
+	if (requireReady && !runtime.Status.Ready) || runtime.Status.ObservedGeneration != runtime.Generation || runtime.Status.ObservedCapabilities == nil {
+		return fmt.Errorf("external AgentRuntime %q has not passed current-generation v2 conformance", runtime.Name)
 	}
 	if runtime.Spec.Capabilities == nil || runtime.Spec.Capabilities.Profile == nil ||
 		runtime.Status.ObservedCapabilities.RuntimeInstanceID == "" ||
 		runtime.Status.ObservedCapabilities.RuntimeProfileDigest != runtime.Spec.Capabilities.Profile.Digest {
-		return fmt.Sprintf("external AgentRuntime %q does not have an exact observed runtime identity/profile", runtime.Name)
+		return fmt.Errorf("external AgentRuntime %q does not have an exact observed runtime identity/profile", runtime.Name)
 	}
 	if task != nil {
 		intent := effectiveACPWorkspaceIntent(task)
 		if runtime.Spec.Capabilities.Profile.WorkspaceIntent != intent {
-			return fmt.Sprintf("external AgentRuntime %q profile workspace intent %q does not match Task intent %q", runtime.Name, runtime.Spec.Capabilities.Profile.WorkspaceIntent, intent)
+			// The current conformed profile cannot execute this Task. Preserve the
+			// permanent classification so binding fails with the mismatch instead
+			// of treating it as runtime readiness and retrying until Task timeout.
+			return permanentACPAgentConfiguration(fmt.Errorf("external AgentRuntime %q profile workspace intent %q does not match Task intent %q", runtime.Name, runtime.Spec.Capabilities.Profile.WorkspaceIntent, intent))
 		}
 	}
 	if runtime.Spec.Capabilities.WorkspaceGovernance == nil ||
 		runtime.Status.ObservedCapabilities.WorkspaceGovernance == nil ||
 		!runtime.Spec.Capabilities.WorkspaceGovernance.Strict() ||
 		!runtime.Status.ObservedCapabilities.WorkspaceGovernance.Strict() {
-		return fmt.Sprintf("external AgentRuntime %q does not provide strict workspace governance", runtime.Name)
+		return fmt.Errorf("external AgentRuntime %q does not provide strict workspace governance", runtime.Name)
 	}
-	return ""
+	return nil
 }
 
 func (r *TaskReconciler) rejectPlannedAgentExecution(
@@ -264,12 +305,17 @@ func (r *TaskReconciler) rejectPlannedAgentExecution(
 }
 
 func agentACPRuntimeUnsupportedReason(task *corev1alpha1.Task, agent *corev1alpha1.Agent) string {
+	if task != nil && task.Spec.Transaction != nil {
+		return "ACP core runtime tasks do not support transaction token delegation"
+	}
+	return agentV2RuntimeUnsupportedReason(task, agent)
+}
+
+func agentV2RuntimeUnsupportedReason(task *corev1alpha1.Task, agent *corev1alpha1.Agent) string {
 	if task == nil {
 		return ""
 	}
 	switch {
-	case task.Spec.Transaction != nil:
-		return "ACP core runtime tasks do not support transaction token delegation"
 	case agent != nil && agent.Spec.Coordination != nil && agent.Spec.Coordination.Autonomous:
 		return "ACP core runtime tasks do not support Agent.spec.coordination.autonomous; disable autonomous coordination"
 	case task.Spec.RetryPolicy != nil && task.Spec.RetryPolicy.MaxRetries > 0:

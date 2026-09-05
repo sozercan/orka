@@ -401,6 +401,118 @@ func TestClientStrictPathBuildingRejectsTraversalBeforeTransport(t *testing.T) {
 	}
 }
 
+func TestClientBeforeMutationReservesRequestValidityWindow(t *testing.T) {
+	tests := []struct {
+		name             string
+		metadataLifetime time.Duration
+		callerDeadline   time.Duration
+	}{
+		{name: "metadata expiry", metadataLifetime: time.Second},
+		{name: "caller deadline", metadataLifetime: 5 * time.Second, callerDeadline: time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			request := clientTestCreateSessionRequest(t, now, "authority-budget-op")
+			request.Metadata.ExpiresAt = time.Now().UTC().Add(test.metadataLifetime)
+			sealRequest(t, request, &request.Metadata.RequestDigest)
+			originalDigest := request.Metadata.RequestDigest
+
+			ctx := context.Background()
+			effectiveDeadline := request.Metadata.ExpiresAt
+			if test.callerDeadline > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, test.callerDeadline)
+				defer cancel()
+				effectiveDeadline, _ = ctx.Deadline()
+			}
+			started := time.Now()
+			transportCalled := false
+			httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				transportCalled = true
+				return nil, errors.New("transport must not be called")
+			})}
+			var validationDeadline time.Time
+			client := clientTestClient(t, "http://runtime.invalid", WithHTTPClient(httpClient), WithBeforeMutation(func(ctx context.Context, _ string) error {
+				var ok bool
+				validationDeadline, ok = ctx.Deadline()
+				if !ok {
+					t.Fatal("pre-mutation authority context has no deadline")
+				}
+				<-ctx.Done()
+				return nil
+			}))
+
+			_, err := client.CreateRuntimeSession(ctx, request)
+			if !errors.Is(err, ErrClientValidation) || !strings.Contains(err.Error(), "reserved deadline") {
+				t.Fatalf("CreateRuntimeSession() error = %v, want reserved-deadline validation error", err)
+			}
+			if transportCalled {
+				t.Fatal("mutation transport was called after authority validation overran its deadline")
+			}
+			if !validationDeadline.Before(effectiveDeadline) {
+				t.Fatalf("authority deadline = %s, effective mutation deadline = %s", validationDeadline, effectiveDeadline)
+			}
+			if reserved, window := effectiveDeadline.Sub(validationDeadline), effectiveDeadline.Sub(started); reserved < window/3 {
+				t.Fatalf("reserved mutation window = %s, effective window = %s", reserved, window)
+			}
+			if !time.Now().Before(effectiveDeadline) {
+				t.Fatal("authority validation consumed the reserved mutation window")
+			}
+			if request.Metadata.RequestDigest != originalDigest {
+				t.Fatalf("request digest changed from %q to %q", originalDigest, request.Metadata.RequestDigest)
+			}
+		})
+	}
+}
+
+func TestClientMutationPreflightFailureReportsZeroWriteEvidence(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	request := clientTestCreateSessionRequest(t, now, "preflight-zero-write-op")
+	transportCalled := false
+	client := clientTestClient(t, "http://runtime.invalid",
+		WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			transportCalled = true
+			return nil, errors.New("mutation transport must not be called")
+		})}),
+		WithBeforeMutation(func(context.Context, string) error {
+			return errors.New("external runtime status unavailable")
+		}),
+	)
+
+	_, err := client.CreateRuntimeSession(context.Background(), request)
+	var clientErr *ClientError
+	if !errors.As(err, &clientErr) || !errors.Is(err, ErrClientValidation) {
+		t.Fatalf("CreateRuntimeSession() error = %v, want validation *ClientError", err)
+	}
+	if clientErr.WriteEvidence.State != RequestWriteZeroBytes || !clientErr.WriteEvidence.SafeToResendSameIdentity() {
+		t.Fatalf("write evidence = %#v, want zero bytes written", clientErr.WriteEvidence)
+	}
+	if transportCalled {
+		t.Fatal("mutation transport was called after pre-mutation validation failed")
+	}
+}
+
+func TestClientMutationRetryablePreflightFailurePreservesClassification(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	request := clientTestCreateSessionRequest(t, now, "retryable-preflight-op")
+	client := clientTestClient(t, "http://runtime.invalid",
+		WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("mutation transport must not be called")
+		})}),
+		WithBeforeMutation(func(context.Context, string) error {
+			return MarkPreMutationRetryable(context.DeadlineExceeded)
+		}),
+	)
+
+	_, err := client.CreateRuntimeSession(context.Background(), request)
+	var clientErr *ClientError
+	if !errors.As(err, &clientErr) || !clientErr.Retryable ||
+		clientErr.WriteEvidence.State != RequestWriteZeroBytes {
+		t.Fatalf("CreateRuntimeSession() error = %#v, want retryable zero-write validation", err)
+	}
+}
+
 func TestClientTransportWriteEvidence(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	request := clientTestCreateSessionRequest(t, now, "transport-op")

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,7 +32,7 @@ const (
 
 const gatewayEventColumns = `id, namespace, namespace_uid, gateway_uid, gateway_generation, gateway_name, binding_name, binding_uid, binding_generation, agent_name, agent_uid, external_event_id,
 	protocol_version, event_type, state, state_message, account_id, context_id, thread_id, sender_id,
-	sender_display_name, text, reply_target, metadata_json, session_name, task_name, task_uid, delivery_id, provider_message_id, trace_parent, trace_state, transcript_order, attempt_count,
+	sender_display_name, text, reply_target, metadata_json, session_name, task_name, task_uid, task_runtime_allowed_tools_json, delivery_id, provider_message_id, trace_parent, trace_state, transcript_order, attempt_count,
 	claim_owner, claim_until, next_attempt_at, occurred_at, received_at, expires_at, created_at, updated_at, completed_at`
 
 const gatewayListOrder = ` ORDER BY created_at DESC, id DESC`
@@ -657,6 +658,54 @@ func (s *Store) RenewGatewayEventClaim(
 		return nil, store.ErrConflict
 	}
 	return s.GetGatewayEvent(ctx, namespace, id)
+}
+
+// FreezeGatewayEventTaskRuntimeAllowedTools records the external runtime policy
+// that will be written to the deterministic Task. The first value wins so
+// crash recovery never rebuilds the Task from mutable live policy.
+func (s *Store) FreezeGatewayEventTaskRuntimeAllowedTools(
+	ctx context.Context,
+	namespace, id, owner string,
+	allowedTools []string,
+	now time.Time,
+) (*store.GatewayEvent, error) {
+	if strings.TrimSpace(owner) == "" || allowedTools == nil {
+		return nil, store.ValidationErrorf("claim owner and explicit allowedTools are required")
+	}
+	encoded, err := json.Marshal(allowedTools)
+	if err != nil {
+		return nil, fmt.Errorf("encode Gateway Task runtime allowedTools: %w", err)
+	}
+	now = now.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE gateway_events
+		SET task_runtime_allowed_tools_json = ?, updated_at = ?
+		WHERE namespace = ? AND id = ? AND state = ? AND claim_owner = ?
+		  AND claim_until > ? AND expires_at > ?
+		  AND (task_runtime_allowed_tools_json IS NULL OR task_runtime_allowed_tools_json = ?)`,
+		string(encoded), now, namespace, id, store.GatewayEventDispatching, owner,
+		now, now, string(encoded),
+	)
+	if err != nil {
+		return nil, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if updated == 0 {
+		return nil, store.ErrConflict
+	}
+	event, err := s.GetGatewayEvent(ctx, namespace, id)
+	if err != nil {
+		return nil, err
+	}
+	if !event.TaskPolicyFrozen || !slices.Equal(event.TaskAllowedTools, allowedTools) {
+		return nil, store.ErrConflict
+	}
+	return event, nil
 }
 
 // MarkGatewayEventTaskCreated links a claimed event to its deterministic Task.
@@ -1813,12 +1862,13 @@ type gatewayRowScanner interface {
 func scanGatewayEvent(row gatewayRowScanner) (*store.GatewayEvent, error) {
 	var event store.GatewayEvent
 	var metadataJSON string
+	var taskRuntimeAllowedToolsJSON sql.NullString
 	var claimUntil, occurredAt, completedAt sql.NullTime
 	if err := row.Scan(
 		&event.ID, &event.Namespace, &event.NamespaceUID, &event.GatewayUID, &event.GatewayGeneration, &event.GatewayName, &event.BindingName,
 		&event.BindingUID, &event.BindingGeneration, &event.AgentName, &event.AgentUID, &event.ExternalEventID, &event.ProtocolVersion, &event.EventType, &event.State, &event.StateMessage,
 		&event.AccountID, &event.ContextID, &event.ThreadID, &event.SenderID, &event.SenderDisplayName,
-		&event.Text, &event.ReplyTarget, &metadataJSON, &event.SessionName, &event.TaskName, &event.TaskUID,
+		&event.Text, &event.ReplyTarget, &metadataJSON, &event.SessionName, &event.TaskName, &event.TaskUID, &taskRuntimeAllowedToolsJSON,
 		&event.DeliveryID, &event.ProviderMessageID, &event.TraceParent, &event.TraceState,
 		&event.TranscriptOrder, &event.AttemptCount, &event.ClaimOwner, &claimUntil, &event.NextAttemptAt, &occurredAt,
 		&event.ReceivedAt, &event.ExpiresAt, &event.CreatedAt, &event.UpdatedAt, &completedAt,
@@ -1827,6 +1877,15 @@ func scanGatewayEvent(row gatewayRowScanner) (*store.GatewayEvent, error) {
 	}
 	if err := unmarshalStringMap(metadataJSON, &event.Metadata); err != nil {
 		return nil, err
+	}
+	if taskRuntimeAllowedToolsJSON.Valid {
+		if err := json.Unmarshal([]byte(taskRuntimeAllowedToolsJSON.String), &event.TaskAllowedTools); err != nil {
+			return nil, fmt.Errorf("decode Gateway Task runtime allowedTools: %w", err)
+		}
+		if event.TaskAllowedTools == nil {
+			return nil, fmt.Errorf("decode Gateway Task runtime allowedTools: frozen value must be an explicit list")
+		}
+		event.TaskPolicyFrozen = true
 	}
 	event.ClaimUntil = timePtr(claimUntil)
 	event.OccurredAt = timePtr(occurredAt)

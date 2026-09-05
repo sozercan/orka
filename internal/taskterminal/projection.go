@@ -275,8 +275,9 @@ func equalDeliveryEvidence(task *corev1alpha1.Task, left, right *corev1alpha1.Ta
 	leftCopy.LastTransitionTime, rightCopy.LastTransitionTime = nil, nil
 	// The projector strips the protocol-only no-workspace revision before the
 	// schema-validated Task status while the immutable payload keeps it, so
-	// evidence is compared through that same normalization.
-	if task != nil && task.Spec.Workspace == nil {
+	// evidence is compared through that same normalization. Workspace intent
+	// and options alone do not establish a repository baseline.
+	if task != nil && (task.Spec.Workspace == nil || strings.TrimSpace(task.Spec.Workspace.GitRepo) == "") {
 		if leftCopy.StartingSHA == NoWorkspaceRevision {
 			leftCopy.StartingSHA = ""
 		}

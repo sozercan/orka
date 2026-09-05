@@ -1,7 +1,6 @@
-# This Agent shows the future namespace-local external v2 selector shape from
-# core_v1alpha1_agentruntime.yaml. Registration and conformance are available,
-# but runtimeRef Task dispatch remains fail-closed until the external v2
-# dispatcher support boundary is enabled. Built-in Codex, Claude, Copilot, and
+# This Agent selects the namespace-local external v2 registration from
+# core_v1alpha1_agentruntime.yaml. The registered profile owns provider, model,
+# prompt, skill, and runtime defaults. Built-in Codex, Claude, Copilot, and
 # OpenCode Agents use runtime.type instead.
 apiVersion: core.orka.ai/v1alpha1
 kind: Agent
@@ -11,10 +10,6 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: external-v2-agent
 spec:
-  model:
-    name: operator-reviewed-model
-  systemPrompt:
-    inline: "You are an operator-reviewed external coding assistant."
   runtime:
     runtimeRef:
       name: sample-external-v2-runtime

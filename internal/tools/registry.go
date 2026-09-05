@@ -49,7 +49,10 @@ type TranscriptSearcher interface {
 
 // ToolContext provides dependencies for tools that need K8s client access or other services.
 type ToolContext struct {
-	Client                    client.Client
+	Client client.Client
+	// PolicyReader bypasses informer lag when coordination tools resolve Task,
+	// Agent, Provider, Tool, and AgentRuntime policy. Writes continue through Client.
+	PolicyReader              client.Reader
 	KubeClient                kubernetes.Interface
 	Namespace                 string
 	SessionID                 string
@@ -642,6 +645,19 @@ func RegisterBrokeredCoordinationTools(r *Registry, k8sClient client.Client) err
 	r.Register(NewRememberMemoryTool())
 	r.Register(NewProposeMemoryTool())
 	r.Register(NewSearchTranscriptTool())
+	return nil
+}
+
+// RegisterBrokeredWebTools registers public web reads whose implementations
+// are safe to execute inside the controller MCP broker. Registration is
+// idempotent because Registry.Register replaces the implementation for a
+// stable tool name.
+func RegisterBrokeredWebTools(r *Registry) error {
+	if r == nil {
+		return fmt.Errorf("brokered web tool registry is required")
+	}
+	r.Register(NewBrokeredWebSearchTool())
+	r.Register(NewBrokeredWebFetchTool())
 	return nil
 }
 

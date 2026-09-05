@@ -463,6 +463,7 @@ func (d *ACPDispatcher) publishWorkspaceDeltaOperation(
 			BaseRepository: pullRequestBase, BaseRef: publication.PRIntent.BaseRef,
 			HeadRepository: target, HeadRef: publication.PRIntent.HeadRef,
 			PublicationGeneration: publication.Generation, ExpectedHeadOID: publication.PRIntent.ExpectedHeadSHA,
+			SessionUID: publication.SessionUID,
 		}
 		prOperation := publicationOperationID("pr-reconcile", task)
 		prRequest := publisherservice.PullRequestReconcileRequest{
@@ -1336,7 +1337,10 @@ func taskDeliveryStatusForKubernetes(task *corev1alpha1.Task, status corev1alpha
 	// repository workspace. It is not a Git object ID and must not escape into
 	// the schema-validated Task status. Preserve every other value so malformed
 	// real-workspace revisions continue to fail closed at the API boundary.
-	if task != nil && task.Spec.Workspace == nil && status.StartingSHA == acpNoWorkspaceRevision {
+	// A workspace may declare intent or options without a repository, matching
+	// the emptyRuntimeWorkspace and prepareRuntimeWorkspace admission paths.
+	if task != nil && (task.Spec.Workspace == nil || strings.TrimSpace(task.Spec.Workspace.GitRepo) == "") &&
+		status.StartingSHA == acpNoWorkspaceRevision {
 		status.StartingSHA = ""
 	}
 	return status

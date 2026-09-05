@@ -53,6 +53,9 @@ function externalRuntime() {
           approvalPolicyDigest: digest, mcpConfigurationDigest: digest, workspaceIntent: 'read',
           proxyCredentialRole: 'provider', proxyCredentialScope: 'codex', resourceClass: 'standard',
         },
+        mcpPolicy: {
+          allowedTools: ['web_search'], disallowedTools: [], allowBash: false, approvalRequiredTools: [],
+        },
         limits: {
           maxResidentSessions: 10, maxConcurrentPrompts: 4, maxRequestBytes: 1000, maxEventLineBytes: 1000,
           maxTerminalResultBytes: 1000, maxBufferedEvents: 100, maxUpdateEventsPerSecond: 50,

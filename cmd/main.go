@@ -1161,6 +1161,10 @@ func main() {
 	var acpMCPRegistry *tools.Registry
 	if acpRuntimeEnabled {
 		acpMCPRegistry = tools.NewRegistry()
+		if err := tools.RegisterBrokeredWebTools(acpMCPRegistry); err != nil {
+			setupLog.Error(err, "unable to register ACP MCP broker web tools")
+			os.Exit(1)
+		}
 		if err := tools.RegisterBrokeredCoordinationTools(acpMCPRegistry, mgr.GetClient()); err != nil {
 			setupLog.Error(err, "unable to register ACP MCP broker coordination tools")
 			os.Exit(1)
@@ -1238,9 +1242,19 @@ func main() {
 	var acpSessionContinuity *controller.ACPSessionContinuity
 	var kubeControlStore *storekube.Store
 	if controlNamespace != "" {
+		// Session deletion must retain runtime cleanup even when admission is
+		// disabled. This dispatcher only performs authenticated recovery; it
+		// does not run the admission loop.
+		sessionCleanupDispatcher := &controller.ACPDispatcher{
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), ResultStore: sqliteStore,
+			Snapshots:               agentExecutionSnapshotStore,
+			SubstrateRouterURL:      substrateConfig.RouterURL,
+			SubstrateActorDNSSuffix: substrateConfig.ActorDNSSuffix,
+		}
 		controlStoreOptions := []storekube.Option{
 			storekube.WithAPIReader(mgr.GetAPIReader()),
 			storekube.WithWatchNamespace(watchNamespace),
+			storekube.WithSessionRuntimeCleanup(sessionCleanupDispatcher.CleanupSessionRuntime),
 		}
 		if harnessV1Enabled {
 			controlStoreOptions = append(controlStoreOptions, storekube.WithoutClusterScopedBranchClaims())
@@ -1254,6 +1268,8 @@ func main() {
 		}
 		controllerEpochManager = controller.NewControllerEpochManager(kubeControlStore, controllerHolderID).
 			WithMirror(sqliteStore)
+		sessionCleanupDispatcher.Store = kubeControlStore
+		sessionCleanupDispatcher.Epochs = controllerEpochManager
 		sessionManager.SetACPSessionCleanup(kubeControlStore, controllerEpochManager)
 		if err := mgr.Add(controllerEpochManager); err != nil {
 			setupLog.Error(err, "unable to add controller epoch manager")
@@ -1280,12 +1296,12 @@ func main() {
 		}
 		if harnessV1Enabled {
 			acpSessionContinuity, err = controller.NewHarnessV1SessionContinuity(controller.HarnessV1SessionContinuityConfig{
-				SessionControls: kubeControlStore, Transcripts: sqliteStore, Lineages: sqliteStore,
+				SessionControls: kubeControlStore, Transcripts: sqliteStore, GatewayEvents: sqliteStore, Lineages: sqliteStore,
 			})
 		} else {
 			acpSessionContinuity, err = controller.NewACPSessionContinuity(controller.ACPSessionContinuityConfig{
 				SessionControls: kubeControlStore, Transcripts: sqliteStore, Publications: kubeControlStore, BranchClaims: kubeControlStore,
-				Lineages: sqliteStore,
+				GatewayEvents: sqliteStore, Lineages: sqliteStore,
 			})
 		}
 		if err != nil {
@@ -1762,10 +1778,12 @@ func main() {
 	}
 
 	if err := (&controller.AgentRuntimeReconciler{
-		Client:              mgr.GetClient(),
-		APIReader:           mgr.GetAPIReader(),
-		Scheme:              mgr.GetScheme(),
-		HarnessV1HTTPClient: harnessV1HTTPClient,
+		Client:                 mgr.GetClient(),
+		APIReader:              mgr.GetAPIReader(),
+		Scheme:                 mgr.GetScheme(),
+		HarnessV1HTTPClient:    harnessV1HTTPClient,
+		MCPRegistry:            acpMCPRegistry,
+		ControllerEpochManager: controllerEpochManager,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AgentRuntime")
 		os.Exit(1)
@@ -1883,6 +1901,7 @@ func main() {
 		MessageStore:              sqliteStore,
 		ArtifactStore:             sqliteStore,
 		ArtifactReservations:      artifactRetentionWiring.runtimeReservations,
+		AgentExecutionSnapshots:   agentExecutionSnapshotStore,
 		ExternalEffects:           kubeControlStore,
 		MemoryStore:               sqliteStore,
 		MemoryProposalStore:       sqliteStore,
@@ -1919,7 +1938,8 @@ func main() {
 	if acpRuntimeEnabled {
 		mcpBroker, err := controller.NewProductionACPMCPBroker(controller.ACPMCPBrokerDependencies{
 			Reader: mgr.GetAPIReader(), Epochs: controllerEpochManager, ControlStore: durableControlStore,
-			KubeClient: kubeClient, Registry: acpMCPRegistry,
+			AgentExecutionSnapshots: agentExecutionSnapshotStore,
+			KubeClient:              kubeClient, Registry: acpMCPRegistry,
 			OutboundAccess: outboundAccessResolver, TransactionExchange: brokeredTransactionExchange,
 			EnforceTransactionCredentialAuth: contextTokenAuthzConfig.Mode == api.ContextTokenAuthorizationModeEnforce,
 			TransactionCredentialReadScopes:  contextTokenAuthzConfig.SecretCredentialReadScopes(),
@@ -1929,7 +1949,7 @@ func main() {
 					return nil, fmt.Errorf("authenticated ACP MCP task context is unavailable")
 				}
 				return &tools.ToolContext{
-					Client: mgr.GetClient(), KubeClient: kubeClient, Namespace: request.Namespace,
+					Client: mgr.GetClient(), PolicyReader: mgr.GetAPIReader(), KubeClient: kubeClient, Namespace: request.Namespace,
 					SessionID: string(request.Authorization.RuntimeSessionUID), TaskID: task.Name,
 					TaskUID: task.UID, ParentTaskID: task.ParentTaskID, AgentName: task.AgentName,
 					OperationID: string(request.Metadata.OperationID), ExternalEffects: durableControlStore,

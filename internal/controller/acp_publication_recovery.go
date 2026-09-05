@@ -411,6 +411,7 @@ func (d *ACPDispatcher) recoverPublicationPullRequest(
 			BaseRepository: recovery.pullRequestBase, BaseRef: publication.PRIntent.BaseRef,
 			HeadRepository: recovery.target, HeadRef: publication.PRIntent.HeadRef,
 			PublicationGeneration: publication.Generation, ExpectedHeadOID: publication.PRIntent.ExpectedHeadSHA,
+			SessionUID: publication.SessionUID,
 		},
 	}
 	prResponse, err := runACPExternalEffect(ctx, d, recovery.fence, store.ExternalEffectIdentity{

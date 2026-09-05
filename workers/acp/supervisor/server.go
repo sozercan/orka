@@ -35,7 +35,7 @@ type Server struct {
 	lifecycle     harnessv2.SupervisorLifecycle
 	drain         harnessv2.DrainStatus
 	sessions      map[harnessv2.RuntimeSessionID]*sessionState
-	tombstones    map[harnessv2.RuntimeSessionUID]harnessv2.RuntimeSessionTombstone
+	tombstones    map[harnessv2.RuntimeSessionUID]sessionTombstone
 	failedCreates map[harnessv2.RuntimeSessionUID]failedCreateReplay
 	poolOps       map[harnessv2.OperationID]harnessv2.OperationRecord
 	statusNonces  map[string]time.Time
@@ -142,6 +142,24 @@ const sessionDeletionOperationReserve = 1
 // count, while count-based eviction would reopen valid create capabilities for
 // replay.
 const tombstoneRetention = time.Hour
+
+type sessionTombstone struct {
+	harnessv2.RuntimeSessionTombstone
+	sessionID     harnessv2.RuntimeSessionID
+	prompt        *retiredPromptSettlement
+	cancellations map[harnessv2.OperationID]*operationReplay
+	// Late cancellation records stay separate so explicit deletion replays
+	// continue to return the original immutable wire tombstone.
+	cancellationOperations map[harnessv2.OperationID]harnessv2.OperationRecord
+}
+
+// A retired prompt retains proof, never its input, output, or capabilities.
+// Its lifetime follows the session tombstone, independently of the admission
+// capability, which can expire while a renewed prompt is still running.
+type retiredPromptSettlement struct {
+	metadata   harnessv2.MutationMetadata
+	settlement harnessv2.PromptSettlement
+}
 
 // pruneTombstonesLocked drops only records older than tombstoneRetention. It
 // must be called with s.mu held, before a new tombstone is inserted.
@@ -266,11 +284,13 @@ type promptMutationExecutor interface {
 }
 
 type operationReplay struct {
-	done         chan struct{}
-	permission   *harnessv2.PermissionResolutionResponse
-	cancellation *harnessv2.CancelPromptResponse
-	lease        *harnessv2.PromptLeaseResponse
-	failure      *operationFailure
+	done           chan struct{}
+	isCancellation bool
+	admission      *harnessv2.PromptAdmissionResponse
+	permission     *harnessv2.PermissionResolutionResponse
+	cancellation   *harnessv2.CancelPromptResponse
+	lease          *harnessv2.PromptLeaseResponse
+	failure        *operationFailure
 }
 
 type operationFailure struct {
@@ -418,7 +438,7 @@ func newServer(cfg Config, prepareIdentityState func(string, *acp.UIDAllocator) 
 		lifecycle:              harnessv2.SupervisorLifecycleReady,
 		drain:                  harnessv2.DrainStatus{AcceptingNewSessions: true},
 		sessions:               make(map[harnessv2.RuntimeSessionID]*sessionState),
-		tombstones:             make(map[harnessv2.RuntimeSessionUID]harnessv2.RuntimeSessionTombstone),
+		tombstones:             make(map[harnessv2.RuntimeSessionUID]sessionTombstone),
 		failedCreates:          make(map[harnessv2.RuntimeSessionUID]failedCreateReplay),
 		poolOps:                make(map[harnessv2.OperationID]harnessv2.OperationRecord),
 		promptSlots:            make(chan struct{}, cfg.Capabilities.Limits.MaxConcurrentPrompts),
@@ -507,13 +527,13 @@ func (s *Server) tombstoneFailedCreateLocked(
 	}
 	delete(s.sessions, sessionID)
 	s.pruneTombstonesLocked(time.Now().UTC())
-	s.tombstones[metadata.Fence.RuntimeSessionUID] = harnessv2.RuntimeSessionTombstone{
+	s.tombstones[metadata.Fence.RuntimeSessionUID] = sessionTombstone{RuntimeSessionTombstone: harnessv2.RuntimeSessionTombstone{
 		RuntimeSessionUID:        metadata.Fence.RuntimeSessionUID,
 		RuntimeSessionGeneration: metadata.Fence.RuntimeSessionGeneration,
 		RuntimeProfileDigest:     s.cfg.Fence.RuntimeProfileDigest,
 		DeletedAt:                time.Now().UTC(),
 		Operations:               []harnessv2.OperationRecord{operationRecord(metadata, harnessv2.OperationPhaseRecorded, "", recordedAt)},
-	}
+	}}
 	if replay == nil {
 		delete(s.failedCreates, metadata.Fence.RuntimeSessionUID)
 		return
@@ -699,7 +719,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, harnessv2.ErrorCodeInvalidRequest, err.Error(), nil, false)
 		return
 	}
-	if request.AgentConfiguration == nil {
+	if request.AgentConfiguration == nil && s.cfg.Provider.Kind != providerKindAgentKit {
 		writeError(w, http.StatusTooManyRequests, harnessv2.ErrorCodeRateLimited, "runtime is waiting for a controller that supports Agent session configuration", nil, true)
 		return
 	}
@@ -720,6 +740,12 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expected := s.expectedFence(request.Metadata.Fence.RuntimeSessionUID, request.Metadata.Fence.RuntimeSessionGeneration)
+	// Fresh creates have no operation record or tombstone to classify, but
+	// must still match the current supervisor before allocating an identity.
+	if mismatch := harnessv2.CompareFence(expected, request.Metadata.Fence, true); mismatch != harnessv2.FenceMatch {
+		writeClassificationError(w, harnessv2.Classification{Class: harnessv2.RequestClassificationStaleFence, FenceMismatch: mismatch})
+		return
+	}
 
 	s.mu.Lock()
 	if existing := s.sessions[request.RuntimeSessionID]; existing != nil {
@@ -837,7 +863,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	state.providerProxy = providerProxy
 	state.mcpProxy = mcpProxy
 	state.profile = request.Profile
-	state.agentConfiguration = *request.AgentConfiguration
+	if request.AgentConfiguration == nil {
+		state.agentConfiguration.MaxTurns = defaultProviderProxyMaxTurns
+	} else {
+		state.agentConfiguration = *request.AgentConfiguration
+	}
 	state.agentDiagnosticFilter = diagnosticFilter
 	state.creating = false
 	recordSessionOperationLocked(state, request.Metadata, harnessv2.OperationPhaseApplied, "", now)
@@ -1446,21 +1476,43 @@ func (s *Server) cleanupDrainedSession(sessionID harnessv2.RuntimeSessionID, sta
 	deletedAt := time.Now().UTC()
 	s.mu.Lock()
 	if s.sessions[sessionID] == state {
-		pruneSessionOperationsLocked(state, deletedAt)
-		operations := make([]harnessv2.OperationRecord, 0, len(state.operations))
-		for _, operation := range state.operations {
-			operations = append(operations, operation)
-		}
-		tombstone := harnessv2.RuntimeSessionTombstone{
-			RuntimeSessionUID: state.descriptor.RuntimeSessionUID, RuntimeSessionGeneration: state.descriptor.Generation,
-			RuntimeProfileDigest: state.descriptor.RuntimeProfileDigest, DeletedAt: deletedAt, Operations: operations,
-		}
-		delete(s.sessions, sessionID)
-		s.pruneTombstonesLocked(deletedAt)
-		delete(s.failedCreates, tombstone.RuntimeSessionUID)
-		s.tombstones[tombstone.RuntimeSessionUID] = tombstone
+		s.tombstoneSessionLocked(state, deletedAt)
 	}
 	s.mu.Unlock()
+}
+
+// tombstoneSessionLocked preserves replay and terminal proof after either
+// explicit deletion or automatic cleanup. The caller must hold s.mu.
+func (s *Server) tombstoneSessionLocked(state *sessionState, deletedAt time.Time) sessionTombstone {
+	pruneSessionOperationsLocked(state, deletedAt)
+	operations := make([]harnessv2.OperationRecord, 0, len(state.operations))
+	for _, operation := range state.operations {
+		operations = append(operations, operation)
+	}
+	tombstone := sessionTombstone{
+		RuntimeSessionTombstone: harnessv2.RuntimeSessionTombstone{
+			RuntimeSessionUID: state.descriptor.RuntimeSessionUID, RuntimeSessionGeneration: state.descriptor.Generation,
+			RuntimeProfileDigest: state.descriptor.RuntimeProfileDigest, DeletedAt: deletedAt, Operations: operations,
+		},
+		sessionID:              state.id,
+		cancellations:          make(map[harnessv2.OperationID]*operationReplay),
+		cancellationOperations: make(map[harnessv2.OperationID]harnessv2.OperationRecord),
+	}
+	if state.prompt != nil && state.prompt.settlement != nil && state.prompt.settlement.Validate() == nil {
+		tombstone.prompt = &retiredPromptSettlement{metadata: state.prompt.request.Metadata, settlement: *state.prompt.settlement}
+	}
+	for operationID, replay := range state.operationReplays {
+		if replay.isCancellation {
+			// Keep the shared replay until its owner finishes, even when cleanup
+			// overtakes an in-flight cancellation handler.
+			tombstone.cancellations[operationID] = replay
+		}
+	}
+	delete(s.sessions, state.id)
+	s.pruneTombstonesLocked(deletedAt)
+	delete(s.failedCreates, tombstone.RuntimeSessionUID)
+	s.tombstones[tombstone.RuntimeSessionUID] = tombstone
+	return tombstone
 }
 
 // Close stops admission and tears down all resident runtime sessions. A cleanup

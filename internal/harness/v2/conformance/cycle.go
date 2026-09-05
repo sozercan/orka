@@ -49,30 +49,18 @@ func probeLifecycle(
 	if err != nil {
 		return fmt.Errorf("allocate conformance identity: %w", err)
 	}
-	sessionID := harnessv2.RuntimeSessionID("conformance-session-" + probeID)
-	sessionUID := harnessv2.RuntimeSessionUID("conformance-session-uid-" + probeID)
-	taskUID := harnessv2.TaskUID("conformance-task-" + probeID)
-	promptID := harnessv2.PromptID("conformance-prompt-" + probeID)
-
-	fence := status.Fence
-	fence.RuntimeSessionUID = sessionUID
-	fence.RuntimeSessionGeneration = 1
-	workspace := harnessv2.WorkspaceSpec{
-		Intent: target.Profile.WorkspaceIntent,
-		Baseline: harnessv2.WorkspaceBaseline{
-			RepositoryIdentity: "orka-conformance.invalid/repository",
-			Revision:           "conformance-baseline",
-			TreeDigest:         digestString("conformance-baseline-" + probeID),
-		},
+	// Cancellation retires a session. Prove workspace validation and
+	// publication on a separate, successfully completed prompt first.
+	if target.WorkspaceGovernance.Strict() {
+		workspaceProbeID := "workspace-" + probeID
+		workspaceState := newLifecycleProbeState(httpClient, client, target, status.Fence, workspaceProbeID)
+		if err := workspaceState.probeWorkspaceLifecycle(ctx, status, workspaceProbeID); err != nil {
+			return err
+		}
 	}
-	state := &lifecycleProbeState{
-		client: client, httpClient: httpClient, target: target,
-		sessionID: sessionID, sessionFence: fence, workspace: workspace,
-		taskUID: taskUID, promptID: promptID,
-	}
+	state := newLifecycleProbeState(httpClient, client, target, status.Fence, probeID)
 	defer state.cleanup(ctx)
-
-	if err := probeStaleInstanceFence(ctx, client, target, status.Fence, workspace, taskUID, probeID); err != nil {
+	if err := probeStaleInstanceFence(ctx, client, target, status.Fence, state.workspace, state.taskUID, probeID); err != nil {
 		return err
 	}
 	if err := state.probeSessionCreation(ctx, status, probeID); err != nil {
@@ -83,22 +71,90 @@ func probeLifecycle(
 			return err
 		}
 	}
+	// Check the generation while the session is still idle. Cancellation may
+	// retire it before the controller can issue an explicit deletion.
+	deleteRequest, err := state.deleteSessionRequest("delete-session-" + probeID)
+	if err != nil {
+		return err
+	}
+	if err := state.probeStaleSessionDeletion(ctx, deleteRequest); err != nil {
+		return err
+	}
 	promptRequest, settlement, err := state.probePromptCancellationLifecycle(ctx, probeID)
 	if err != nil {
 		return err
 	}
-	if target.WorkspaceGovernance.Strict() {
-		delta, deltaErr := state.probeWorkspaceDelta(ctx, probeID, promptRequest.Metadata, settlement)
-		if deltaErr != nil {
-			return deltaErr
-		}
-		if target.SupportsPublicationFinalization && delta.Delta.State == harnessv2.WorkspaceDeltaPrepared {
-			if err := state.probePublicationFinalization(ctx, probeID, promptRequest.Metadata, delta.Delta); err != nil {
-				return err
-			}
+	completed := settlement.TerminalEvent == harnessv2.EventCompleted
+	// A prompt that finishes before cancellation still owes workspace
+	// validation and publication finalization before its session can retire.
+	if completed && target.WorkspaceGovernance.Strict() {
+		if err := state.probeCompletedPromptWorkspace(ctx, probeID, promptRequest.Metadata, settlement); err != nil {
+			return err
 		}
 	}
-	return state.probeSessionDeletion(ctx, probeID)
+	return state.probeSessionDeletion(ctx, probeID, !completed)
+}
+
+func newLifecycleProbeState(
+	httpClient *http.Client,
+	client *harnessv2.Client,
+	target Target,
+	fence harnessv2.Fence,
+	probeID string,
+) *lifecycleProbeState {
+	sessionID := harnessv2.RuntimeSessionID("conformance-session-" + probeID)
+	sessionUID := harnessv2.RuntimeSessionUID("conformance-session-uid-" + probeID)
+	taskUID := harnessv2.TaskUID("conformance-task-" + probeID)
+	promptID := harnessv2.PromptID("conformance-prompt-" + probeID)
+
+	fence.RuntimeSessionUID = sessionUID
+	fence.RuntimeSessionGeneration = 1
+	workspace := harnessv2.WorkspaceSpec{
+		Intent: target.Profile.WorkspaceIntent,
+		Baseline: harnessv2.WorkspaceBaseline{
+			RepositoryIdentity: "orka-conformance.invalid/repository",
+			Revision:           "conformance-baseline",
+			TreeDigest:         digestString("conformance-baseline-" + probeID),
+		},
+	}
+	return &lifecycleProbeState{
+		client: client, httpClient: httpClient, target: target,
+		sessionID: sessionID, sessionFence: fence, workspace: workspace,
+		taskUID: taskUID, promptID: promptID,
+	}
+}
+
+func (s *lifecycleProbeState) probeWorkspaceLifecycle(ctx context.Context, status *harnessv2.StatusResponse, probeID string) error {
+	defer s.cleanup(ctx)
+	if err := s.probeSessionCreation(ctx, status, probeID); err != nil {
+		return err
+	}
+	promptRequest, settlement, err := s.probeCompletedPromptLifecycle(ctx, probeID)
+	if err != nil {
+		return err
+	}
+	if err := s.probeCompletedPromptWorkspace(ctx, probeID, promptRequest.Metadata, settlement); err != nil {
+		return err
+	}
+	return s.probeSessionDeletion(ctx, probeID, false)
+}
+
+func (s *lifecycleProbeState) probeCompletedPromptWorkspace(
+	ctx context.Context,
+	probeID string,
+	metadata harnessv2.MutationMetadata,
+	settlement harnessv2.PromptSettlement,
+) error {
+	delta, err := s.probeWorkspaceDelta(ctx, probeID, metadata, settlement)
+	if err != nil {
+		return err
+	}
+	if s.target.SupportsPublicationFinalization && delta.Delta.State == harnessv2.WorkspaceDeltaPrepared {
+		if err := s.probePublicationFinalization(ctx, probeID, metadata, delta.Delta); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *lifecycleProbeState) probeSessionCreation(
@@ -128,6 +184,39 @@ func (s *lifecycleProbeState) probeSessionCreation(
 	return nil
 }
 
+func (s *lifecycleProbeState) probeCompletedPromptLifecycle(
+	ctx context.Context,
+	probeID string,
+) (harnessv2.StartPromptRequest, harnessv2.PromptSettlement, error) {
+	request, err := s.startPromptRequest("start-prompt-" + probeID)
+	if err != nil {
+		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, err
+	}
+	request.Input.Content[0].Text = "Orka harness conformance: respond with ok and perform no external side effects."
+	request.Input.Metadata["orka.conformance"] = "complete-for-workspace"
+	if err := setRequestDigest(&request, &request.Metadata); err != nil {
+		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, err
+	}
+	s.promptStarted = true
+	stream, err := s.client.StartPrompt(ctx, s.sessionID, request)
+	if err != nil {
+		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, fmt.Errorf("open workspace probe prompt stream: %w", err)
+	}
+	defer stream.Close() //nolint:errcheck
+	result := consumePromptStream(stream)
+	if result.err != nil {
+		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, fmt.Errorf("consume workspace probe prompt stream: %w", result.err)
+	}
+	if result.terminal == nil || result.terminal.Type != harnessv2.EventCompleted {
+		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, fmt.Errorf("workspace probe prompt did not complete successfully")
+	}
+	streamDone := make(chan promptStreamResult, 1)
+	streamDone <- result
+	// Replaying cancellation and settlement is safe while the completed
+	// session awaits validation. A canceled session may already be retired.
+	return s.probeCancellationSettlement(ctx, probeID, request, streamDone, true)
+}
+
 func (s *lifecycleProbeState) probePromptCancellationLifecycle(
 	ctx context.Context,
 	probeID string,
@@ -155,15 +244,33 @@ func (s *lifecycleProbeState) probePromptCancellationLifecycle(
 	go func() {
 		streamDone <- consumePromptStream(stream)
 	}()
+	var replay promptReplayObservation
 	if s.target.WorkspaceGovernance.DuplicateSafeMutations {
 		if accepted.Accepted == nil {
 			return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, fmt.Errorf("accepted prompt event omitted acceptance metadata")
 		}
-		if err := s.probeAcceptedPromptReplay(ctx, request, accepted.Accepted.AcceptedAt); err != nil {
+		replay, err = s.probeAcceptedPromptReplay(ctx, request, accepted.Accepted.AcceptedAt)
+		if err != nil {
 			return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, err
 		}
 	}
+	request, settlement, err := s.probeCancellationSettlement(ctx, probeID, request, streamDone, false)
+	if err != nil {
+		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, err
+	}
+	if err := replay.validateSettlement(settlement); err != nil {
+		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, err
+	}
+	return request, settlement, nil
+}
 
+func (s *lifecycleProbeState) probeCancellationSettlement(
+	ctx context.Context,
+	probeID string,
+	request harnessv2.StartPromptRequest,
+	streamDone <-chan promptStreamResult,
+	verifyReplay bool,
+) (harnessv2.StartPromptRequest, harnessv2.PromptSettlement, error) {
 	cancelRequest, err := s.cancelPromptRequest("cancel-prompt-"+probeID, request.Metadata)
 	if err != nil {
 		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, err
@@ -189,7 +296,7 @@ func (s *lifecycleProbeState) probePromptCancellationLifecycle(
 	if err := validatePromptCancellationSettlement(streamResult.terminal, cancelResponse.Settlement); err != nil {
 		return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, err
 	}
-	if s.target.WorkspaceGovernance.DuplicateSafeMutations {
+	if verifyReplay && s.target.WorkspaceGovernance.DuplicateSafeMutations {
 		if err := s.probeCancellationReplay(ctx, cancelRequest, cancelResponse); err != nil {
 			return harnessv2.StartPromptRequest{}, harnessv2.PromptSettlement{}, err
 		}
@@ -213,17 +320,52 @@ func validatePromptCancellationSettlement(terminal *harnessv2.Event, settlement 
 	return nil
 }
 
-func (s *lifecycleProbeState) probeSessionDeletion(ctx context.Context, probeID string) error {
+func (s *lifecycleProbeState) probeSessionDeletion(ctx context.Context, probeID string, allowAutomaticCleanup bool) error {
 	request, err := s.deleteSessionRequest("delete-session-" + probeID)
 	if err != nil {
 		return err
 	}
-	if err := s.probeStaleSessionDeletion(ctx, request); err != nil {
-		return err
+	if !allowAutomaticCleanup {
+		if err := s.probeStaleSessionDeletion(ctx, request); err != nil {
+			return err
+		}
 	}
-	deleted, err := s.client.DeleteRuntimeSession(ctx, s.sessionID, request)
-	if err != nil {
-		return fmt.Errorf("delete conformance runtime session: %w", err)
+	var deleted *harnessv2.DeleteRuntimeSessionResponse
+	for {
+		deleted, err = s.client.DeleteRuntimeSession(ctx, s.sessionID, request)
+		if err == nil {
+			break
+		}
+		var clientErr *harnessv2.ClientError
+		if !allowAutomaticCleanup || !errors.As(err, &clientErr) {
+			return fmt.Errorf("delete conformance runtime session: %w", err)
+		}
+		if clientErr.StatusCode == http.StatusNotFound {
+			// A canceled session may already have been retired. Verify absence
+			// on the same runtime boot, rather than accepting a bare 404.
+			status, statusErr := s.client.Status(ctx)
+			if statusErr != nil {
+				return fmt.Errorf("verify canceled runtime session retirement: %w", statusErr)
+			}
+			if mismatch := harnessv2.CompareFence(s.sessionFence, status.Fence, false); mismatch != harnessv2.FenceMatch {
+				return fmt.Errorf("runtime fence changed during cancellation cleanup: %s", mismatch)
+			}
+			for _, session := range status.Sessions {
+				if session.RuntimeSessionID == s.sessionID || session.RuntimeSessionUID == s.sessionFence.RuntimeSessionUID {
+					return fmt.Errorf("canceled runtime session remains resident after deletion returned not found")
+				}
+			}
+			s.deleteAttempted = true
+			return nil
+		}
+		if clientErr.StatusCode != http.StatusConflict || clientErr.Code != harnessv2.ErrorCodeAlreadyAccepted || !clientErr.Retryable {
+			return fmt.Errorf("delete conformance runtime session: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for canceled runtime session cleanup: %w", ctx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
 	s.deleteAttempted = true
 	if deleted.Classification.Class != harnessv2.RequestClassificationFresh {
@@ -471,7 +613,7 @@ func (s *lifecycleProbeState) probeWorkspaceDelta(
 	promptMetadata harnessv2.MutationMetadata,
 	settlement harnessv2.PromptSettlement,
 ) (*harnessv2.CreateWorkspaceDeltaResponse, error) {
-	settlementJSON, err := harnessv2.CanonicalValue(settlement)
+	settlementDigest, err := harnessv2.CanonicalPromptSettlementDigest(settlement)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize prompt settlement: %w", err)
 	}
@@ -483,7 +625,7 @@ func (s *lifecycleProbeState) probeWorkspaceDelta(
 		DeltaID:                harnessv2.WorkspaceDeltaID("conformance-delta-" + probeID),
 		Intent:                 s.target.Profile.WorkspaceIntent,
 		VerifiedBaseline:       s.workspace.Baseline,
-		PromptSettlementDigest: digestBytes(settlementJSON),
+		PromptSettlementDigest: settlementDigest,
 		Limits: harnessv2.WorkspaceDeltaLimits{
 			MaxBytes:   maxBytes,
 			MaxEntries: conformanceMaxWorkspaceEntries,

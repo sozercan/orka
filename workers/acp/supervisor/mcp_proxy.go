@@ -106,6 +106,9 @@ type mcpJSONRPCError struct {
 type mcpToolsCallParams struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments,omitempty"`
+	// MCP clients send progress tokens and extensions in _meta. The enclosing
+	// request limit bounds it, and it never contributes broker authority.
+	Meta map[string]json.RawMessage `json:"_meta,omitempty"`
 }
 
 func newMCPProxy(broker MCPBroker) (*mcpProxy, error) {

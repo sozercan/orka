@@ -80,6 +80,12 @@ function agentRuntime(name: string) {
           proxyCredentialScope: 'codex',
           resourceClass: 'standard',
         },
+        mcpPolicy: {
+          allowedTools: ['web_search'],
+          disallowedTools: [],
+          allowBash: false,
+          approvalRequiredTools: [],
+        },
         limits: {
           maxResidentSessions: 10,
           maxConcurrentPrompts: 4,

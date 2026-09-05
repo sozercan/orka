@@ -7,11 +7,17 @@ MIT License - see LICENSE file for details.
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"unicode/utf8"
+
+	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 )
 
 func TestWebFetchTool_Name(t *testing.T) {
@@ -202,6 +208,154 @@ func TestWebFetchTool_Execute_Truncation(t *testing.T) {
 	}
 	if fetchResult.Length != 100 {
 		t.Errorf("length = %d, want 100", fetchResult.Length)
+	}
+}
+
+func TestWebFetchTool_Execute_TruncatesUnicodeByCharacter(t *testing.T) {
+	const content = "a😀éz"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(content))
+	}))
+	defer server.Close()
+
+	tool := &WebFetchTool{client: server.Client(), allowPrivateForTests: true}
+	args, err := json.Marshal(WebFetchArgs{URL: server.URL, MaxChars: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	var fetchResult WebFetchResult
+	if err := json.Unmarshal([]byte(result), &fetchResult); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if fetchResult.Content != "a😀é" {
+		t.Fatalf("content = %q, want %q", fetchResult.Content, "a😀é")
+	}
+	if fetchResult.Length != 3 {
+		t.Fatalf("length = %d, want 3", fetchResult.Length)
+	}
+	if !fetchResult.Truncated {
+		t.Fatal("expected truncated = true")
+	}
+	if !utf8.ValidString(fetchResult.Content) {
+		t.Fatalf("content is not valid UTF-8: %q", fetchResult.Content)
+	}
+}
+
+func TestBrokeredWebFetchToolRejectsOversizedMaxCharsBeforeRequest(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte("unexpected"))
+	}))
+	defer server.Close()
+
+	tool := NewBrokeredWebFetchTool()
+	tool.client = server.Client()
+	tool.allowPrivateForTests = true
+	args := json.RawMessage(fmt.Sprintf(`{"url":%q,"max_chars":%d}`, server.URL, brokeredWebFetchMaxChars+1))
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("Execute() accepted max_chars above the brokered limit")
+	}
+	if requests != 0 {
+		t.Fatalf("oversized brokered web_fetch made %d HTTP requests, want 0", requests)
+	}
+}
+
+func TestBrokeredWebFetchToolRejectsOversizedURLBeforeRequest(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte("unexpected"))
+	}))
+	defer server.Close()
+
+	tool := NewBrokeredWebFetchTool()
+	tool.client = server.Client()
+	tool.allowPrivateForTests = true
+	oversizedURL := server.URL + "/?" + strings.Repeat("&", brokeredWebFetchMaxURLBytes)
+	args, err := json.Marshal(WebFetchArgs{URL: oversizedURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("Execute() accepted a URL above the brokered limit")
+	}
+	if requests != 0 {
+		t.Fatalf("oversized brokered web_fetch URL made %d HTTP requests, want 0", requests)
+	}
+}
+
+func TestBrokeredWebFetchToolAllowsSchemaMaxUnicodeURL(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	tool := NewBrokeredWebFetchTool()
+	tool.client = server.Client()
+	tool.allowPrivateForTests = true
+	var schema struct {
+		Properties struct {
+			URL struct {
+				MaxLength int `json:"maxLength"`
+			} `json:"url"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(tool.Parameters(), &schema); err != nil {
+		t.Fatal(err)
+	}
+	if schema.Properties.URL.MaxLength != brokeredWebFetchMaxURLBytes/utf8.UTFMax {
+		t.Fatalf("url maxLength = %d, want %d", schema.Properties.URL.MaxLength, brokeredWebFetchMaxURLBytes/utf8.UTFMax)
+	}
+
+	prefix := server.URL + "/"
+	url := prefix + strings.Repeat("😀", schema.Properties.URL.MaxLength-utf8.RuneCountInString(prefix))
+	if utf8.RuneCountInString(url) != schema.Properties.URL.MaxLength {
+		t.Fatalf("URL characters = %d, want %d", utf8.RuneCountInString(url), schema.Properties.URL.MaxLength)
+	}
+	args, err := json.Marshal(WebFetchArgs{URL: url})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("schema-max brokered web_fetch made %d HTTP requests, want 1", requests)
+	}
+}
+
+func TestBrokeredWebFetchToolWorstCaseEscapingFitsMCPResultLimit(t *testing.T) {
+	content := bytes.Repeat([]byte{0}, brokeredWebFetchMaxChars)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write(content)
+	}))
+	defer server.Close()
+
+	tool := NewBrokeredWebFetchTool()
+	tool.client = server.Client()
+	tool.allowPrivateForTests = true
+	urlPrefix := server.URL + "/?"
+	worstCaseURL := urlPrefix + strings.Repeat("&", brokeredWebFetchMaxURLBytes-len(urlPrefix))
+	args, err := json.Marshal(WebFetchArgs{URL: worstCaseURL, MaxChars: brokeredWebFetchMaxChars})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(result) > harnessv2.MaxMCPResultBytes {
+		t.Fatalf("brokered web_fetch result bytes = %d, max = %d", len(result), harnessv2.MaxMCPResultBytes)
 	}
 }
 

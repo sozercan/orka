@@ -37,7 +37,11 @@ func promptContentToACP(blocks []harnessv2.ContentBlock) ([]acp.ContentBlock, er
 		case harnessv2.ContentBlockText:
 			result = append(result, acp.Text(block.Text))
 		case harnessv2.ContentBlockResourceLink:
-			result = append(result, acp.ContentBlock{Type: "resource_link", URI: block.URI, Name: block.Name, MIMEType: block.MimeType})
+			name := block.Name
+			if name == "" {
+				name = block.URI
+			}
+			result = append(result, acp.ContentBlock{Type: "resource_link", URI: block.URI, Name: name, MIMEType: block.MimeType})
 		case harnessv2.ContentBlockArtifactRef:
 			return nil, fmt.Errorf("prompt artifact reference %d must be materialized before ACP dispatch", index)
 		default:

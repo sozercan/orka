@@ -373,7 +373,9 @@ func effectiveACPAllowedTools(task *corev1alpha1.Task, agent *corev1alpha1.Agent
 	if task != nil {
 		_, delegatedChild := task.Labels[labels.LabelParentTask]
 		disableCoordinationToolInjection := task.Annotations[labels.AnnotationDisableCoordinationToolInject] == scheduledRunLabelValue
-		if delegatedChild && !disableCoordinationToolInjection {
+		runtimeRefAgent := agent != nil && agent.Spec.Runtime != nil && agent.Spec.Runtime.RuntimeRef != nil &&
+			strings.TrimSpace(agent.Spec.Runtime.RuntimeRef.Name) != ""
+		if delegatedChild && !disableCoordinationToolInjection && !runtimeRefAgent {
 			values = append(values, "send_message", "check_messages")
 		}
 	}

@@ -198,27 +198,21 @@ func TestPromptDuplicateClassificationPrecedesCapacityAdmission(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		phase          harnessv2.OperationPhase
-		terminal       harnessv2.EventType
-		wantCode       harnessv2.ErrorCode
 		wantClass      harnessv2.RequestClassification
 		withSettlement bool
 	}{
 		{
-			name: "already accepted", phase: harnessv2.OperationPhaseAccepted,
-			wantCode: harnessv2.ErrorCodeAlreadyAccepted, wantClass: harnessv2.RequestClassificationAlreadyAccepted,
+			name: "already accepted", wantClass: harnessv2.RequestClassificationAlreadyAccepted,
 		},
 		{
-			name: "settled", phase: harnessv2.OperationPhaseSettled, terminal: harnessv2.EventCompleted,
-			wantCode: harnessv2.ErrorCodeSettled, wantClass: harnessv2.RequestClassificationSettled, withSettlement: true,
+			name: "settled", wantClass: harnessv2.RequestClassificationSettled, withSettlement: true,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server.mu.Lock()
 			state := server.sessions[create.RuntimeSessionID]
-			state.operations[prompt.Metadata.OperationID] = operationRecord(prompt.Metadata, test.phase, test.terminal, now)
-			state.prompt = &promptState{request: prompt}
+			state.prompt = &promptState{request: prompt, acceptedAt: now}
 			if test.withSettlement {
 				settlement := harnessv2.PromptSettlement{
 					TerminalEvent: harnessv2.EventCompleted, Outcome: harnessv2.PromptOutcomeSucceeded,
@@ -226,6 +220,7 @@ func TestPromptDuplicateClassificationPrecedesCapacityAdmission(t *testing.T) {
 				}
 				state.prompt.settlement = &settlement
 			}
+			recordPromptAdmissionLocked(state, state.prompt)
 			server.mu.Unlock()
 
 			for len(server.promptSlots) < cap(server.promptSlots) {
@@ -238,11 +233,15 @@ func TestPromptDuplicateClassificationPrecedesCapacityAdmission(t *testing.T) {
 			if response.Code != http.StatusOK {
 				t.Fatalf("duplicate status = %d body=%s", response.Code, response.Body.String())
 			}
-			var decoded harnessv2.ErrorResponse
+			var decoded harnessv2.PromptAdmissionResponse
 			if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
 				t.Fatal(err)
 			}
-			if decoded.Code != test.wantCode || decoded.Classification == nil || decoded.Classification.Class != test.wantClass {
+			if err := decoded.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Classification.Class != test.wantClass || !decoded.AcceptedAt.Equal(now) ||
+				(decoded.Settlement != nil) != test.withSettlement {
 				t.Fatalf("duplicate response = %#v", decoded)
 			}
 		})
@@ -257,17 +256,23 @@ func TestSettledPromptDoesNotBlockNextIdleTurn(t *testing.T) {
 		t.Fatalf("create status = %d body=%s", created.Code, created.Body.String())
 	}
 	previous := testStartPromptRequest(t, cfg, create.Metadata.Fence)
-	settlement := harnessv2.PromptSettlement{
-		TerminalEvent: harnessv2.EventCompleted,
-		Outcome:       harnessv2.PromptOutcomeSucceeded,
-		StopReason:    harnessv2.ACPStopReasonEndTurn,
-		SettledAt:     time.Now().UTC(),
+	previousPath := "/v2/runtime-sessions/session-1/prompts/prompt-1"
+	completed := performMutation(t, server.Handler(), http.MethodPut, previousPath, previous, cfg)
+	if completed.Code != http.StatusOK {
+		t.Fatalf("first prompt status = %d", completed.Code)
 	}
+	var original harnessv2.PromptAdmissionResponse
+	decodeResponse(t, performMutation(t, server.Handler(), http.MethodPut, previousPath, previous, cfg), &original)
+	if err := original.Validate(); err != nil {
+		t.Fatalf("first prompt replay: %v", err)
+	}
+	// Simulate completed workspace validation. This replay test does not need
+	// the Linux-only process-freeze proof used by the workspace endpoint.
 	server.mu.Lock()
 	state := server.sessions[create.RuntimeSessionID]
 	state.descriptor.State = harnessv2.RuntimeSessionStateIdle
-	state.prompt = &promptState{request: previous, settlement: &settlement}
 	server.mu.Unlock()
+	deactivatePromptCapabilities(state, previous.Metadata.PromptID, harnessv2.RuntimeSessionStateIdle)
 
 	next := testStartPromptRequest(t, cfg, create.Metadata.Fence)
 	next.Metadata.OperationID = testPromptOperationTwo
@@ -280,6 +285,15 @@ func TestSettledPromptDoesNotBlockNextIdleTurn(t *testing.T) {
 	response := performMutation(t, server.Handler(), http.MethodPut, "/v2/runtime-sessions/session-1/prompts/prompt-2", next, cfg)
 	if response.Code != http.StatusOK {
 		t.Fatalf("continuation status = %d body=%s", response.Code, response.Body.String())
+	}
+	var replayed harnessv2.PromptAdmissionResponse
+	decodeResponse(t, performMutation(t, server.Handler(), http.MethodPut, previousPath, previous, cfg), &replayed)
+	if err := replayed.Validate(); err != nil {
+		t.Fatalf("old prompt replay after continuation: %v", err)
+	}
+	if replayed.Classification != original.Classification || !replayed.AcceptedAt.Equal(original.AcceptedAt) ||
+		original.Settlement == nil || replayed.Settlement == nil || *replayed.Settlement != *original.Settlement {
+		t.Fatalf("continuation changed the original prompt admission: %#v", replayed)
 	}
 	server.mu.Lock()
 	defer server.mu.Unlock()

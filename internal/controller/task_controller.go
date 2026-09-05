@@ -46,6 +46,7 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
+	"github.com/orka-agents/orka/internal/agentruntimepolicy"
 	"github.com/orka-agents/orka/internal/approvals"
 	"github.com/orka-agents/orka/internal/artifactcap"
 	execevents "github.com/orka-agents/orka/internal/events"
@@ -763,6 +764,9 @@ func (r *TaskReconciler) handlePending(ctx context.Context, task *corev1alpha1.T
 
 	if task.Spec.Type == corev1alpha1.TaskTypeAgent {
 		plan := r.planAgentExecution(ctx, task, agent)
+		if err := validatePlannedRuntimeRefAgentTaskRestrictions(task, agent, plan); err != nil {
+			return r.rejectPlannedAgentExecution(ctx, task, rejectAgentExecutionPlan(err.Error()))
+		}
 		switch plan.path {
 		case agentExecutionPathRejected:
 			return r.rejectPlannedAgentExecution(ctx, task, plan)
@@ -776,6 +780,11 @@ func (r *TaskReconciler) handlePending(ctx context.Context, task *corev1alpha1.T
 				return result, err
 			}
 			return r.queueHarnessV1Task(ctx, task)
+		case agentExecutionPathExternal:
+			if result, err, handled := r.ensureAgentExecutionBinding(ctx, task, agent); handled {
+				return result, err
+			}
+			return r.queueACPRuntimeTask(ctx, task, agent)
 		default:
 			return ctrl.Result{}, fmt.Errorf("unknown agent execution path %q", plan.path)
 		}
@@ -800,7 +809,11 @@ func (r *TaskReconciler) pendingAgentTaskDeadline(
 		return time.Time{}, false
 	}
 	agent, err := r.resolveAgent(ctx, task)
-	if err != nil || r.planAgentExecution(ctx, task, agent).path != agentExecutionPathACP {
+	if err != nil {
+		return time.Time{}, false
+	}
+	path := r.planAgentExecution(ctx, task, agent).path
+	if path != agentExecutionPathACP && path != agentExecutionPathExternal {
 		return time.Time{}, false
 	}
 	return deadline, true
@@ -3008,7 +3021,7 @@ func executionWorkspaceStatusValidCleanupPolicy(cleanupPolicy corev1alpha1.Works
 
 func validateRuntimeRefAgentTaskRestrictions(task *corev1alpha1.Task, agent *corev1alpha1.Agent) error {
 	if agent != nil && agent.Spec.Runtime != nil {
-		if len(agent.Spec.Runtime.DefaultAllowedTools) > 0 {
+		if agent.Spec.Runtime.DefaultAllowedTools != nil {
 			return fmt.Errorf("runtimeRef custom runtimes require task-level allowedTools for brokered tool exposure and do not support defaultAllowedTools policy metadata")
 		}
 		if agent.Spec.Runtime.DefaultAllowBash != nil {
@@ -3034,6 +3047,54 @@ func validateRuntimeRefAgentTaskRestrictions(task *corev1alpha1.Task, agent *cor
 	}
 	if task != nil && task.Spec.PriorTaskRef != nil {
 		return fmt.Errorf("runtimeRef custom runtimes do not support priorTaskRef workspace handoff")
+	}
+	return nil
+}
+
+func validatePlannedRuntimeRefAgentTaskRestrictions(
+	task *corev1alpha1.Task,
+	agent *corev1alpha1.Agent,
+	plan agentExecutionPlan,
+) error {
+	// planAgentExecution resolves runtimeRef before selecting the external path,
+	// so these v2-only checks cannot change harness v1 compatibility.
+	if plan.path != agentExecutionPathExternal {
+		return nil
+	}
+	return validateHarnessV2RuntimeRefAgentTaskRestrictions(task, agent)
+}
+
+func validateHarnessV2RuntimeRefAgentTaskRestrictions(task *corev1alpha1.Task, agent *corev1alpha1.Agent) error {
+	if agent != nil {
+		if agent.Spec.Model != nil {
+			return fmt.Errorf("runtimeRef custom runtimes do not support Agent.spec.model; provider and model configuration are fixed by the registered runtime profile")
+		}
+		if agent.Spec.SystemPrompt != nil {
+			return fmt.Errorf("runtimeRef custom runtimes do not support Agent.spec.systemPrompt because external session creation sends no AgentConfiguration")
+		}
+		if len(agent.Spec.Skills) > 0 {
+			return fmt.Errorf("runtimeRef custom runtimes do not support Agent.spec.skills because external session creation sends no AgentConfiguration")
+		}
+		for _, tool := range agent.Spec.Tools {
+			if tool.Enabled == nil || *tool.Enabled {
+				return fmt.Errorf("runtimeRef custom runtimes do not support enabled Agent.spec.tools; use task-level allowedTools for brokered tool exposure")
+			}
+		}
+	}
+	if agent != nil && agent.Spec.Runtime != nil {
+		// Older CRDs defaulted this field to 50, so existing Agents may retain
+		// that persisted value after an upgrade. External v2 sessions receive no
+		// AgentConfiguration, which makes the historical default inert. Any other
+		// value is still an unsupported runtime-profile override.
+		if agent.Spec.Runtime.DefaultMaxTurns != nil && *agent.Spec.Runtime.DefaultMaxTurns != 50 {
+			return fmt.Errorf("runtimeRef custom runtimes do not support defaultMaxTurns; iteration limits are fixed by the registered runtime profile")
+		}
+		if agent.Spec.Runtime.DefaultAllowedTools != nil {
+			return fmt.Errorf("runtimeRef custom runtimes require task-level allowedTools for brokered tool exposure and do not support defaultAllowedTools policy metadata")
+		}
+	}
+	if task != nil && task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.MaxTurns != nil {
+		return fmt.Errorf("runtimeRef custom runtimes do not support maxTurns; iteration limits are fixed by the registered runtime profile")
 	}
 	return nil
 }
@@ -3339,6 +3400,9 @@ func (r *TaskReconciler) handleScheduled(ctx context.Context, task *corev1alpha1
 	child.Spec.SuccessfulRunsHistoryLimit = nil
 	child.Spec.FailedRunsHistoryLimit = nil
 	child.Spec.Suspend = nil
+	if err := agentruntimepolicy.ResolveAndMaterializeTaskRuntimeRefAllowedTools(ctx, r.taskMetadataReader(), child); err != nil {
+		return ctrl.Result{}, fmt.Errorf("refreshing scheduled child AgentRuntime policy: %w", err)
+	}
 	tracing.StampTaskTraceContext(ctx, child)
 
 	// Set owner reference

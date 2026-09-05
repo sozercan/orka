@@ -219,6 +219,19 @@ type MCPPolicyConfiguration struct {
 	ApprovalPolicy         MCPApprovalPolicy `json:"approvalPolicy"`
 }
 
+// MCPPolicyRequiresPermissionCapability reports whether enforcing one policy
+// requires the runtime to emit ACP permission requests. Brokered tools need
+// that path only when approval is required; provider-native tools always need
+// it so the supervisor can govern calls that bypass the MCP broker.
+func MCPPolicyRequiresPermissionCapability(toolPolicy MCPToolPolicy, approvalPolicy MCPApprovalPolicy) bool {
+	if len(approvalPolicy.RequiredTools) > 0 {
+		return true
+	}
+	return slices.ContainsFunc(toolPolicy.Tools, func(tool MCPToolDescriptor) bool {
+		return tool.Source == MCPToolSourceProviderNative
+	})
+}
+
 func (c MCPPolicyConfiguration) validate() error {
 	if err := validateSHA256Digest(c.ToolPolicyDigest); err != nil {
 		return fmt.Errorf("tool policy digest: %w", err)

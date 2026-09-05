@@ -107,7 +107,10 @@ func TestACPNoWorkspaceTerminalProjectionSettlesStatusAndFinalizer(t *testing.T)
 			Namespace: "default", Name: "no-workspace", UID: types.UID("no-workspace-task-uid"),
 			Finalizers: []string{labels.TaskFinalizer},
 		},
-		Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
+		Spec: corev1alpha1.TaskSpec{
+			Type:      corev1alpha1.TaskTypeAgent,
+			Workspace: &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead},
+		},
 		Status: corev1alpha1.TaskStatus{
 			Phase: corev1alpha1.TaskPhaseRunning,
 			Execution: &corev1alpha1.TaskExecutionStatus{
@@ -131,7 +134,9 @@ func TestACPNoWorkspaceTerminalProjectionSettlesStatusAndFinalizer(t *testing.T)
 		StartingSHA: acpNoWorkspaceRevision,
 	}
 	workspaceTask := task.DeepCopy()
-	workspaceTask.Spec.Workspace = &corev1alpha1.WorkspaceConfig{Intent: corev1alpha1.WorkspaceIntentRead}
+	workspaceTask.Spec.Workspace = &corev1alpha1.WorkspaceConfig{
+		Intent: corev1alpha1.WorkspaceIntentRead, GitRepo: "https://github.com/example/repo.git",
+	}
 	if got := taskDeliveryStatusForKubernetes(workspaceTask, noWorkspaceDelivery); got.StartingSHA != acpNoWorkspaceRevision {
 		t.Fatalf("workspace delivery startingSHA = %q, want invalid sentinel preserved for API validation", got.StartingSHA)
 	}

@@ -39,6 +39,7 @@ import (
 
 	gatewayv1alpha1 "github.com/orka-agents/orka/api/gateway/v1alpha1"
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/agentruntimepolicy"
 	"github.com/orka-agents/orka/internal/gateway/protocol"
 	orkalabels "github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/store"
@@ -629,12 +630,12 @@ func (s *Service) DispatchOnce(ctx context.Context) error {
 	if handled, recoveryErr := s.reconcileExistingDispatchTask(ctx, event, recoveryNow); handled || recoveryErr != nil {
 		return recoveryErr
 	}
-	binding, ready, err := s.resolveDispatchBinding(ctx, event)
+	binding, agent, ready, err := s.resolveDispatchBinding(ctx, event)
 	if err != nil || !ready {
 		return err
 	}
 	freshNow := time.Now().UTC()
-	if handled, err := s.handleExpiredDispatchClaim(ctx, event, binding, freshNow); handled || err != nil {
+	if handled, err := s.handleExpiredDispatchClaim(ctx, event, binding, agent, freshNow); handled || err != nil {
 		return err
 	}
 	if event.ExpiresAt.Sub(freshNow) < minimumGatewayExecutionWindow {
@@ -668,7 +669,7 @@ func (s *Service) DispatchOnce(ctx context.Context) error {
 		gatewayDispatchTotal.WithLabelValues("namespace_limit").Inc()
 		return nil
 	}
-	linkedTask, _, ready, err := s.createOrFindGatewayTask(ctx, renewed, binding, freshNow)
+	linkedTask, _, ready, err := s.createOrFindGatewayTask(ctx, renewed, binding, agent, freshNow)
 	if err != nil || !ready {
 		return err
 	}
@@ -749,7 +750,10 @@ func (s *Service) reconcileExistingDispatchTask(
 		return true, s.expireDispatchEvent(ctx, event, "The admitted Agent identity changed.")
 	}
 
-	expected := taskForGatewayEvent(event, binding, now)
+	expected, err := s.materializedTaskForGatewayEvent(ctx, event, binding, agent, now)
+	if err != nil {
+		return true, err
+	}
 	if gatewayTaskMatchesExpected(existing, expected, event, binding) {
 		return true, s.EventStore.MarkGatewayEventTaskCreated(
 			ctx, event.Namespace, event.ID, event.TaskName, string(existing.UID), s.Owner, now,
@@ -762,7 +766,11 @@ func (s *Service) reconcileExistingDispatchTask(
 }
 
 func (s *Service) handleExpiredDispatchClaim(
-	ctx context.Context, event *store.GatewayEvent, binding *gatewayv1alpha1.GatewayBinding, now time.Time,
+	ctx context.Context,
+	event *store.GatewayEvent,
+	binding *gatewayv1alpha1.GatewayBinding,
+	agent *corev1alpha1.Agent,
+	now time.Time,
 ) (bool, error) {
 	if event.ExpiresAt.Sub(now) >= minimumGatewayExecutionWindow {
 		return false, nil
@@ -780,7 +788,10 @@ func (s *Service) handleExpiredDispatchClaim(
 		return true, err
 	}
 	if binding != nil {
-		expected := taskForGatewayEvent(event, binding, now)
+		expected, err := s.materializedTaskForGatewayEvent(ctx, event, binding, agent, now)
+		if err != nil {
+			return true, err
+		}
 		if gatewayTaskMatchesExpected(existing, expected, event, binding) {
 			return true, s.EventStore.MarkGatewayEventTaskCreated(
 				ctx, event.Namespace, event.ID, event.TaskName, string(existing.UID), s.Owner, now,
@@ -796,63 +807,63 @@ func (s *Service) handleExpiredDispatchClaim(
 
 func (s *Service) resolveDispatchBinding(
 	ctx context.Context, event *store.GatewayEvent,
-) (*gatewayv1alpha1.GatewayBinding, bool, error) {
+) (*gatewayv1alpha1.GatewayBinding, *corev1alpha1.Agent, bool, error) {
 	gatewayObject := &gatewayv1alpha1.Gateway{}
 	err := s.freshReader().Get(ctx, client.ObjectKey{Namespace: event.Namespace, Name: event.GatewayName}, gatewayObject)
 	if apierrors.IsNotFound(err) {
-		return nil, false, s.expireDispatchEvent(ctx, event, "The admitted Gateway no longer exists.")
+		return nil, nil, false, s.expireDispatchEvent(ctx, event, "The admitted Gateway no longer exists.")
 	}
 	if err != nil {
 		s.retryEvent(ctx, event, "admitted Gateway is not ready", eventBackoff(event.AttemptCount))
 		gatewayDispatchTotal.WithLabelValues("gateway_not_ready").Inc()
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	if string(gatewayObject.UID) != event.GatewayUID {
-		return nil, false, s.expireDispatchEvent(ctx, event, "The admitted Gateway identity changed.")
+		return nil, nil, false, s.expireDispatchEvent(ctx, event, "The admitted Gateway identity changed.")
 	}
 	if gatewayObject.Generation != event.GatewayGeneration {
-		return nil, false, s.expireDispatchEvent(ctx, event, "The admitted Gateway generation changed.")
+		return nil, nil, false, s.expireDispatchEvent(ctx, event, "The admitted Gateway generation changed.")
 	}
 	if !gatewayObject.Status.Ready || gatewayObject.Status.ObservedGeneration != gatewayObject.Generation {
 		s.retryEvent(ctx, event, "admitted Gateway is not ready", eventBackoff(event.AttemptCount))
 		gatewayDispatchTotal.WithLabelValues("gateway_not_ready").Inc()
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	binding := &gatewayv1alpha1.GatewayBinding{}
 	err = s.freshReader().Get(ctx, client.ObjectKey{Namespace: event.Namespace, Name: event.BindingName}, binding)
 	if apierrors.IsNotFound(err) {
-		return nil, false, s.expireDispatchEvent(ctx, event, "The admitted GatewayBinding no longer exists.")
+		return nil, nil, false, s.expireDispatchEvent(ctx, event, "The admitted GatewayBinding no longer exists.")
 	}
 	if err != nil {
 		s.retryEvent(ctx, event, "binding changed or is not ready", eventBackoff(event.AttemptCount))
 		gatewayDispatchTotal.WithLabelValues("binding_not_ready").Inc()
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	if string(binding.UID) != event.BindingUID || binding.Generation != event.BindingGeneration {
-		return nil, false, s.expireDispatchEvent(ctx, event, "The admitted GatewayBinding identity changed.")
+		return nil, nil, false, s.expireDispatchEvent(ctx, event, "The admitted GatewayBinding identity changed.")
 	}
 	if !binding.Status.Ready || binding.Status.ObservedGeneration != binding.Generation {
 		s.retryEvent(ctx, event, "binding changed or is not ready", eventBackoff(event.AttemptCount))
 		gatewayDispatchTotal.WithLabelValues("binding_not_ready").Inc()
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	if !bindingMatchesAdmittedEvent(binding, event) {
-		return nil, false, s.expireDispatchEvent(ctx, event, "The admitted GatewayBinding routing changed.")
+		return nil, nil, false, s.expireDispatchEvent(ctx, event, "The admitted GatewayBinding routing changed.")
 	}
 	agent := &corev1alpha1.Agent{}
 	err = s.freshReader().Get(ctx, client.ObjectKey{Namespace: event.Namespace, Name: event.AgentName}, agent)
 	if apierrors.IsNotFound(err) {
-		return nil, false, s.expireDispatchEvent(ctx, event, "The admitted Agent no longer exists.")
+		return nil, nil, false, s.expireDispatchEvent(ctx, event, "The admitted Agent no longer exists.")
 	}
 	if err != nil {
 		s.retryEvent(ctx, event, "admitted agent is not available", eventBackoff(event.AttemptCount))
 		gatewayDispatchTotal.WithLabelValues("agent_not_ready").Inc()
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	if event.AgentUID != "" && string(agent.UID) != event.AgentUID {
-		return nil, false, s.expireDispatchEvent(ctx, event, "The admitted Agent identity changed.")
+		return nil, nil, false, s.expireDispatchEvent(ctx, event, "The admitted Agent identity changed.")
 	}
-	return binding, true, nil
+	return binding, agent, true, nil
 }
 
 func (s *Service) expireDispatchEvent(ctx context.Context, event *store.GatewayEvent, reason string) error {
@@ -952,9 +963,22 @@ func (s *Service) createOrFindGatewayTask(
 	ctx context.Context,
 	event *store.GatewayEvent,
 	binding *gatewayv1alpha1.GatewayBinding,
+	agent *corev1alpha1.Agent,
 	now time.Time,
 ) (*corev1alpha1.Task, bool, bool, error) {
-	task := taskForGatewayEvent(event, binding, now)
+	task, err := s.materializedTaskForGatewayEvent(ctx, event, binding, agent, now)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if !event.TaskPolicyFrozen && task.Spec.AgentRuntime != nil && task.Spec.AgentRuntime.AllowedTools != nil {
+		frozen, freezeErr := s.EventStore.FreezeGatewayEventTaskRuntimeAllowedTools(
+			ctx, event.Namespace, event.ID, s.Owner, task.Spec.AgentRuntime.AllowedTools, now,
+		)
+		if freezeErr != nil {
+			return nil, false, false, fmt.Errorf("freeze Gateway Task runtime policy: %w", freezeErr)
+		}
+		*event = *frozen
+	}
 	orkatracing.StampTaskTraceContext(ctx, task)
 	createErr := s.Client.Create(ctx, task)
 	if createErr == nil {
@@ -1592,6 +1616,27 @@ func gatewayTaskMatchesExpected(
 		}
 	}
 	return true
+}
+
+func (s *Service) materializedTaskForGatewayEvent(
+	ctx context.Context,
+	event *store.GatewayEvent,
+	binding *gatewayv1alpha1.GatewayBinding,
+	agent *corev1alpha1.Agent,
+	now time.Time,
+) (*corev1alpha1.Task, error) {
+	task := taskForGatewayEvent(event, binding, now)
+	if event.TaskPolicyFrozen {
+		if task.Spec.AgentRuntime == nil {
+			task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{}
+		}
+		task.Spec.AgentRuntime.AllowedTools = append([]string{}, event.TaskAllowedTools...)
+		return task, nil
+	}
+	if err := agentruntimepolicy.ResolveAndMaterializeRuntimeRefAllowedTools(ctx, s.freshReader(), task, agent); err != nil {
+		return nil, fmt.Errorf("resolve generated Gateway Task AgentRuntime policy: %w", err)
+	}
+	return task, nil
 }
 
 func taskForGatewayEvent(event *store.GatewayEvent, binding *gatewayv1alpha1.GatewayBinding, now time.Time) *corev1alpha1.Task {

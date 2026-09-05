@@ -130,18 +130,31 @@ func WithSessionCleanupPersistence(cleanup store.SessionCleanupPersistenceStore)
 	}
 }
 
+// WithSessionRuntimeCleanup closes resident runtimes before the Session's
+// durable authority and transcript are deleted.
+func WithSessionRuntimeCleanup(cleanup store.SessionRuntimeCleanupFunc) Option {
+	return func(s *Store) error {
+		if cleanup == nil {
+			return store.ValidationErrorf("Session runtime cleanup must not be nil")
+		}
+		s.sessionRuntimeCleanup = cleanup
+		return nil
+	}
+}
+
 // Store maps ACP control-store interfaces to Kubernetes CR status and Leases.
 type Store struct {
-	client              client.Client
-	reader              client.Reader
-	controlNamespace    string
-	watchNamespace      string
-	sessionTurns        store.SessionTurnPersistenceStore
-	harnessV1Attempts   store.HarnessV1AttemptStore
-	outbox              store.OutboxPersistenceStore
-	sessionCleanup      store.SessionCleanupPersistenceStore
-	branchClaimsEnabled bool
-	epochMutations      *semaphore.Weighted
+	client                client.Client
+	reader                client.Reader
+	controlNamespace      string
+	watchNamespace        string
+	sessionTurns          store.SessionTurnPersistenceStore
+	harnessV1Attempts     store.HarnessV1AttemptStore
+	outbox                store.OutboxPersistenceStore
+	sessionCleanup        store.SessionCleanupPersistenceStore
+	sessionRuntimeCleanup store.SessionRuntimeCleanupFunc
+	branchClaimsEnabled   bool
+	epochMutations        *semaphore.Weighted
 }
 
 // NewComposite constructs the hard-cutover DurableControlStore: Kubernetes is
