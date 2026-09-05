@@ -199,6 +199,10 @@ type PullRequestIntent struct {
 	HeadRef               string     `json:"headRef"`
 	PublicationGeneration int64      `json:"publicationGeneration"`
 	ExpectedHeadOID       string     `json:"expectedHeadOid"`
+	// SessionUID is the immutable owner from the durable Publication. It lets
+	// successive publications reuse their Session's PR without adopting a PR
+	// created by another Session that happens to use the same branch.
+	SessionUID string `json:"sessionUid,omitempty"`
 }
 
 // PullRequestState is the reconciled forge state.

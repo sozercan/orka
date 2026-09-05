@@ -36,6 +36,7 @@ const (
 	githubPullRequestStateOpen       = "open"
 	githubPullRequestStateClosed     = "closed"
 	githubIntentMarkerPrefix         = "<!-- orka.publisher.pr-intent.v1 key="
+	githubSessionMarkerPrefix        = "<!-- orka.publisher.pr-session.v1 key="
 	githubIntentMarkerSuffix         = " -->"
 	githubPullRequestTitlePrefix     = "Orka publication generation "
 	githubPullRequestBodyDescription = "Created by the Orka clean-room workspace publisher."
@@ -422,13 +423,16 @@ func (r *githubPRReconciler) lookup(
 	if hasGitHubNextPage(headers.Get("Link")) {
 		return publisher.PullRequestReceipt{}, false, githubConflict("GitHub pull request candidate history exceeds the reconciliation bound")
 	}
-	marker := githubIntentMarker(intentKey)
+	marker, err := githubReconciliationMarker(intent, intentKey)
+	if err != nil {
+		return publisher.PullRequestReceipt{}, false, err
+	}
 	exact := make([]githubPullRequest, 0, 1)
 	unrelatedOpen := false
 	for i := range candidates {
 		candidate := candidates[i]
 		claimed := candidate.Body != nil && strings.Contains(*candidate.Body, marker)
-		marked := candidate.Body != nil && githubBodyHasIntentMarker(*candidate.Body, marker)
+		marked := candidate.Body != nil && githubBodyHasReconciliationMarker(*candidate.Body, marker)
 		if claimed && !marked {
 			return publisher.PullRequestReceipt{}, false, githubConflict("a pull request contains a malformed or duplicate exact intent marker")
 		}
@@ -501,7 +505,11 @@ func (r *githubPRReconciler) receiptForCandidate(
 	candidate githubPullRequest,
 	requireOpen bool,
 ) (publisher.PullRequestReceipt, error) {
-	if candidate.Body == nil || !githubBodyHasIntentMarker(*candidate.Body, githubIntentMarker(intentKey)) ||
+	marker, err := githubReconciliationMarker(intent, intentKey)
+	if err != nil {
+		return publisher.PullRequestReceipt{}, err
+	}
+	if candidate.Body == nil || !githubBodyHasReconciliationMarker(*candidate.Body, marker) ||
 		!githubCandidateMatchesRepositoriesAndRefs(candidate, base, head) || candidate.Head.SHA != intent.ExpectedHeadOID {
 		return publisher.PullRequestReceipt{}, githubConflict("GitHub pull request does not match the exact immutable intent")
 	}
@@ -546,9 +554,13 @@ func (r *githubPRReconciler) create(
 	intentKey string,
 	base, head githubResolvedRepository,
 ) (githubPullRequest, error) {
+	sessionKey, err := intent.SessionKey()
+	if err != nil {
+		return githubPullRequest{}, err
+	}
 	request := githubCreatePullRequest{
 		Title: githubPullRequestTitlePrefix + strconv.FormatInt(intent.PublicationGeneration, 10),
-		Body:  githubPullRequestBody(intent.PublicationGeneration, intentKey),
+		Body:  githubPullRequestBody(intent.PublicationGeneration, intentKey, sessionKey),
 		Head:  head.intent.owner + ":" + head.intent.branch,
 		Base:  base.intent.branch, Draft: false, MaintainerCanModify: false,
 	}
@@ -556,7 +568,7 @@ func (r *githubPRReconciler) create(
 		request.HeadRepository = head.intent.name
 	}
 	var response githubPullRequest
-	err := r.doJSON(
+	err = r.doJSON(
 		ctx, http.MethodPost, r.endpoint("/repos/"+base.intent.owner+"/"+base.intent.name+"/pulls", nil), request, &response, http.StatusCreated,
 	)
 	return response, err
@@ -566,12 +578,32 @@ func githubIntentMarker(intentKey string) string {
 	return githubIntentMarkerPrefix + intentKey + githubIntentMarkerSuffix
 }
 
-func githubBodyHasIntentMarker(body, marker string) bool {
-	return strings.Count(body, marker) == 1 && (body == marker || strings.HasSuffix(body, "\n\n"+marker))
+func githubReconciliationMarker(intent publisher.PullRequestIntent, intentKey string) (string, error) {
+	if intent.SessionUID == "" {
+		return githubIntentMarker(intentKey), nil
+	}
+	key, err := intent.SessionKey()
+	if err != nil {
+		return "", err
+	}
+	return githubSessionMarkerPrefix + key + githubIntentMarkerSuffix, nil
 }
 
-func githubPullRequestBody(generation int64, intentKey string) string {
-	return githubPullRequestBodyDescription + "\n\nPublication generation: " + strconv.FormatInt(generation, 10) + "\n\n" + githubIntentMarker(intentKey)
+func githubBodyHasReconciliationMarker(body, marker string) bool {
+	if strings.Count(body, marker) != 1 || (body != marker && !strings.HasSuffix(body, "\n\n"+marker)) {
+		return false
+	}
+	// A body claiming multiple Sessions is ambiguous even if one exact marker
+	// is the final line. A per-head marker alone never authorizes continuation.
+	return !strings.HasPrefix(marker, githubSessionMarkerPrefix) || strings.Count(body, githubSessionMarkerPrefix) == 1
+}
+
+func githubPullRequestBody(generation int64, intentKey, sessionKey string) string {
+	body := githubPullRequestBodyDescription + "\n\nPublication generation: " + strconv.FormatInt(generation, 10) + "\n\n" + githubIntentMarker(intentKey)
+	if sessionKey != "" {
+		body += "\n\n" + githubSessionMarkerPrefix + sessionKey + githubIntentMarkerSuffix
+	}
+	return body
 }
 
 type githubAPIRequestError struct {

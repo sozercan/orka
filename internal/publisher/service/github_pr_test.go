@@ -151,7 +151,7 @@ func TestGitHubPRReconcilerCreatesExactPullRequest(t *testing.T) {
 	}
 	request := created[0]
 	if request.Title != "Orka publication generation 7" || request.Head != "bot:orka-change" || request.HeadRepository != "fork" ||
-		request.Base != "main" || request.Draft || request.MaintainerCanModify || request.Body != githubPullRequestBody(7, key) {
+		request.Base != "main" || request.Draft || request.MaintainerCanModify || request.Body != githubPullRequestBody(7, key, "") {
 		t.Fatalf("create request = %#v", request)
 	}
 	if strings.Contains(request.Body, githubTestAuthorization) {

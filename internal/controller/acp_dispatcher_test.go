@@ -3083,6 +3083,9 @@ func TestACPDispatcherPublishesPreparedWorkspaceDelta(t *testing.T) {
 		if intent.BaseRepository.ID != "github.com/orka-agents/orka" || intent.HeadRepository.ID != "github.com/sozercan/orka-fork" {
 			t.Fatalf("continuation PR repositories = base %#v head %#v", intent.BaseRepository, intent.HeadRepository)
 		}
+		if intent.SessionUID != sessionUID {
+			t.Fatalf("continuation PR Session UID = %q, want durable owner %q", intent.SessionUID, sessionUID)
+		}
 	default:
 		t.Fatal("publisher did not receive a pull request intent")
 	}

@@ -3,30 +3,57 @@ package publisher
 import (
 	"context"
 	"fmt"
+	"strings"
 )
+
+type pullRequestRepositoryIdentity struct {
+	Provider string `json:"provider"`
+	ID       string `json:"id"`
+}
 
 // Key returns the exact immutable tuple identity used for PR reconciliation.
 func (i PullRequestIntent) Key() (string, error) {
 	if err := validatePullRequestIntent(i); err != nil {
 		return "", err
 	}
-	type repositoryIdentity struct {
-		Provider string `json:"provider"`
-		ID       string `json:"id"`
-	}
 	return digestCanonical(struct {
-		Domain                string             `json:"domain"`
-		BaseRepository        repositoryIdentity `json:"baseRepository"`
-		BaseRef               string             `json:"baseRef"`
-		HeadRepository        repositoryIdentity `json:"headRepository"`
-		HeadRef               string             `json:"headRef"`
-		PublicationGeneration int64              `json:"publicationGeneration"`
-		ExpectedHeadOID       string             `json:"expectedHeadOid"`
+		Domain                string                        `json:"domain"`
+		BaseRepository        pullRequestRepositoryIdentity `json:"baseRepository"`
+		BaseRef               string                        `json:"baseRef"`
+		HeadRepository        pullRequestRepositoryIdentity `json:"headRepository"`
+		HeadRef               string                        `json:"headRef"`
+		PublicationGeneration int64                         `json:"publicationGeneration"`
+		ExpectedHeadOID       string                        `json:"expectedHeadOid"`
+		SessionUID            string                        `json:"sessionUid,omitempty"`
 	}{
 		Domain:         "orka.publisher.pr-intent.v1",
-		BaseRepository: repositoryIdentity{Provider: i.BaseRepository.Provider, ID: i.BaseRepository.ID}, BaseRef: i.BaseRef,
-		HeadRepository: repositoryIdentity{Provider: i.HeadRepository.Provider, ID: i.HeadRepository.ID}, HeadRef: i.HeadRef,
-		PublicationGeneration: i.PublicationGeneration, ExpectedHeadOID: i.ExpectedHeadOID,
+		BaseRepository: pullRequestRepositoryIdentity{Provider: i.BaseRepository.Provider, ID: i.BaseRepository.ID}, BaseRef: i.BaseRef,
+		HeadRepository: pullRequestRepositoryIdentity{Provider: i.HeadRepository.Provider, ID: i.HeadRepository.ID}, HeadRef: i.HeadRef,
+		PublicationGeneration: i.PublicationGeneration, ExpectedHeadOID: i.ExpectedHeadOID, SessionUID: i.SessionUID,
+	})
+}
+
+// SessionKey identifies one Session's PR across verified publications. The
+// per-publication Key and receipt still bind the current exact head commit.
+func (i PullRequestIntent) SessionKey() (string, error) {
+	if err := validatePullRequestIntent(i); err != nil {
+		return "", err
+	}
+	if i.SessionUID == "" {
+		return "", nil
+	}
+	return digestCanonical(struct {
+		Domain         string                        `json:"domain"`
+		BaseRepository pullRequestRepositoryIdentity `json:"baseRepository"`
+		BaseRef        string                        `json:"baseRef"`
+		HeadRepository pullRequestRepositoryIdentity `json:"headRepository"`
+		HeadRef        string                        `json:"headRef"`
+		SessionUID     string                        `json:"sessionUid"`
+	}{
+		Domain:         "orka.publisher.pr-session.v1",
+		BaseRepository: pullRequestRepositoryIdentity{Provider: i.BaseRepository.Provider, ID: i.BaseRepository.ID}, BaseRef: i.BaseRef,
+		HeadRepository: pullRequestRepositoryIdentity{Provider: i.HeadRepository.Provider, ID: i.HeadRepository.ID}, HeadRef: i.HeadRef,
+		SessionUID: i.SessionUID,
 	})
 }
 
@@ -45,6 +72,9 @@ func validatePullRequestIntent(intent PullRequestIntent) error {
 	}
 	if intent.PublicationGeneration < 1 {
 		return invalid("PR publication generation", "must be at least 1")
+	}
+	if len(intent.SessionUID) > 512 || strings.TrimSpace(intent.SessionUID) != intent.SessionUID {
+		return invalid("PR session UID", "must be a bounded immutable identifier")
 	}
 	return validateObjectID("PR expected head", intent.ExpectedHeadOID)
 }

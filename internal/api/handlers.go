@@ -1114,7 +1114,7 @@ func (h *Handlers) DeleteSession(c fiber.Ctx) error {
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrGatewayOwnedSession) {
 			return fiber.NewError(fiber.StatusNotFound, "session not found")
 		}
-		if errors.Is(err, store.ErrConflict) {
+		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotReady) {
 			return fiber.NewError(fiber.StatusConflict, "session has active or unsettled work")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to delete session: %v", err))

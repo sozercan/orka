@@ -57,6 +57,7 @@ type externalACPDispatchFixture struct {
 type externalACPDispatchFixtureOptions struct {
 	statusTransform                 func(*harnessv2.StatusResponse)
 	profileTransform                func(*harnessv2.RuntimeProfile)
+	terminalEvents                  map[harnessv2.PromptID]harnessv2.EventType
 	promptObserver                  func(harnessv2.StartPromptRequest)
 	workspaceDeltaObserver          func(harnessv2.CreateWorkspaceDeltaRequest)
 	supportsPublicationFinalization bool
@@ -198,11 +199,15 @@ func newExternalACPDispatchFixtureWithOptions(
 	createRequests := make(chan harnessv2.CreateRuntimeSessionRequest, 8)
 	deleteCalls := &atomic.Int32{}
 	deleteRequests := make(chan harnessv2.DeleteRuntimeSessionRequest, 8)
-	server := newDispatcherRuntimeServerWithSessionConfigurationAndDelete(
-		t, profile, profileDigest, false, false,
-		func(request harnessv2.DeleteRuntimeSessionRequest) {
-			deleteCalls.Add(1)
-			deleteRequests <- request
+	server := newDispatcherRuntimeServerForPoolWithOptions(
+		t, profile, profileDigest, acpDispatcherTestPoolUID, dispatcherRuntimeServerOptions{
+			disableAgentSessionConfiguration: true,
+			disablePermissions:               true,
+			terminalEvents:                   options.terminalEvents,
+			onDelete: func(request harnessv2.DeleteRuntimeSessionRequest) {
+				deleteCalls.Add(1)
+				deleteRequests <- request
+			},
 		},
 		func(request harnessv2.CreateRuntimeSessionRequest) {
 			createCalls.Add(1)
@@ -1846,7 +1851,7 @@ func TestACPDispatcherExternalReconformedCredentialCleanupRevalidatesBeforeMutat
 	}
 	cleanupClient, cleanupFence, err := fixture.dispatcher.externalRuntimeCleanupClient(
 		fixture.ctx, currentRuntime, bound.body.ExternalRuntime, bound.plan.Digest, bound.body.ExternalRuntime.Limits,
-		runtimeFence.RuntimeInstanceID, runtimeFence.SupervisorBootID,
+		runtimeFence.RuntimeInstanceID, runtimeFence.SupervisorBootID, nil,
 	)
 	if err != nil {
 		t.Fatal(err)

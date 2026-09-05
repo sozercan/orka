@@ -4520,6 +4520,8 @@ type externalRuntimeCleanupAuthority struct {
 	runtimeProfileDigest  harnessv2.ProfileDigest
 	protocolLimits        harnessv2.ProtocolLimits
 	reconformedAuth       bool
+	sessionCleanup        *sessionRuntimeCleanupFence
+	sessionCleanupAuth    *corev1.Secret
 }
 
 func newExternalRuntimeCleanupAuthority(
@@ -4574,6 +4576,13 @@ func externalRuntimeMutationUsesFrozenCleanupAuthority(operation string) bool {
 	}
 }
 
+func externalRuntimeCleanupMutationAllowed(authority *externalRuntimeCleanupAuthority, operation string) bool {
+	if authority != nil && authority.sessionCleanup != nil {
+		return operation == "delete_runtime_session"
+	}
+	return externalRuntimeMutationUsesFrozenCleanupAuthority(operation)
+}
+
 func (d *ACPDispatcher) externalRuntimeCleanupClient(
 	ctx context.Context,
 	current *corev1alpha1.AgentRuntime,
@@ -4582,6 +4591,7 @@ func (d *ACPDispatcher) externalRuntimeCleanupClient(
 	protocolLimits harnessv2.ProtocolLimits,
 	expectedRuntimeInstanceID harnessv2.RuntimeInstanceID,
 	expectedSupervisorBootID harnessv2.SupervisorBootID,
+	sessionCleanup *sessionRuntimeCleanupFence,
 ) (*harnessv2.Client, harnessv2.Fence, error) {
 	if current == nil || frozen == nil {
 		return nil, harnessv2.Fence{}, errors.New("external AgentRuntime frozen cleanup target is required")
@@ -4602,16 +4612,23 @@ func (d *ACPDispatcher) externalRuntimeCleanupClient(
 	reconformedAuth, err := validateExternalRuntimeCleanupAuthentication(
 		current, frozenRuntime, frozen, auth, runtimeProfileDigest,
 	)
+	var cleanupAuth *corev1.Secret
+	if err != nil && sessionCleanup != nil &&
+		string(auth.controllerSecretUID) == frozen.ControllerAuth.UID &&
+		string(auth.capabilitySecretUID) == frozen.OperationCapability.UID {
+		cleanupAuth, err = d.sessionRuntimeCleanupAuthSnapshot(ctx, current, frozenRuntime, auth,
+			runtimeProfileDigest, expectedRuntimeInstanceID, expectedSupervisorBootID, sessionCleanup)
+	}
 	if err != nil {
 		return nil, harnessv2.Fence{}, err
 	}
-	controllerFence, err := d.Epochs.CurrentFence(ctx)
+	runtimeEpoch, err := d.externalRuntimeCleanupEpoch(ctx, sessionCleanup)
 	if err != nil {
 		return nil, harnessv2.Fence{}, err
 	}
 	observed, err := validateExternalRuntimeCleanupIdentity(
 		current, types.NamespacedName{Namespace: current.Namespace, Name: current.Name}, current.UID,
-		expectedRuntimeInstanceID, expectedSupervisorBootID, "", 0, controllerFence,
+		expectedRuntimeInstanceID, expectedSupervisorBootID, "", 0, runtimeEpoch,
 	)
 	if err != nil {
 		return nil, harnessv2.Fence{}, err
@@ -4625,6 +4642,8 @@ func (d *ACPDispatcher) externalRuntimeCleanupClient(
 		return nil, harnessv2.Fence{}, err
 	}
 	authority.reconformedAuth = reconformedAuth
+	authority.sessionCleanup = sessionCleanup
+	authority.sessionCleanupAuth = cleanupAuth
 	runtimeClient, err := d.newExternalRuntimeCleanupHTTPClient(authority, harnessv2.ProfileDigest(observed.RuntimeProfileDigest), true)
 	if err != nil {
 		return nil, harnessv2.Fence{}, err
@@ -4633,12 +4652,12 @@ func (d *ACPDispatcher) externalRuntimeCleanupClient(
 	if err != nil {
 		return nil, harnessv2.Fence{}, err
 	}
-	if err := validateExternalRuntimeCleanupStatus(authority, observed, controllerFence, status); err != nil {
+	if err := validateExternalRuntimeCleanupStatus(authority, observed, runtimeEpoch, status); err != nil {
 		return nil, harnessv2.Fence{}, err
 	}
 	return runtimeClient, harnessv2.Fence{
 		RuntimeInstanceID: authority.runtimeInstanceID, SupervisorBootID: authority.supervisorBootID,
-		ControllerEpoch: uint64(controllerFence.Epoch), RuntimePoolUID: authority.runtimePoolUID,
+		ControllerEpoch: runtimeEpoch, RuntimePoolUID: authority.runtimePoolUID,
 		RuntimePoolGeneration: authority.runtimePoolGeneration, RuntimeProfileDigest: authority.runtimeProfileDigest,
 		ProfileDigestSchemaVersion: harnessv2.ProfileDigestSchemaVersion,
 	}, nil
@@ -4760,7 +4779,7 @@ func (d *ACPDispatcher) newExternalRuntimeCleanupHTTPClient(
 	}
 	if withMutationRevalidation {
 		options = append(options, harnessv2.WithBeforeMutation(func(validateCtx context.Context, operation string) error {
-			if !externalRuntimeMutationUsesFrozenCleanupAuthority(operation) {
+			if !externalRuntimeCleanupMutationAllowed(authority, operation) {
 				return errors.New("external AgentRuntime cleanup client cannot perform admission or non-cleanup mutations")
 			}
 			return d.revalidateExternalRuntimeCleanupMutation(validateCtx, authority)
@@ -4784,13 +4803,13 @@ func (d *ACPDispatcher) revalidateExternalRuntimeCleanupMutation(
 	if err := reader.Get(ctx, authority.runtimeKey, current); err != nil {
 		return markExternalRuntimeMutationReadRetryable(fmt.Errorf("re-read external AgentRuntime before cleanup mutation: %w", err))
 	}
-	controllerFence, err := d.Epochs.CurrentFence(ctx)
+	runtimeEpoch, err := d.externalRuntimeCleanupEpoch(ctx, authority.sessionCleanup)
 	if err != nil {
 		return err
 	}
 	observed, err := validateExternalRuntimeCleanupIdentity(
 		current, authority.runtimeKey, authority.runtimeUID, authority.runtimeInstanceID, authority.supervisorBootID,
-		authority.runtimePoolUID, authority.runtimePoolGeneration, controllerFence,
+		authority.runtimePoolUID, authority.runtimePoolGeneration, runtimeEpoch,
 	)
 	if err != nil {
 		return err
@@ -4815,7 +4834,11 @@ func (d *ACPDispatcher) revalidateExternalRuntimeCleanupMutation(
 		!bytes.Equal(currentAuth.operationCapabilitySecret, authority.auth.operationCapabilitySecret) {
 		return errors.New("external AgentRuntime frozen cleanup authentication changed before mutation")
 	}
-	if authority.reconformedAuth {
+	if authority.sessionCleanupAuth != nil {
+		if err := d.revalidateSessionRuntimeCleanupAuthSnapshot(ctx, current, authority); err != nil {
+			return err
+		}
+	} else if authority.reconformedAuth {
 		if err := validateExternalRuntimeReconformedCleanupAuthentication(
 			current, authority.frozenRuntime, currentAuth, authority.runtimeProfileDigest,
 		); err != nil {
@@ -4832,7 +4855,13 @@ func (d *ACPDispatcher) revalidateExternalRuntimeCleanupMutation(
 	if err != nil {
 		return markExternalRuntimeMutationReadRetryable(err)
 	}
-	return validateExternalRuntimeCleanupStatus(authority, observed, controllerFence, status)
+	if err := validateExternalRuntimeCleanupStatus(authority, observed, runtimeEpoch, status); err != nil {
+		return err
+	}
+	if authority.sessionCleanup != nil {
+		_, err = d.externalRuntimeCleanupEpoch(ctx, authority.sessionCleanup)
+	}
+	return err
 }
 
 func validateExternalRuntimeCleanupIdentity(
@@ -4843,7 +4872,7 @@ func validateExternalRuntimeCleanupIdentity(
 	expectedSupervisorBootID harnessv2.SupervisorBootID,
 	expectedRuntimePoolUID harnessv2.RuntimePoolUID,
 	expectedRuntimePoolGeneration uint64,
-	controllerFence store.ControllerEpochFence,
+	runtimeEpoch uint64,
 ) (*corev1alpha1.AgentRuntimeObservedCapabilities, error) {
 	if current == nil || current.Namespace != expectedKey.Namespace || current.Name != expectedKey.Name ||
 		current.UID == "" || current.UID != expectedUID {
@@ -4858,7 +4887,7 @@ func validateExternalRuntimeCleanupIdentity(
 	}
 	if observed.RuntimeInstanceID != string(expectedRuntimeInstanceID) ||
 		observed.SupervisorBootID != string(expectedSupervisorBootID) ||
-		observed.ControllerEpoch != controllerFence.Epoch {
+		observed.ControllerEpoch < 1 || uint64(observed.ControllerEpoch) != runtimeEpoch {
 		return nil, errors.New("external AgentRuntime runtime instance, boot, or controller fence changed before cleanup mutation")
 	}
 	if expectedRuntimePoolUID != "" && observed.RuntimePoolUID != string(expectedRuntimePoolUID) {
@@ -4873,13 +4902,13 @@ func validateExternalRuntimeCleanupIdentity(
 func validateExternalRuntimeCleanupStatus(
 	authority *externalRuntimeCleanupAuthority,
 	observed *corev1alpha1.AgentRuntimeObservedCapabilities,
-	controllerFence store.ControllerEpochFence,
+	runtimeEpoch uint64,
 	status *harnessv2.StatusResponse,
 ) error {
 	if authority == nil || observed == nil || status == nil ||
 		status.Fence.RuntimeInstanceID != authority.runtimeInstanceID ||
 		status.Fence.SupervisorBootID != authority.supervisorBootID ||
-		status.Fence.ControllerEpoch != uint64(controllerFence.Epoch) ||
+		status.Fence.ControllerEpoch != runtimeEpoch ||
 		status.Fence.RuntimePoolUID != authority.runtimePoolUID ||
 		status.Fence.RuntimePoolGeneration != authority.runtimePoolGeneration ||
 		string(status.Fence.RuntimeProfileDigest) != observed.RuntimeProfileDigest ||

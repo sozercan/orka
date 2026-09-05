@@ -62,7 +62,7 @@ func TestRuntimePoolDrainPreservesSessionTaskCleanupBeforeReplacement(t *testing
 	}
 	dispatcher := &ACPDispatcher{Client: r.Client, APIReader: r.Client}
 	for _, task := range tasks {
-		if ready, err := dispatcher.reconcileRecoveredRuntimeSession(ctx, task, task.UID, true, true); err != nil || !ready {
+		if ready, err := dispatcher.reconcileRecoveredRuntimeSession(ctx, task, task.UID, true, &sessionRuntimeCleanupFence{}); err != nil || !ready {
 			t.Fatalf("Session cleanup lost retired runtime proof for %s: ready:%v err:%v", task.Name, ready, err)
 		}
 	}
@@ -162,7 +162,7 @@ func TestRuntimePoolReplacementRetainsSessionCleanupProof(t *testing.T) {
 				t.Fatalf("replacement failed to serve a new exact instance: %#v", current.Status)
 			}
 			dispatcher := &ACPDispatcher{Client: r.Client, APIReader: r.Client}
-			if ready, err := dispatcher.reconcileRecoveredRuntimeSession(ctx, task, task.UID, true, true); err != nil || !ready {
+			if ready, err := dispatcher.reconcileRecoveredRuntimeSession(ctx, task, task.UID, true, &sessionRuntimeCleanupFence{}); err != nil || !ready {
 				t.Fatalf("Session cleanup after replacement = ready:%v err:%v", ready, err)
 			}
 		})

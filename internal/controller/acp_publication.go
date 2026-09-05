@@ -463,6 +463,7 @@ func (d *ACPDispatcher) publishWorkspaceDeltaOperation(
 			BaseRepository: pullRequestBase, BaseRef: publication.PRIntent.BaseRef,
 			HeadRepository: target, HeadRef: publication.PRIntent.HeadRef,
 			PublicationGeneration: publication.Generation, ExpectedHeadOID: publication.PRIntent.ExpectedHeadSHA,
+			SessionUID: publication.SessionUID,
 		}
 		prOperation := publicationOperationID("pr-reconcile", task)
 		prRequest := publisherservice.PullRequestReconcileRequest{

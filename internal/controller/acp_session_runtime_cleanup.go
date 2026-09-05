@@ -32,6 +32,44 @@ type sessionRuntimeCleanupTarget struct {
 	taskUID         types.UID
 	leaseGeneration int64
 	identity        sessionRuntimeCleanupIdentity
+	runtimeEpoch    uint64
+}
+
+// sessionRuntimeCleanupFence separates the current cleanup owner from the
+// immutable terminal turn's resident runtime. Only Session teardown may use
+// this older runtime epoch; it grants no admission or publication authority.
+type sessionRuntimeCleanupFence struct {
+	controller   store.ControllerEpochFence
+	runtimeEpoch uint64
+}
+
+func (d *ACPDispatcher) externalRuntimeCleanupEpoch(ctx context.Context, cleanup *sessionRuntimeCleanupFence) (uint64, error) {
+	current, err := d.Epochs.CurrentFence(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if cleanup == nil {
+		return uint64(current.Epoch), nil
+	}
+	if cleanup.controller != current || cleanup.runtimeEpoch == 0 || cleanup.runtimeEpoch > uint64(current.Epoch) {
+		return 0, fmt.Errorf("%w: Session runtime cleanup epoch authority changed", store.ErrConflict)
+	}
+	reader, ok := d.Store.(interface {
+		GetControllerEpochFence(context.Context, string) (store.ControllerEpochFence, error)
+	})
+	if !ok {
+		return 0, errors.New("session runtime cleanup requires authoritative epoch reads")
+	}
+	// ReclaimSession already holds the epoch mutation lock. A fresh read must
+	// not reacquire it or rely on the manager's cached leadership fence.
+	authoritative, err := reader.GetControllerEpochFence(ctx, current.Name)
+	if err != nil {
+		return 0, err
+	}
+	if authoritative != cleanup.controller {
+		return 0, fmt.Errorf("%w: Session runtime cleanup controller lost authority", store.ErrConflict)
+	}
+	return cleanup.runtimeEpoch, nil
 }
 
 // CleanupSessionRuntime retires resident conversation processes after the
@@ -81,8 +119,15 @@ func (d *ACPDispatcher) CleanupSessionRuntime(
 	cleaned := make(map[sessionRuntimeCleanupIdentity]struct{})
 	for i := range targets {
 		target := &targets[i]
+		cleanupFence := &sessionRuntimeCleanupFence{controller: fence, runtimeEpoch: uint64(fence.Epoch)}
+		if target.runtimeEpoch > 0 {
+			cleanupFence.runtimeEpoch = target.runtimeEpoch
+		}
+		if _, err := d.externalRuntimeCleanupEpoch(ctx, cleanupFence); err != nil {
+			return err
+		}
 		if _, done := cleaned[target.identity]; !done {
-			ready, err := d.reconcileRecoveredRuntimeSession(ctx, target.task, target.taskUID, true, true)
+			ready, err := d.reconcileRecoveredRuntimeSession(ctx, target.task, target.taskUID, true, cleanupFence)
 			if err != nil {
 				return err
 			}
@@ -90,6 +135,9 @@ func (d *ACPDispatcher) CleanupSessionRuntime(
 				return fmt.Errorf("%w: Session runtime cleanup is awaiting exact runtime retirement", store.ErrNotReady)
 			}
 			cleaned[target.identity] = struct{}{}
+		}
+		if _, err := d.externalRuntimeCleanupEpoch(ctx, cleanupFence); err != nil {
+			return err
 		}
 		if err := d.recordSessionRuntimeCleanupForTask(ctx, target); err != nil {
 			return err
@@ -138,6 +186,11 @@ func (d *ACPDispatcher) sessionRuntimeCleanupTarget(
 			!store.IsTerminalPromptExecutionState(store.PromptExecutionState(payload.HarnessRuntime.State)) ||
 			string(payload.HarnessRuntime.State) != string(payload.HarnessRuntime.Outcome) {
 			return nil, fmt.Errorf("%w: harness v1 projection lacks a terminal attempt", store.ErrConflict)
+		}
+		// V1 has no exact resident-runtime retirement proof for an unknown
+		// outcome. Retain that barrier even when its control object is absent.
+		if payload.HarnessRuntime.State == corev1alpha1.TaskExecutionStateOutcomeUnknown {
+			return nil, fmt.Errorf("%w: harness v1 unknown outcome requires reconciliation", store.ErrConflict)
 		}
 		return nil, nil
 	}
@@ -199,9 +252,16 @@ func (d *ACPDispatcher) sessionRuntimeCleanupTarget(
 		}
 		return nil, nil
 	}
-	return &sessionRuntimeCleanupTarget{
+	target := &sessionRuntimeCleanupTarget{
 		task: frozen, taskUID: types.UID(turn.Key.TaskUID), leaseGeneration: turn.Key.LeaseGeneration, identity: identity,
-	}, nil
+	}
+	// Legacy projections may recover omitted identity from mutable Task status.
+	// They cannot authorize a prior-epoch mutation. Only a complete, explicitly
+	// frozen execution can supply the resident runtime's original epoch.
+	if payload.Execution.RuntimeSessionUID != "" && payload.Execution.ControllerEpoch > 0 {
+		target.runtimeEpoch = uint64(payload.Execution.ControllerEpoch)
+	}
+	return target, nil
 }
 
 func (d *ACPDispatcher) frozenSessionRuntimeCleanupTask(
