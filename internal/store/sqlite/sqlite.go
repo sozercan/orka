@@ -310,6 +310,8 @@ func migrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_security_scan_runs_repo
 			ON security_scan_runs(namespace, repository_scan, started_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_security_scan_runs_admission
+			ON security_scan_runs(namespace, repository_scan)`,
 		`CREATE TABLE IF NOT EXISTS security_threat_models (
 			namespace         TEXT NOT NULL,
 			repository_scan   TEXT NOT NULL,
@@ -1057,6 +1059,8 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("migration failed: %w", err)
 	}
 	if err := ensureSQLiteColumns(db, "security_scan_runs", []sqliteColumnMigration{
+		{Name: "repository_scan_uid", Definition: "repository_scan_uid TEXT NOT NULL DEFAULT ''"},
+		{Name: "repository_scan_generation", Definition: "repository_scan_generation INTEGER NOT NULL DEFAULT 0"},
 		{Name: "slice_count", Definition: "slice_count INTEGER NOT NULL DEFAULT 0"},
 		{Name: "reviewed_slice_count", Definition: "reviewed_slice_count INTEGER NOT NULL DEFAULT 0"},
 		{Name: "skipped_slice_count", Definition: "skipped_slice_count INTEGER NOT NULL DEFAULT 0"},

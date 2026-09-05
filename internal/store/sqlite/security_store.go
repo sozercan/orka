@@ -87,21 +87,23 @@ func (s *Store) CreateScanRun(ctx context.Context, run *store.ScanRun) error {
 	query := `INSERT INTO security_scan_runs
 		 (id, namespace, repository_scan, task_name, mode, phase, base_commit, head_commit, commit_count,
 		  slice_count, reviewed_slice_count, skipped_slice_count, accepted_findings, dropped_findings,
-		  scanner_policy_version, policy_digest, idempotency_key, summary, error_message, started_at, completed_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		  scanner_policy_version, policy_digest, idempotency_key, summary, error_message, started_at, completed_at,
+		  repository_scan_uid, repository_scan_generation)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	args := []any{
 		run.ID, run.Namespace, run.RepositoryScan, run.TaskName, run.Mode, run.Phase,
 		run.BaseCommit, run.HeadCommit, run.CommitCount, run.SliceCount, run.ReviewedSliceCount,
 		run.SkippedSliceCount, run.AcceptedFindings, run.DroppedFindings,
 		run.ScannerPolicyVersion, run.PolicyDigest, run.IdempotencyKey, run.Summary, run.ErrorMessage,
-		run.StartedAt, run.CompletedAt,
+		run.StartedAt, run.CompletedAt, run.RepositoryScanUID, run.RepositoryScanGeneration,
 	}
 	if run.Phase == securityScanRunPhasePending || run.Phase == securityScanRunPhaseRunning {
 		query = `INSERT INTO security_scan_runs
 		 (id, namespace, repository_scan, task_name, mode, phase, base_commit, head_commit, commit_count,
 		  slice_count, reviewed_slice_count, skipped_slice_count, accepted_findings, dropped_findings,
-		  scanner_policy_version, policy_digest, idempotency_key, summary, error_message, started_at, completed_at)
-		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		  scanner_policy_version, policy_digest, idempotency_key, summary, error_message, started_at, completed_at,
+		  repository_scan_uid, repository_scan_generation)
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		 WHERE NOT EXISTS (
 		   SELECT 1 FROM security_scan_runs
 		   WHERE namespace = ? AND repository_scan = ? AND phase IN ('pending', 'running')
@@ -125,23 +127,49 @@ func (s *Store) CreateScanRun(ctx context.Context, run *store.ScanRun) error {
 	return nil
 }
 
-// UpdateScanRun updates a scan run.
+// UpdateScanRun updates progress without rebinding a run or reactivating an old
+// run after a newer run has been admitted, even when that newer run is terminal.
 func (s *Store) UpdateScanRun(ctx context.Context, run *store.ScanRun) error {
 	run.StartedAt = utcTime(run.StartedAt)
 	run.CompletedAt = utcTimePtr(run.CompletedAt)
-	_, err := s.db.ExecContext(ctx,
+	result, err := s.db.ExecContext(ctx,
 		`UPDATE security_scan_runs
 		 SET task_name = ?, mode = ?, phase = ?, base_commit = ?, head_commit = ?, commit_count = ?,
 		     slice_count = ?, reviewed_slice_count = ?, skipped_slice_count = ?, accepted_findings = ?, dropped_findings = ?,
 		     scanner_policy_version = ?, policy_digest = ?, idempotency_key = ?,
-		     summary = ?, error_message = ?, started_at = ?, completed_at = ?
-		 WHERE namespace = ? AND id = ?`,
+		     summary = ?, error_message = ?, completed_at = ?
+		 WHERE namespace = ? AND id = ? AND repository_scan = ?
+		   AND repository_scan_uid = ? AND repository_scan_generation = ?
+		   AND (? NOT IN ('pending', 'running') OR (
+		     NOT EXISTS (
+		       SELECT 1 FROM security_scan_runs other
+		       WHERE other.namespace = security_scan_runs.namespace
+		         AND other.repository_scan = security_scan_runs.repository_scan
+		         AND other.id <> security_scan_runs.id AND other.phase IN ('pending', 'running')
+		     ) AND NOT EXISTS (
+		       SELECT 1 FROM security_scan_runs newer
+		       WHERE newer.namespace = security_scan_runs.namespace
+		         AND newer.repository_scan = security_scan_runs.repository_scan
+		         AND newer.rowid > security_scan_runs.rowid
+		     )
+		   ))`,
 		run.TaskName, run.Mode, run.Phase, run.BaseCommit, run.HeadCommit, run.CommitCount,
 		run.SliceCount, run.ReviewedSliceCount, run.SkippedSliceCount, run.AcceptedFindings, run.DroppedFindings,
 		run.ScannerPolicyVersion, run.PolicyDigest, run.IdempotencyKey,
-		run.Summary, run.ErrorMessage, run.StartedAt, run.CompletedAt, run.Namespace, run.ID,
+		run.Summary, run.ErrorMessage, run.CompletedAt, run.Namespace, run.ID, run.RepositoryScan,
+		run.RepositoryScanUID, run.RepositoryScanGeneration, run.Phase,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil || updated == 1 {
+		return err
+	}
+	if _, err := s.GetScanRun(ctx, run.Namespace, run.ID); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: scan run identity changed or a newer run was admitted", store.ErrConflict)
 }
 
 // GetScanRun fetches a scan run by ID.
@@ -151,7 +179,7 @@ func (s *Store) GetScanRun(ctx context.Context, namespace, id string) (*store.Sc
 		`SELECT id, namespace, repository_scan, task_name, mode, phase, started_at, completed_at,
 		        base_commit, head_commit, commit_count, slice_count, reviewed_slice_count, skipped_slice_count,
 		        accepted_findings, dropped_findings, scanner_policy_version, policy_digest, idempotency_key,
-		        summary, error_message
+		        summary, error_message, repository_scan_uid, repository_scan_generation
 		 FROM security_scan_runs WHERE namespace = ? AND id = ?`,
 		namespace, id,
 	).Scan(
@@ -159,7 +187,7 @@ func (s *Store) GetScanRun(ctx context.Context, namespace, id string) (*store.Sc
 		&run.StartedAt, &run.CompletedAt, &run.BaseCommit, &run.HeadCommit, &run.CommitCount,
 		&run.SliceCount, &run.ReviewedSliceCount, &run.SkippedSliceCount, &run.AcceptedFindings,
 		&run.DroppedFindings, &run.ScannerPolicyVersion, &run.PolicyDigest, &run.IdempotencyKey,
-		&run.Summary, &run.ErrorMessage,
+		&run.Summary, &run.ErrorMessage, &run.RepositoryScanUID, &run.RepositoryScanGeneration,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
@@ -170,7 +198,8 @@ func (s *Store) GetScanRun(ctx context.Context, namespace, id string) (*store.Sc
 	return &run, nil
 }
 
-// ListScanRuns lists scan runs for a repository scan ordered newest first.
+// ListScanRuns lists scan runs in admission order, newest first. Caller clocks
+// and late Task timestamps must not change which run owns the current pipeline.
 func (s *Store) ListScanRuns(ctx context.Context, namespace, repositoryScan string, limit int, cursor string) ([]store.ScanRun, string, error) {
 	offset, err := parseOffsetCursor(cursor)
 	if err != nil {
@@ -184,10 +213,10 @@ func (s *Store) ListScanRuns(ctx context.Context, namespace, repositoryScan stri
 		`SELECT id, namespace, repository_scan, task_name, mode, phase, started_at, completed_at,
 		        base_commit, head_commit, commit_count, slice_count, reviewed_slice_count, skipped_slice_count,
 		        accepted_findings, dropped_findings, scanner_policy_version, policy_digest, idempotency_key,
-		        summary, error_message
+		        summary, error_message, repository_scan_uid, repository_scan_generation
 		 FROM security_scan_runs
 		 WHERE namespace = ? AND repository_scan = ?
-		 ORDER BY started_at DESC, id DESC
+		 ORDER BY rowid DESC
 		 LIMIT ? OFFSET ?`,
 		namespace, repositoryScan, limit, offset,
 	)
@@ -204,7 +233,7 @@ func (s *Store) ListScanRuns(ctx context.Context, namespace, repositoryScan stri
 			&run.StartedAt, &run.CompletedAt, &run.BaseCommit, &run.HeadCommit, &run.CommitCount,
 			&run.SliceCount, &run.ReviewedSliceCount, &run.SkippedSliceCount, &run.AcceptedFindings,
 			&run.DroppedFindings, &run.ScannerPolicyVersion, &run.PolicyDigest, &run.IdempotencyKey,
-			&run.Summary, &run.ErrorMessage,
+			&run.Summary, &run.ErrorMessage, &run.RepositoryScanUID, &run.RepositoryScanGeneration,
 		); err != nil {
 			return nil, "", err
 		}
