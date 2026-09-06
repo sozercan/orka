@@ -40,7 +40,7 @@ func TestContextTokenAllowedToolsFiltersInjectedProxyTools(t *testing.T) {
 	app.Use(NewAuthMiddleware(handler.client, AuthConfig{ContextTokens: ctxTokenConfig}))
 	app.Get("/filter", func(c fiber.Ctx) error {
 		compReq := &llm.CompletionRequest{}
-		injectOrkaTools(c.Context(), handler.client, compReq, "default")
+		injectOrkaTools(compReq)
 		gotNames = completionToolNames(filterCompletionToolsForContextToken(c, handler.contextTokenAuthorization, compReq.Tools))
 		return c.SendStatus(http.StatusNoContent)
 	})

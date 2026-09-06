@@ -7,7 +7,6 @@ MIT License - see LICENSE file for details.
 package api
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -20,7 +19,6 @@ import (
 )
 
 func TestPrepareCompatCoordinatorToolsDisabledPreservesRequest(t *testing.T) {
-	handler, _ := setupTestAnthropicHandler()
 	clientTool := llm.Tool{Name: "client_tool"}
 	req := &llm.CompletionRequest{
 		Tools:        []llm.Tool{clientTool},
@@ -34,8 +32,7 @@ func TestPrepareCompatCoordinatorToolsDisabledPreservesRequest(t *testing.T) {
 	var setupErr error
 	app := fiber.New()
 	app.Post("/", func(c fiber.Ctx) error {
-		enabled, setupErr = prepareCompatCoordinatorTools(c, context.Background(), req, compatCoordinatorSetup{
-			Client:              handler.client,
+		enabled, setupErr = prepareCompatCoordinatorTools(c, req, compatCoordinatorSetup{
 			Namespace:           "default",
 			ToolUseAction:       "testTools",
 			AuthorizationConfig: ContextTokenAuthorizationConfig{},
@@ -63,7 +60,6 @@ func TestPrepareCompatCoordinatorToolsDisabledPreservesRequest(t *testing.T) {
 }
 
 func TestPrepareCompatCoordinatorToolsEnabledInjectsPromptToolsAndStripsClientToolMessages(t *testing.T) {
-	handler, _ := setupTestAnthropicHandler()
 	req := &llm.CompletionRequest{
 		Tools:        []llm.Tool{{Name: "client_tool"}},
 		SystemPrompt: "original prompt",
@@ -77,8 +73,7 @@ func TestPrepareCompatCoordinatorToolsEnabledInjectsPromptToolsAndStripsClientTo
 	var setupErr error
 	app := fiber.New()
 	app.Post("/", func(c fiber.Ctx) error {
-		enabled, setupErr = prepareCompatCoordinatorTools(c, context.Background(), req, compatCoordinatorSetup{
-			Client:              handler.client,
+		enabled, setupErr = prepareCompatCoordinatorTools(c, req, compatCoordinatorSetup{
 			Namespace:           "default",
 			ToolUseAction:       "testTools",
 			AuthorizationConfig: ContextTokenAuthorizationConfig{},
@@ -111,7 +106,6 @@ func TestPrepareCompatCoordinatorToolsEnabledInjectsPromptToolsAndStripsClientTo
 }
 
 func TestPrepareCompatCoordinatorToolsPropagatesToolAuthorizationAction(t *testing.T) {
-	handler, _ := setupTestAnthropicHandler()
 	authz, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: ContextTokenAuthorizationModeEnforce})
 	if err != nil {
 		t.Fatalf("NewContextTokenAuthorizationConfig: %v", err)
@@ -121,8 +115,7 @@ func TestPrepareCompatCoordinatorToolsPropagatesToolAuthorizationAction(t *testi
 	app := fiber.New()
 	app.Post("/", func(c fiber.Ctx) error {
 		c.Locals(UserInfoContextKey, &UserInfo{AuthType: AuthTypeContextToken, ContextToken: &ContextToken{Scopes: []string{}}})
-		_, setupErr = prepareCompatCoordinatorTools(c, context.Background(), req, compatCoordinatorSetup{
-			Client:              handler.client,
+		_, setupErr = prepareCompatCoordinatorTools(c, req, compatCoordinatorSetup{
 			Namespace:           "default",
 			ToolUseAction:       "openAITools",
 			AuthorizationConfig: authz,
@@ -142,7 +135,6 @@ func TestPrepareCompatCoordinatorToolsPropagatesToolAuthorizationAction(t *testi
 }
 
 func TestPrepareCompatCoordinatorToolsFiltersAllowedToolsBeforeAuthorizing(t *testing.T) {
-	handler, _ := setupTestAnthropicHandler()
 	authz, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: ContextTokenAuthorizationModeEnforce})
 	if err != nil {
 		t.Fatalf("NewContextTokenAuthorizationConfig: %v", err)
@@ -155,8 +147,7 @@ func TestPrepareCompatCoordinatorToolsFiltersAllowedToolsBeforeAuthorizing(t *te
 			Scopes:             []string{ContextTokenScopeToolsUse},
 			TransactionContext: map[string]any{"allowedTools": []string{"file_read"}},
 		}})
-		_, setupErr = prepareCompatCoordinatorTools(c, context.Background(), req, compatCoordinatorSetup{
-			Client:              handler.client,
+		_, setupErr = prepareCompatCoordinatorTools(c, req, compatCoordinatorSetup{
 			Namespace:           "default",
 			ToolUseAction:       "anthropicTools",
 			AuthorizationConfig: authz,
@@ -179,7 +170,6 @@ func TestPrepareCompatCoordinatorToolsFiltersAllowedToolsBeforeAuthorizing(t *te
 }
 
 func TestPrepareCompatCoordinatorToolsToolUseAuthErrorDoesNotApplyPromptOrStripMessages(t *testing.T) {
-	handler, _ := setupTestAnthropicHandler()
 	authz, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: ContextTokenAuthorizationModeEnforce})
 	if err != nil {
 		t.Fatalf("NewContextTokenAuthorizationConfig: %v", err)
@@ -195,8 +185,7 @@ func TestPrepareCompatCoordinatorToolsToolUseAuthErrorDoesNotApplyPromptOrStripM
 	app := fiber.New()
 	app.Post("/", func(c fiber.Ctx) error {
 		c.Locals(UserInfoContextKey, &UserInfo{AuthType: AuthTypeContextToken, ContextToken: &ContextToken{Scopes: []string{}}})
-		_, setupErr = prepareCompatCoordinatorTools(c, context.Background(), req, compatCoordinatorSetup{
-			Client:              handler.client,
+		_, setupErr = prepareCompatCoordinatorTools(c, req, compatCoordinatorSetup{
 			Namespace:           "default",
 			ToolUseAction:       "openAITools",
 			AuthorizationConfig: authz,

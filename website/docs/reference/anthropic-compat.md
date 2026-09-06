@@ -183,9 +183,11 @@ specific to the Anthropic shape.
 4. Step 3 repeats until the model returns text only.
 5. That final response goes back to you.
 
-The loop executes the [18 built-in coordinator tools](openai-compat.md#coordinator-mode).
-Custom `Tool` CRDs with `parameters` can appear in the model's tool list, but the loop
-cannot execute their HTTP requests. Calling one returns `tool "..." not found`.
+The loop advertises and executes the registered
+[built-in and coordinator tools](openai-compat.md#coordinator-mode). Custom Kubernetes
+`Tool` resources are not advertised or executed, including those with a built-in name.
+With `X-Orka-Tools: disabled`, your client's tool definitions pass through unchanged and
+your client handles tool execution.
 
 ### Streaming behavior
 
