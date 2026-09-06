@@ -10,13 +10,23 @@ set -Eeuo pipefail
 cluster_name="${ORKA_DEMO_CLUSTER:-orka-demo}"
 img="${ORKA_DEMO_IMAGE:-orka-demo:dev}"
 publisher_img="${ORKA_DEMO_PUBLISHER_IMAGE:-orka-workspace-publisher:demo}"
+# Built-in agent runtimes only run from digest-pinned images the controller was
+# deployed with, so the demo builds the immutable Codex ACP runtime and pins it
+# through the kind registry. Set ORKA_DEMO_BUILD_ACP_CODEX=0 to skip (agent
+# Tasks then fail closed until the operator supplies the image).
+build_acp_codex="${ORKA_DEMO_BUILD_ACP_CODEX:-1}"
+acp_codex_img="${ORKA_DEMO_ACP_CODEX_IMAGE:-orka-acp-codex-runtime:demo}"
 namespace="${ORKA_NAMESPACE:-orka-system}"
-demo_namespace="${DEMO_NAMESPACE:-demo-magic}"
+# Demo resources live in the controller's single watched namespace; see
+# demo-env.sh.
+demo_namespace="${DEMO_NAMESPACE:-orka-system}"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 # shellcheck source=scripts/lib/kind-local-registry.sh
 . "${repo_root}/scripts/lib/kind-local-registry.sh"
+# shellcheck source=scripts/lib/e2e-admission-tls.sh
+. "${repo_root}/scripts/lib/e2e-admission-tls.sh"
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -49,9 +59,23 @@ log "Loading ${img} into kind/${cluster_name}"
 kind load docker-image "${img}" --name "${cluster_name}"
 manager_ref="$(orka_kind_registry_push "${img}" "orka/controller")"
 publisher_ref="$(orka_kind_registry_push "${publisher_img}" "orka/workspace-publisher")"
+placeholder_digest="sha256:$(printf '0%.0s' {1..64})"
+acp_codex_ref="example.invalid/orka/acp-codex@${placeholder_digest}"
+if [[ "${build_acp_codex}" == "1" ]]; then
+  log "Building immutable Codex ACP runtime image ${acp_codex_img}"
+  (cd "${repo_root}" && make docker-build-acp-codex-runtime ACP_CODEX_RUNTIME_IMG="${acp_codex_img}")
+  acp_codex_ref="$(orka_kind_registry_push "${acp_codex_img}" "orka/acp-codex-runtime")"
+  log "Codex ACP runtime image pinned as ${acp_codex_ref}"
+fi
 
 log "Ensuring namespaces ${namespace}, ${demo_namespace}, and vekil-system"
-kubectl create namespace "${namespace}"      --dry-run=client -o yaml | kubectl apply -f -
+# make deploy adopts the controller namespace only when it already carries the
+# static harness-v2 identity label, so create it through the same helper.
+bash "${repo_root}/scripts/lib/ensure-static-mode-namespace.sh" kubectl "${namespace}" harness-v2
+# The fail-closed admission webhook needs its serving certificate before
+# make deploy applies the production ACP topology.
+log "Ensuring the admission webhook TLS secret in ${namespace}"
+orka_e2e_bootstrap_admission_tls kubectl "${namespace}"
 kubectl create namespace "${demo_namespace}" --dry-run=client -o yaml | kubectl apply -f -
 kubectl create namespace vekil-system         --dry-run=client -o yaml | kubectl apply -f -
 
@@ -59,11 +83,10 @@ log "Installing ACP v2 CRDs"
 (cd "${repo_root}" && make install)
 
 log "Deploying Orka (namespace ${namespace}, image ${manager_ref})"
-placeholder_digest="sha256:$(printf '0%.0s' {1..64})"
 (cd "${repo_root}" && make deploy \
   IMG="${manager_ref}" \
   WORKSPACE_PUBLISHER_IMG="${publisher_ref}" \
-  ACP_CODEX_RUNTIME_IMG="example.invalid/orka/acp-codex@${placeholder_digest}" \
+  ACP_CODEX_RUNTIME_IMG="${acp_codex_ref}" \
   ACP_CLAUDE_RUNTIME_IMG="example.invalid/orka/acp-claude@${placeholder_digest}" \
   ACP_COPILOT_RUNTIME_IMG="example.invalid/orka/acp-copilot@${placeholder_digest}" \
   ACP_OPENCODE_RUNTIME_IMG="example.invalid/orka/acp-opencode@${placeholder_digest}")

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,9 +22,15 @@ import (
 )
 
 const (
-	maxRetries      = 5
-	saTokenPath     = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	saNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+	// resultMaxRetries and maxBackoff size the result submission window
+	// (~4 minutes of backoff) so a finished worker's result survives a routine
+	// single-replica controller restart (Recreate strategy: image pull, leader
+	// election, and PVC reattach commonly take 1-3 minutes of API downtime).
+	// Artifact uploads keep their own, shorter budget (artifactMaxRetries).
+	resultMaxRetries = 9
+	maxBackoff       = 60 * time.Second
+	saTokenPath      = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	saNamespacePath  = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
 	// MaxStructuredSummaryChars bounds agent-written summaries stored in structured
 	// results. Diffs remain intact for workspace handoff, but oversized summaries
@@ -31,11 +38,24 @@ const (
 	MaxStructuredSummaryChars = 32 * 1024
 )
 
-var resultStdoutMarkerPath = agentSandboxResultMarkerExecPath
+const (
+	// resultStdoutMarkerFile mirrors the stdout result marker to a file so a
+	// supervising process can recover it when stdout is truncated.
+	resultStdoutMarkerFile  = "/app/orka-result-marker"
+	resultStdoutTokenPrefix = "ORKA_RESULT_TOKEN:"
+)
+
+var resultStdoutMarkerPath = resultStdoutMarkerFile
+
+// retrySleep is stubbed by tests so retry-exhaustion cases do not spend the
+// full multi-minute backoff window.
+var retrySleep = time.Sleep
 
 // SubmitResult sends the task result to the controller via HTTP POST.
 // It reads ORKA_RESULT_ENDPOINT or constructs the URL from ORKA_CONTROLLER_URL.
-// Retries up to 5 times with exponential backoff (2s, 4s, 8s, 16s) on failure.
+// Retries with exponential backoff capped at maxBackoff (2s, 4s, 8s, 16s,
+// 32s, then 60s steps — ~4 minutes in total) so a controller restart does not
+// discard a completed worker's result.
 func SubmitResult(result []byte) error {
 	if len(bytes.TrimSpace(result)) == 0 {
 		return fmt.Errorf("result must not be blank")
@@ -45,7 +65,7 @@ func SubmitResult(result []byte) error {
 		marker := workerenv.ResultStdoutPrefix + base64.StdEncoding.EncodeToString(result)
 		fileData := marker + "\n"
 		if token := strings.TrimSpace(os.Getenv(workerenv.ResultStdoutToken)); token != "" {
-			fileData = agentSandboxResultTokenPrefix + token + "\n" + fileData
+			fileData = resultStdoutTokenPrefix + token + "\n" + fileData
 		}
 		if err := os.WriteFile(resultStdoutMarkerPath, []byte(fileData), 0o600); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to write stdout result marker file: %v\n", err)
@@ -62,20 +82,56 @@ func SubmitResult(result []byte) error {
 	saToken := workerServiceAccountToken()
 
 	var lastErr error
-	for attempt := range maxRetries {
+	for attempt := range resultMaxRetries {
 		if attempt > 0 {
-			backoff := time.Duration(1<<uint(attempt)) * time.Second
-			time.Sleep(backoff)
+			backoff := min(time.Duration(1<<uint(attempt))*time.Second, maxBackoff)
+			retrySleep(backoff)
 		}
 
 		lastErr = doPost(endpoint, result, saToken)
 		if lastErr == nil {
 			return nil
 		}
-		fmt.Fprintf(os.Stderr, "result submission attempt %d/%d failed: %v\n", attempt+1, maxRetries, lastErr)
+		if permanentSubmissionError(lastErr) {
+			// A definitive client-side rejection (oversized result, invalid
+			// worker authorization, result storage disabled) does not change
+			// by resending the identical request; fail now so the Job and Task
+			// settle instead of idling through the multi-minute window.
+			return fmt.Errorf("result submission rejected permanently: %w", lastErr)
+		}
+		fmt.Fprintf(os.Stderr, "result submission attempt %d/%d failed: %v\n", attempt+1, resultMaxRetries, lastErr)
 	}
 
-	return fmt.Errorf("all %d result submission attempts failed: %w", maxRetries, lastErr)
+	return fmt.Errorf("all %d result submission attempts failed: %w", resultMaxRetries, lastErr)
+}
+
+// httpStatusError carries a non-2xx controller response so callers can tell
+// permanent rejections from transient failures.
+type httpStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
+}
+
+// permanentSubmissionError reports whether err is a controller response that
+// will not change on retry: every 4xx except timeouts (408) and throttling
+// (429), plus 501 (result storage disabled). Transport errors, 5xx, and
+// throttling remain retryable.
+func permanentSubmissionError(err error) bool {
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.Status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	case http.StatusNotImplemented:
+		return true
+	}
+	return statusErr.Status >= 400 && statusErr.Status < 500
 }
 
 func resultEndpoint() (string, error) {
@@ -149,7 +205,7 @@ func doPostOnceWithContentType(endpoint string, data []byte, saToken, contentTyp
 	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	return &httpStatusError{Status: resp.StatusCode, Body: string(body)}
 }
 
 // StructuredResult is an optional structured envelope for task results.

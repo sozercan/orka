@@ -9,6 +9,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -27,17 +28,18 @@ func TestRepoLessWorkspaceBaselineIsStableAcrossSessionTurns(t *testing.T) {
 	ctx := context.Background()
 	d := &ACPDispatcher{}
 	session := &acpTaskSession{Binding: ACPRuntimeSessionBinding{SessionUID: "acp-session-stable"}}
+	createIssuedAt := time.Date(2026, time.September, 2, 7, 0, 0, 0, time.UTC)
 
 	first := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "turn-1", Namespace: runtimePoolDefaultControllerNamespace, UID: "task-uid-turn-1"}}
 	first.Spec.Type = corev1alpha1.TaskTypeAgent
 	second := first.DeepCopy()
 	second.Name, second.UID = "turn-2", "task-uid-turn-2"
 
-	firstPrepared, err := d.prepareRuntimeWorkspace(ctx, first, store.ControllerEpochFence{}, session)
+	firstPrepared, err := d.prepareRuntimeWorkspace(ctx, first, store.ControllerEpochFence{}, session, createIssuedAt, false)
 	if err != nil {
 		t.Fatalf("prepare first turn: %v", err)
 	}
-	secondPrepared, err := d.prepareRuntimeWorkspace(ctx, second, store.ControllerEpochFence{}, session)
+	secondPrepared, err := d.prepareRuntimeWorkspace(ctx, second, store.ControllerEpochFence{}, session, createIssuedAt, false)
 	if err != nil {
 		t.Fatalf("prepare second turn: %v", err)
 	}
@@ -49,7 +51,7 @@ func TestRepoLessWorkspaceBaselineIsStableAcrossSessionTurns(t *testing.T) {
 		t.Fatalf("session turns derived different workspace binding digests")
 	}
 
-	standalone, err := d.prepareRuntimeWorkspace(ctx, first, store.ControllerEpochFence{}, nil)
+	standalone, err := d.prepareRuntimeWorkspace(ctx, first, store.ControllerEpochFence{}, nil, createIssuedAt, false)
 	if err != nil {
 		t.Fatalf("prepare standalone: %v", err)
 	}
@@ -65,12 +67,13 @@ func TestRepoLessWorkspaceBindingRotatesLegacyIdentityFreeSession(t *testing.T) 
 	sessionUID := "acp-session-migrate"
 	const continuationName = "continuation"
 	session := &acpTaskSession{Binding: ACPRuntimeSessionBinding{SessionUID: sessionUID}}
+	createIssuedAt := time.Date(2026, time.September, 2, 7, 0, 0, 0, time.UTC)
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{
 		Name: continuationName, Namespace: runtimePoolDefaultControllerNamespace, UID: continuationName + "-task-uid",
 	}}
 	task.Spec.Type = corev1alpha1.TaskTypeAgent
 
-	prepared, err := d.prepareRuntimeWorkspace(ctx, task, store.ControllerEpochFence{}, session)
+	prepared, err := d.prepareRuntimeWorkspace(ctx, task, store.ControllerEpochFence{}, session, createIssuedAt, false)
 	if err != nil {
 		t.Fatalf("prepare %s workspace: %v", continuationName, err)
 	}

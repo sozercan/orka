@@ -27,7 +27,9 @@ jobs:
       - name: Compare Substrate pin with upstream HEAD
         run: |
           set -Eeuo pipefail
-          pin="$(grep -E '^SUBSTRATE_REF=' scripts/agent-substrate-e2e.sh | grep -oE '[0-9a-f]{40}' | head -n1)"
+          # The pipeline must not abort the step under pipefail when nothing
+          # matches; the empty-pin check below reports the actionable error.
+          pin="$(grep -E '^SUBSTRATE_REF=' scripts/agent-substrate-e2e.sh | grep -oE '[0-9a-f]{40}' | head -n1 || true)"
           if [ -z "${pin}" ]; then
             echo "::error::could not extract SUBSTRATE_REF from scripts/agent-substrate-e2e.sh; update this workflow's extraction pattern"
             exit 1

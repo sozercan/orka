@@ -20,6 +20,7 @@ import (
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -148,6 +149,54 @@ func TestACPUpgradeDrainCoordinatorCompletesExactInstanceDrain(t *testing.T) {
 	}
 	if completed, err := ACPUpgradeDrainCompletedForEpoch(ctx, kubeClient, coordinator.Options.MarkerNamespace, fence.Name, fence.Epoch-1); err != nil || completed {
 		t.Fatalf("previous unrelated epoch completion = %t, %v, want false", completed, err)
+	}
+}
+
+func TestACPUpgradeDrainCoordinatorDrainsPreservedOldGenerationInstance(t *testing.T) {
+	scheme := upgradeDrainTestScheme(t)
+	pool, pod, auth, supervisor := upgradeDrainRuntimePoolFixture(t)
+	pool.Generation++
+	pool.Status.ObservedGeneration = pool.Generation
+	pool.Status.Lifecycle = corev1alpha1.RuntimePoolLifecycleDegraded
+	pool.Status.AdmissionState = corev1alpha1.RuntimePoolAdmissionClosed
+	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+		Type:               corev1alpha1.RuntimePoolConditionRolloutReady,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: pool.Generation,
+		Reason:             runtimePoolRolloutReasonTimedOut,
+		Message:            "preserving the previous-generation runtime Pod",
+	})
+	if got := supervisor.probe.Status.Fence.RuntimePoolGeneration; got >= uint64(pool.Generation) {
+		t.Fatalf("fixture probe generation = %d, want older than current pool generation %d", got, pool.Generation)
+	}
+
+	fence := store.ControllerEpochFence{Name: store.DefaultControllerEpochName, Epoch: 7, HolderID: "controller-7"}
+	epochRecord, epochLease := upgradeDrainEpochObjects(fence)
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1alpha1.RuntimePool{}).
+		WithObjects(pool, &pod, auth, epochRecord, epochLease).
+		Build()
+	coordinator := NewACPUpgradeDrainCoordinator(
+		kubeClient,
+		kubeClient,
+		fixedUpgradeDrainEpochSource{fence: fence},
+		&fakeUpgradeDrainEpochStore{current: store.ControllerEpoch{Name: fence.Name, Epoch: fence.Epoch, HolderID: fence.HolderID}},
+		ACPUpgradeDrainBarrierObserverFunc(func(context.Context) (ACPUpgradeDrainBarrierSnapshot, error) {
+			return ACPUpgradeDrainBarrierSnapshot{}, nil
+		}),
+		NewACPAdmissionGate(),
+		testUpgradeDrainOptions(),
+	)
+	coordinator.SupervisorClient = supervisor
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Trigger(ctx); err != nil {
+		t.Fatalf("Trigger() with preserved old-generation instance: %v", err)
+	}
+	if supervisor.drainCallCount() != 1 {
+		t.Fatalf("old-generation drain calls = %d, want 1", supervisor.drainCallCount())
 	}
 }
 
@@ -992,4 +1041,43 @@ func TestRuntimeSessionControlAvailableWithoutLeaseIsQuiescent(t *testing.T) {
 	if !runtimeSessionControlHasUpgradeDrainWork(control) {
 		t.Fatal("active Session mutation lease did not block planned drain")
 	}
+}
+
+// ReadACPUpgradeDrainMarker returns the marker atomically ordered on the
+// authoritative controller-epoch Lease.
+func ReadACPUpgradeDrainMarker(
+	ctx context.Context,
+	reader client.Reader,
+	namespace, epochName string,
+) (ACPUpgradeDrainMarker, error) {
+	lease, err := readACPUpgradeDrainControllerEpochLease(ctx, reader, namespace, epochName)
+	if err != nil {
+		return ACPUpgradeDrainMarker{}, err
+	}
+	marker, present, err := decodeACPUpgradeDrainMarker(lease.Annotations[acpUpgradeDrainMarkerAnnotation])
+	if err != nil {
+		return ACPUpgradeDrainMarker{}, err
+	}
+	if !present {
+		return ACPUpgradeDrainMarker{}, store.ErrNotFound
+	}
+	return marker, nil
+}
+
+// ACPUpgradeDrainCompletedForEpoch is the only planned-takeover predicate. A
+// timeout or merely persisted intent intentionally returns false.
+func ACPUpgradeDrainCompletedForEpoch(
+	ctx context.Context,
+	reader client.Reader,
+	namespace, epochName string,
+	epoch int64,
+) (bool, error) {
+	marker, err := ReadACPUpgradeDrainMarker(ctx, reader, namespace, epochName)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return marker.ControllerEpoch == epoch && marker.State == ACPUpgradeDrainMarkerCompleted, nil
 }

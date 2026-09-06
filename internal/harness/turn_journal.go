@@ -9,7 +9,6 @@ package harness
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/orka-agents/orka/internal/store"
 )
@@ -51,24 +50,6 @@ func (j TurnJournal) ExistingFrameKeys(ctx context.Context) (map[string]struct{}
 		return nil, err
 	}
 	return keys, nil
-}
-
-// HasPersistedFrames reports whether the journal already contains mapped frames
-// for turnID. A positive result means the turn was already accepted and ran,
-// even if the wrapper process lost its in-memory turn map.
-func (j TurnJournal) HasPersistedFrames(ctx context.Context, turnID HarnessTurnID) (bool, error) {
-	if strings.TrimSpace(string(turnID)) == "" {
-		return false, nil
-	}
-	found := false
-	err := j.visitMappedFrameIdentities(ctx, func(identity MappedFrameIdentity) (bool, error) {
-		if identity.HasTurnID(turnID) {
-			found = true
-			return false, nil
-		}
-		return true, nil
-	})
-	return found, err
 }
 
 // AppendFrameIfNew maps and appends frame unless this journal pass already saw

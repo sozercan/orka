@@ -1,3 +1,7 @@
+---
+description: "Running Orka's gateways: delivery guarantees, bounds, and what to watch."
+---
+
 # Operating generic gateways
 
 Generic gateways are enabled by default. They use the controller SQLite database for normalized ingress events, Session transcript provenance, and outbound delivery state.
@@ -41,7 +45,7 @@ Agent runtime warmth does not affect Gateway readiness. Accepted events remain d
 
 A `serviceRef` resolves to `https://<service>.<namespace>.svc:<port>`. The adapter certificate must include `<service>.<namespace>.svc` as a DNS subject alternative name; an IP address or a different external hostname does not satisfy controller hostname verification.
 
-For a private CA, mount the CA certificate into the controller and either install it in the container's system trust store or set `SSL_CERT_DIR` to the mounted CA directory. Do not disable certificate verification. Roll the controller after changing its trust configuration, and wait for the rollout before expecting the Gateway to become Ready. For the default Helm release name and namespace:
+For a private CA, mount the CA certificate into the controller and either install it in the container's system trust store or set `SSL_CERT_DIR` to the mounted CA directory. Do not disable certificate verification. Roll the controller after changing its trust configuration, and wait for the rollout before expecting the Gateway to become Ready. For a Helm release named `orka` in `orka-system` (a `kubectl apply` install names the Deployment `orka-controller-manager` instead — see [Troubleshooting](troubleshooting.md#what-is-my-controller-deployment-called)):
 
 ```bash
 kubectl -n orka-system rollout restart deployment/orka-controller
@@ -54,7 +58,12 @@ Gateway-created Tasks remain ordinary Orka Task objects for controller execution
 
 ## Secret rotation
 
-Create or update Secret data without changing the configured key. Kubernetes Secret watch events trigger reconciliation; status records only the observed resourceVersion. Never put token values in Gateway metadata, status, logs, Tasks, or support bundles.
+Create or update Secret data without changing the configured key. Kubernetes Secret watch events trigger reconciliation; status records only the observed resourceVersion.
+
+:::danger[Token values belong only in the Secret]
+Never put them in Gateway metadata, status, logs, Tasks, or support bundles. Status records
+the Secret's `resourceVersion` and nothing else, and support bundles are routinely shared.
+:::
 
 When an endpoint changes, update the outbound Secret's `gateway.orka.ai/adapter-endpoint` annotation to the exact new resolved HTTPS endpoint. The Gateway remains not ready until the binding matches and the authenticated probe succeeds.
 
@@ -65,16 +74,33 @@ Inspect event and delivery state in the dashboard or with:
 ```bash
 orka gateway events list --state DeadLettered,Expired
 orka gateway deliveries list --state DeadLettered,Failed,Expired
-orka gateway deliveries retry <delivery-id>
+orka gateway deliveries retry '<delivery-id>'
 ```
 
 Manual retry preserves the stable delivery/idempotency ID, resets the bounded attempt window, extends expiry by 24 hours, and increments `manualRetryCount`. Expired ingress events are not automatically replayed because their original sender/context authorization may no longer be valid.
 
 ## Backup and restore
 
-Gateway Sessions, normalized events, delivery rows, and event-to-Task correlation are in the controller SQLite database. Gateway CRDs, referenced Secrets, and Task CRs are Kubernetes objects and are **not** in that file. A disaster-recovery backup therefore needs both the SQLite volume and the corresponding cluster objects; keep credentials in the cluster Secret backup, never in the SQLite archive.
+Gateway state lives in two places, and a backup of one alone is not a backup.
 
-SQLite runs in WAL mode. Do not copy only `orka.db` while the controller is writing because committed records may still be in `orka.db-wal`. Use one of these consistency-safe approaches:
+| Where | What is in it |
+| --- | --- |
+| Controller SQLite database (on the PVC) | Gateway Sessions, normalized events, delivery rows, event-to-Task correlation |
+| Kubernetes | Gateway CRDs, referenced Secrets, Task CRs |
+
+:::danger[Back up both, and keep credentials out of the SQLite archive]
+A disaster-recovery backup needs the SQLite volume *and* the corresponding cluster objects.
+Credentials belong in the cluster Secret backup only.
+:::
+
+SQLite runs in WAL mode, which means a committed record may still be sitting in `orka.db-wal`
+rather than in `orka.db`.
+
+:::warning[Copying `orka.db` alone from a running controller silently loses committed work]
+There is no error. The copy simply comes back missing whatever was still in the WAL.
+:::
+
+Use one of these consistency-safe approaches:
 
 - take an atomic CSI `VolumeSnapshot` of the whole persistent volume, including the database, WAL, and shared-memory files; quiescing writes first is still preferred;
 - use SQLite's online backup API against the live database; or
@@ -90,7 +116,12 @@ For a release or disaster-recovery backup:
 
 To restore, stop gateway writers, restore the SQLite files and matching Kubernetes objects, then start one controller replica first. Confirm CRDs are Established, migrations complete, Gateways return Ready, terminal deliveries remain terminal, and queued events/due deliveries become claimable before restoring normal replica count and ingress. Claims that were active at backup time become eligible only after their recorded lease expires.
 
-Deterministic Task and delivery IDs prevent restored work from receiving new identities. They cannot prove whether a provider accepted a request immediately before the snapshot, so a conforming adapter must deduplicate any replay by the original delivery/idempotency ID. Never "repair" a restore by deleting or regenerating delivery IDs.
+Deterministic Task and delivery IDs prevent restored work from receiving new identities. They cannot prove whether a provider accepted a request immediately before the snapshot, so a conforming adapter must deduplicate any replay by the original delivery/idempotency ID.
+
+:::danger[Never "repair" a restore by deleting or regenerating delivery IDs]
+Those IDs are the only thing stopping a replayed delivery from being processed twice. A new
+ID turns a safe duplicate into a second real side effect.
+:::
 
 ## Upgrade compatibility and version skew
 
@@ -131,7 +162,11 @@ A binary-only rollback is acceptable only when the release notes explicitly stat
 4. Deploy the prior controller and adapter versions.
 5. Validate readiness and ledger counts before resuming ingress.
 
-Do not run an older controller against a forward-migrated production database merely because it starts. Do not use a down migration on the live database unless that exact path is shipped and documented by the release.
+:::danger[A controller that starts is not a controller that is safe]
+Do not run an older controller against a forward-migrated production database merely because
+it starts. Do not use a down migration on the live database unless that exact path is shipped
+and documented by the release.
+:::
 
 ## Cleanup
 

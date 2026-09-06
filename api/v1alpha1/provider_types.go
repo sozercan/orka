@@ -41,10 +41,6 @@ type ProviderSpec struct {
 	// +optional
 	DefaultModel string `json:"defaultModel,omitempty"`
 
-	// RateLimit configures rate limiting for this provider
-	// +optional
-	RateLimit *ProviderRateLimit `json:"rateLimit,omitempty"`
-
 	// Azure contains Azure-specific configuration
 	// +optional
 	Azure *AzureConfig `json:"azure,omitempty"`
@@ -60,17 +56,6 @@ type ProviderSecretRef struct {
 	// +kubebuilder:default="api-key"
 	// +optional
 	Key string `json:"key,omitempty"`
-}
-
-// ProviderRateLimit configures rate limiting
-type ProviderRateLimit struct {
-	// RequestsPerMinute limits requests per minute
-	// +optional
-	RequestsPerMinute *int32 `json:"requestsPerMinute,omitempty"`
-
-	// TokensPerMinute limits tokens per minute
-	// +optional
-	TokensPerMinute *int64 `json:"tokensPerMinute,omitempty"`
 }
 
 // AzureConfig contains Azure OpenAI specific configuration

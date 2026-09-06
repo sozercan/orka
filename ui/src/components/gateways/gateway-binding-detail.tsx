@@ -5,15 +5,17 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useGatewayBinding } from '@/hooks/use-gateways'
-import { GatewayQueryError } from './gateway-query-error'
+import { ListAccessError } from '@/components/ui/list-access-error'
 import { isGatewayResourceReady, isGatewayStatusFresh } from './gateway-readiness'
 import { GatewayStatusBadge } from './gateway-tables'
+import { formatTimestamp } from '@/lib/time'
+import { humanizeCamelCase } from '@/lib/utils'
 
 export function GatewayBindingDetail({ name }: { name: string }) {
   const binding = useGatewayBinding(name)
 
   if (binding.isLoading) return <Skeleton className="h-96 rounded-xl" />
-  if (binding.error) return <GatewayQueryError label={`GatewayBinding ${name}`} error={binding.error} />
+  if (binding.error) return <ListAccessError resource={`GatewayBinding ${name}`} error={binding.error} />
   if (!binding.data) {
     return <Card><CardContent className="py-12 text-center text-muted-foreground">GatewayBinding not found.</CardContent></Card>
   }
@@ -155,16 +157,16 @@ export function GatewayBindingDetail({ name }: { name: string }) {
           <CardHeader><CardTitle className="flex items-center gap-2"><Clock3 className="h-5 w-5 text-primary" />Activity and capabilities</CardTitle></CardHeader>
           <CardContent className="space-y-4 text-sm">
             <div className="grid gap-4 sm:grid-cols-2">
-              <KeyValue label="Last inbound" value={formatDate(item.status?.lastInboundActivity)} />
-              <KeyValue label="Last outbound" value={formatDate(item.status?.lastOutboundActivity)} />
+              <KeyValue label="Last inbound" value={formatTimestamp(item.status?.lastInboundActivity)} />
+              <KeyValue label="Last outbound" value={formatTimestamp(item.status?.lastOutboundActivity)} />
               <KeyValue label="Observed generation" value={item.status?.observedGeneration?.toString() || 'Not observed'} />
-              <KeyValue label="Created" value={formatDate(item.metadata.creationTimestamp)} />
+              <KeyValue label="Created" value={formatTimestamp(item.metadata.creationTimestamp)} />
             </div>
             <div className="space-y-2 border-t pt-4">
               <p className="text-xs uppercase tracking-wide text-muted-foreground">Resolved adapter capabilities</p>
               <div className="flex flex-wrap gap-2">
                 {Object.entries(resolvedCapabilities ?? {}).filter(([, enabled]) => enabled).map(([capability]) => (
-                  <Badge key={capability} variant="outline">{humanize(capability)}</Badge>
+                  <Badge key={capability} variant="outline">{humanizeCamelCase(capability)}</Badge>
                 ))}
                 {!resolvedCapabilities && <span className="text-sm text-muted-foreground">No capabilities have been resolved.</span>}
               </div>
@@ -215,12 +217,3 @@ function formatOptionalNumber(value?: number) {
   return value === undefined ? 'Controller default' : value.toString()
 }
 
-function formatDate(value?: string) {
-  if (!value) return 'Never'
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
-}
-
-function humanize(value: string) {
-  return value.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
-}

@@ -32,16 +32,11 @@ type SubstrateActorPoolSpec struct {
 	WorkerPoolRef *WorkspaceTemplateReference `json:"workerPoolRef,omitempty"`
 
 	// TargetActors is the desired number of stateful actors tracked for this
-	// pool. It may exceed TargetWorkers to express oversubscription.
+	// pool. It may exceed the physical worker budget to express oversubscription.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
 	TargetActors int32 `json:"targetActors,omitempty"`
-
-	// TargetWorkers is the intended physical worker budget for this pool.
-	// +kubebuilder:validation:Minimum=0
-	// +optional
-	TargetWorkers int32 `json:"targetWorkers,omitempty"`
 
 	// PrecreateActors asks the controller to create deterministic warm actors up
 	// to TargetActors. Substrate may suspend them when the WorkerPool is full.

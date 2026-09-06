@@ -193,11 +193,6 @@ func (s *Store) requireBranchClaimAccess() error {
 	return nil
 }
 
-// ControlNamespace returns the namespace containing the controller epoch Lease.
-func (s *Store) ControlNamespace() string {
-	return s.controlNamespace
-}
-
 // GetSessionTurn delegates SQLite-only SessionTurn reads.
 func (s *Store) GetSessionTurn(ctx context.Context, id string) (*store.SessionTurn, error) {
 	if s.sessionTurns == nil {

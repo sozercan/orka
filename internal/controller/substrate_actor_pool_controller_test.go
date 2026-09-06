@@ -49,7 +49,6 @@ func TestSubstrateActorPoolReconcilerPrecreatesActorsAndUpdatesDensity(t *testin
 		Spec: corev1alpha1.SubstrateActorPoolSpec{
 			TemplateRef:     corev1alpha1.WorkspaceTemplateReference{Name: "codex", Namespace: "ate-demo"},
 			TargetActors:    3,
-			TargetWorkers:   1,
 			PrecreateActors: true,
 		},
 	}
@@ -124,7 +123,6 @@ func TestSubstrateActorPoolReconcilerAcceptsMCPOnlyTemplate(t *testing.T) {
 		Spec: corev1alpha1.SubstrateActorPoolSpec{
 			TemplateRef:     corev1alpha1.WorkspaceTemplateReference{Name: "mcp-template", Namespace: "ate-demo"},
 			TargetActors:    1,
-			TargetWorkers:   1,
 			PrecreateActors: true,
 		},
 	}
@@ -367,11 +365,10 @@ func TestSubstrateActorPoolReconcilerDefersScaleDownWithActiveLease(t *testing.T
 	template.SetName("codex")
 	template.SetNamespace("ate-demo")
 	prefix := deterministicSubstratePoolActorPrefix(pool.Namespace, pool.Name)
-	holder := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "running-task", Namespace: "default", UID: "running-task-uid"},
-		Status:     corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseRunning},
+	holder := &corev1alpha1.Tool{
+		ObjectMeta: metav1.ObjectMeta{Name: "running-tool", Namespace: "default", UID: "running-tool-uid"},
 	}
-	lease := newSubstratePoolActorLease(holder, pool.Namespace, deterministicSubstratePoolActorID(prefix, 2), deterministicSubstratePoolActorID(prefix, 2))
+	lease := newSubstrateMCPPoolActorLease(holder, pool.Namespace, deterministicSubstratePoolActorID(prefix, 2), deterministicSubstratePoolActorID(prefix, 2))
 	executor := &recordingSubstratePoolExecutor{}
 	reconciler := &SubstrateActorPoolReconciler{
 		Client:           fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1alpha1.SubstrateActorPool{}).WithObjects(pool, template, holder, lease).Build(),
@@ -411,11 +408,10 @@ func TestSubstrateActorPoolReconcilerFinalizerWaitsForActiveLeases(t *testing.T)
 		},
 	}
 	prefix := deterministicSubstratePoolActorPrefix(pool.Namespace, pool.Name)
-	holder := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "running-task", Namespace: "default", UID: "running-task-uid"},
-		Status:     corev1alpha1.TaskStatus{Phase: corev1alpha1.TaskPhaseRunning},
+	holder := &corev1alpha1.Tool{
+		ObjectMeta: metav1.ObjectMeta{Name: "running-tool", Namespace: "default", UID: "running-tool-uid"},
 	}
-	lease := newSubstratePoolActorLease(holder, pool.Namespace, deterministicSubstratePoolActorID(prefix, 0), deterministicSubstratePoolActorID(prefix, 0))
+	lease := newSubstrateMCPPoolActorLease(holder, pool.Namespace, deterministicSubstratePoolActorID(prefix, 0), deterministicSubstratePoolActorID(prefix, 0))
 	executor := &recordingSubstratePoolExecutor{}
 	reconciler := &SubstrateActorPoolReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, holder, lease).Build(),

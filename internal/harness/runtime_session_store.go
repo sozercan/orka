@@ -11,20 +11,6 @@ import (
 	"time"
 )
 
-// RuntimeSessionFilter constrains internal RuntimeSession persistence queries.
-type RuntimeSessionFilter struct {
-	Namespace       string
-	SessionName     string
-	ActiveTask      string
-	AgentName       string
-	Provider        ProviderKind
-	States          []RuntimeSessionState
-	CleanupPolicies []RuntimeCleanupPolicy
-	IncludeDeleted  bool
-	Limit           int
-	Cursor          string
-}
-
 // RuntimeSessionTransition describes an optimistic state transition for a
 // namespace-owned RuntimeSession.
 type RuntimeSessionTransition struct {
@@ -46,7 +32,6 @@ type RuntimeSessionTransition struct {
 type RuntimeSessionStore interface {
 	CreateRuntimeSession(ctx context.Context, session *RuntimeSession) error
 	GetRuntimeSession(ctx context.Context, namespace string, id RuntimeSessionID) (*RuntimeSession, error)
-	ListRuntimeSessions(ctx context.Context, filter RuntimeSessionFilter) ([]RuntimeSession, string, error)
 	TransitionRuntimeSession(ctx context.Context, transition RuntimeSessionTransition) (*RuntimeSession, error)
 	DeleteRuntimeSession(ctx context.Context, namespace string, id RuntimeSessionID) error
 }

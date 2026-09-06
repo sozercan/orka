@@ -40,22 +40,6 @@ type HarnessV1BrokeredToolExecutor interface {
 	) (json.RawMessage, error)
 }
 
-type HarnessV1BrokeredToolExecutorFunc func(
-	context.Context,
-	string,
-	*corev1alpha1.Tool,
-	harness.ToolCallRequest,
-) (json.RawMessage, error)
-
-func (f HarnessV1BrokeredToolExecutorFunc) ExecuteHarnessV1BrokeredTool(
-	ctx context.Context,
-	namespace string,
-	tool *corev1alpha1.Tool,
-	request harness.ToolCallRequest,
-) (json.RawMessage, error) {
-	return f(ctx, namespace, tool, request)
-}
-
 // harnessV1AuthenticatedTask carries the dispatcher-verified Task identity of
 // a brokered tool call. The dispatcher stamps it per request immediately
 // before invoking the executor, after the Task passed the immutable

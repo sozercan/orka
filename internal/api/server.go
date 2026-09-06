@@ -66,7 +66,6 @@ func (s *ControllerEpochStoreFenceSource) CurrentFence(ctx context.Context) (sto
 // ServerConfig holds configuration for the API server
 type ServerConfig struct {
 	Port                      int
-	MetricsPort               int
 	WatchNamespace            string
 	ExecutionMode             executionmode.Mode
 	EnforceNamespaceIsolation bool
@@ -98,28 +97,24 @@ type ServerConfig struct {
 
 // Server is the REST API server
 type Server struct {
-	app                    *fiber.App
-	client                 client.Client
-	config                 ServerConfig
-	sessionManager         *controller.SessionManager
-	handlers               *Handlers
-	chatHandler            *ChatHandler
-	openaiHandler          *OpenAICompatHandler
-	anthropicHandler       *AnthropicCompatHandler
-	internalHandlers       *InternalHandlers
-	ResultStore            store.ResultStore
-	SessionStore           store.SessionStore
-	PlanStore              store.PlanStore
-	MessageStore           store.MessageStore
-	ArtifactStore          store.ArtifactStore
-	MemoryStore            store.MemoryStore
-	MemoryProposalStore    store.MemoryProposalStore
-	SecurityStore          store.SecurityStore
-	RepositoryMonitorStore store.RepositoryMonitorStore
-	ExecutionEventStore    store.ExecutionEventStore
-	GatewayEventStore      store.GatewayEventStore
-	GatewayDeliveryStore   store.GatewayDeliveryStore
-	GatewayService         *gatewayruntime.Service
+	app                 *fiber.App
+	client              client.Client
+	config              ServerConfig
+	sessionManager      *controller.SessionManager
+	handlers            *Handlers
+	chatHandler         *ChatHandler
+	openaiHandler       *OpenAICompatHandler
+	anthropicHandler    *AnthropicCompatHandler
+	internalHandlers    *InternalHandlers
+	ResultStore         store.ResultStore
+	SessionStore        store.SessionStore
+	PlanStore           store.PlanStore
+	MessageStore        store.MessageStore
+	ArtifactStore       store.ArtifactStore
+	MemoryStore         store.MemoryStore
+	MemoryProposalStore store.MemoryProposalStore
+	ExecutionEventStore store.ExecutionEventStore
+	GatewayEventStore   store.GatewayEventStore
 }
 
 // NewServer creates a new API server
@@ -134,23 +129,19 @@ func NewServer(c client.Client, sessionManager *controller.SessionManager, confi
 	app.Server().HeaderReceived = requestBodyConfig
 
 	server := &Server{
-		app:                    app,
-		client:                 c,
-		config:                 config,
-		sessionManager:         sessionManager,
-		ResultStore:            config.ResultStore,
-		SessionStore:           config.SessionStore,
-		PlanStore:              config.PlanStore,
-		MessageStore:           config.MessageStore,
-		ArtifactStore:          config.ArtifactStore,
-		MemoryStore:            config.MemoryStore,
-		MemoryProposalStore:    config.MemoryProposalStore,
-		SecurityStore:          config.SecurityStore,
-		RepositoryMonitorStore: config.RepositoryMonitorStore,
-		ExecutionEventStore:    config.ExecutionEventStore,
-		GatewayEventStore:      config.GatewayEventStore,
-		GatewayDeliveryStore:   config.GatewayDeliveryStore,
-		GatewayService:         config.GatewayService,
+		app:                 app,
+		client:              c,
+		config:              config,
+		sessionManager:      sessionManager,
+		ResultStore:         config.ResultStore,
+		SessionStore:        config.SessionStore,
+		PlanStore:           config.PlanStore,
+		MessageStore:        config.MessageStore,
+		ArtifactStore:       config.ArtifactStore,
+		MemoryStore:         config.MemoryStore,
+		MemoryProposalStore: config.MemoryProposalStore,
+		ExecutionEventStore: config.ExecutionEventStore,
+		GatewayEventStore:   config.GatewayEventStore,
 	}
 
 	server.handlers = NewHandlers(HandlersConfig{
@@ -179,10 +170,13 @@ func NewServer(c client.Client, sessionManager *controller.SessionManager, confi
 	resolver := NewProviderResolver(c, config.Chat)
 	server.chatHandler = NewChatHandler(c, sessionManager, config.Chat, config.WatchNamespace, config.EnforceNamespaceIsolation, config.SessionStore, config.ResultStore, resolver, config.Clientset)
 	server.chatHandler.contextTokenAuthorization = config.ContextTokenAuthorization
+	server.chatHandler.gatewayEventStore = config.GatewayEventStore
 	server.openaiHandler = NewOpenAICompatHandler(c, config.WatchNamespace, config.EnforceNamespaceIsolation, config.Chat, resolver, config.ResultStore, config.Clientset)
 	server.openaiHandler.contextTokenAuthorization = config.ContextTokenAuthorization
+	server.openaiHandler.gatewayEventStore = config.GatewayEventStore
 	server.anthropicHandler = NewAnthropicCompatHandler(c, config.WatchNamespace, config.EnforceNamespaceIsolation, config.Chat, resolver, config.ResultStore, config.Clientset)
 	server.anthropicHandler.contextTokenAuthorization = config.ContextTokenAuthorization
+	server.anthropicHandler.gatewayEventStore = config.GatewayEventStore
 	server.setupMiddleware()
 	server.setupRoutes()
 	server.setupStaticFiles()
@@ -299,10 +293,7 @@ func (s *Server) setupRoutes() {
 	externalAuth := NewAuthMiddleware(s.client, AuthConfig{OIDC: s.config.OIDC, ContextTokens: s.config.ContextTokens})
 
 	// API v1 group
-	api := s.app.Group("/api/v1")
-
-	// Auth middleware for API endpoints
-	api.Use(externalAuth)
+	api := s.externalAPIGroup("/api/v1", externalAuth)
 
 	// Task endpoints
 	api.Post("/tasks", s.handlers.CreateTask)
@@ -463,14 +454,12 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI-compatible API (under /openai/v1, separate from /api/v1)
 	// This allows OpenAI-compatible clients to use Orka as a custom provider.
-	oai := s.app.Group("/openai/v1")
-	oai.Use(externalAuth)
+	oai := s.externalAPIGroup("/openai/v1", externalAuth)
 	oai.Post("/chat/completions", s.openaiHandler.HandleChatCompletions)
 	oai.Get("/models", s.openaiHandler.HandleListModels)
 
 	// Anthropic-compatible API
-	anthropic := s.app.Group("/anthropic/v1")
-	anthropic.Use(externalAuth)
+	anthropic := s.externalAPIGroup("/anthropic/v1", externalAuth)
 	anthropic.Post("/messages", s.anthropicHandler.HandleMessages)
 	anthropic.Get("/models", s.anthropicHandler.HandleListModels)
 
@@ -553,6 +542,28 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
+// spaFallbackEligible reports whether a 404 for path is served as the SPA
+// index page instead of a JSON error. Telemetry middleware uses the same
+// predicate so the recorded status matches what the client receives.
+func spaFallbackEligible(path string) bool {
+	isAPI := len(path) >= 4 && path[:4] == "/api"
+	return !isAPI && path != "/healthz" && path != "/readyz"
+}
+
+// spaIndexHTML returns the embedded SPA index page, or false when the UI
+// assets are unavailable.
+func spaIndexHTML() ([]byte, bool) {
+	distFS, err := uiembed.FS()
+	if err != nil {
+		return nil, false
+	}
+	data, err := fs.ReadFile(distFS, "index.html")
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
 // customErrorHandler handles errors returned by handlers and produces a
 // consistent JSON envelope for all main API endpoints.
 //
@@ -582,18 +593,10 @@ func customErrorHandler(c fiber.Ctx, err error) error {
 	}
 
 	// For 404s on non-API paths, serve the SPA index.html
-	if code == fiber.StatusNotFound {
-		path := c.Path()
-		isAPI := len(path) >= 4 && path[:4] == "/api"
-		if !isAPI && path != "/healthz" && path != "/readyz" {
-			distFS, fsErr := uiembed.FS()
-			if fsErr == nil {
-				data, readErr := fs.ReadFile(distFS, "index.html")
-				if readErr == nil {
-					c.Set("Content-Type", "text/html; charset=utf-8")
-					return c.Status(fiber.StatusOK).Send(data)
-				}
-			}
+	if code == fiber.StatusNotFound && spaFallbackEligible(c.Path()) {
+		if data, ok := spaIndexHTML(); ok {
+			c.Set("Content-Type", "text/html; charset=utf-8")
+			return c.Status(fiber.StatusOK).Send(data)
 		}
 	}
 

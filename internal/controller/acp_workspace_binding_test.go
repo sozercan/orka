@@ -2088,3 +2088,16 @@ func TestProjectACPExecutionWorkspaceStatusRetriesOnIdentityReadFailure(t *testi
 		t.Fatalf("phase advanced to %q over a failed identity read; the transition must retry instead", current.Status.ExecutionWorkspace.Phase)
 	}
 }
+
+// resolveACPWorkspaceBinding is the legacy (class-less) test entry point for
+// resolveACPWorkspaceBindingWithClass.
+//
+//nolint:unparam // Keeps the production signature so call sites read as the real resolver.
+func resolveACPWorkspaceBinding(
+	task *corev1alpha1.Task,
+	defaultProvider corev1alpha1.WorkspaceProvider,
+	enforceNamespaceIsolation bool,
+	sessionUID string,
+) (*ACPRuntimeWorkspaceBinding, error) {
+	return resolveACPWorkspaceBindingWithClass(task, defaultProvider, enforceNamespaceIsolation, sessionUID, nil)
+}

@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	"github.com/orka-agents/orka/internal/labels"
 	"github.com/orka-agents/orka/internal/workspace"
 )
 
@@ -1170,16 +1171,145 @@ func TestToolReconcilerMCPSubstrateActorUsesPoolRef(t *testing.T) {
 		t.Fatalf("lease annotations = %#v, want held by mcp-tool", gotLease.Annotations)
 	}
 
-	taskReconciler := &TaskReconciler{Client: r.Client}
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: defaultNS, UID: "task-uid"},
-	}
-	reserved, err := taskReconciler.tryReserveSubstratePoolActor(context.Background(), task, defaultNS, executor.claimName)
+	busy, err := substratePoolActorLeaseHasActiveHolder(context.Background(), r.Client, &gotLease)
 	if err != nil {
-		t.Fatalf("tryReserveSubstratePoolActor() error = %v", err)
+		t.Fatalf("substratePoolActorLeaseHasActiveHolder() error = %v", err)
 	}
-	if reserved {
-		t.Fatal("task reserved MCP tool-held pool actor, want busy")
+	if !busy {
+		t.Fatal("MCP tool-held pool actor lease reported idle, want busy")
+	}
+}
+
+func TestToolReconcilerMCPSubstrateActorWaitsForLegacyTaskCleanup(t *testing.T) {
+	scheme := newToolScheme()
+	template := approvedMCPActorTemplateForTest()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testMCPPath {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	pool := &corev1alpha1.SubstrateActorPool{
+		ObjectMeta: metav1.ObjectMeta{Name: testMCPPoolName, Namespace: defaultNS},
+		Spec: corev1alpha1.SubstrateActorPoolSpec{
+			TemplateRef:  corev1alpha1.WorkspaceTemplateReference{Name: "mcp-template", Namespace: "ate-demo"},
+			TargetActors: 1,
+		},
+	}
+	tool := &corev1alpha1.Tool{
+		ObjectMeta: metav1.ObjectMeta{Name: "mcp-tool", Namespace: defaultNS, UID: types.UID("new-tool-uid")},
+		Spec: corev1alpha1.ToolSpec{
+			Description: "MCP tool",
+			MCP: &corev1alpha1.MCPToolServer{
+				Path: testMCPPath,
+				SubstrateActor: &corev1alpha1.SubstrateMCPActor{
+					TemplateRef: corev1alpha1.WorkspaceTemplateReference{Name: "mcp-template", Namespace: "ate-demo"},
+					PoolRef:     &corev1alpha1.SubstrateActorPoolReference{Name: testMCPPoolName},
+				},
+			},
+		},
+	}
+	actorID := deterministicSubstratePoolActorID(deterministicSubstratePoolActorPrefix(defaultNS, testMCPPoolName), 0)
+	legacyTask := &corev1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-task", Namespace: defaultNS, UID: types.UID("old-task-uid")},
+		Status: corev1alpha1.TaskStatus{
+			Phase: corev1alpha1.TaskPhaseFailed,
+			ExecutionWorkspace: &corev1alpha1.ExecutionWorkspaceStatus{
+				Provider:      corev1alpha1.WorkspaceProviderSubstrate,
+				CleanupPolicy: corev1alpha1.WorkspaceCleanupPolicyDelete,
+				Phase:         corev1alpha1.ExecutionWorkspacePhaseFailed,
+				Reason:        corev1alpha1.ExecutionWorkspaceReasonCleanupFailed,
+			},
+		},
+	}
+	legacyLease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Name:      substratePoolActorLeaseName(actorID),
+		Namespace: defaultNS,
+		Labels: map[string]string{
+			labels.LabelManaged:                   managedLabelValue,
+			labels.LabelPurpose:                   substratePoolActorLeasePurpose,
+			substratePoolActorLeaseActorIDLabel:   actorID,
+			substratePoolActorLeaseHolderUIDLabel: string(legacyTask.UID),
+		},
+		Annotations: map[string]string{
+			legacySubstratePoolActorLeaseTaskNSAnno:   legacyTask.Namespace,
+			legacySubstratePoolActorLeaseTaskNameAnno: legacyTask.Name,
+			legacySubstratePoolActorLeaseTaskUIDAnno:  string(legacyTask.UID),
+		},
+	}}
+	executor := &recordingToolWorkspaceExecutor{}
+	r := &ToolReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&corev1alpha1.Tool{}, &corev1alpha1.Task{}).
+			WithObjects(tool, template, pool, legacyTask, legacyLease).Build(),
+		Scheme:           scheme,
+		HTTPClient:       srv.Client(),
+		SubstrateEnabled: true,
+		SubstrateConfig: SubstrateConfig{
+			RouterURL:      srv.URL,
+			ActorDNSSuffix: "actors.resources.substrate.ate.dev",
+			ClaimTimeout:   time.Second,
+		},
+		SubstrateExecutorFactory: func(SubstrateConfig) (workspace.WorkspaceExecutor, error) {
+			return executor, nil
+		},
+	}
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, mcpToolRequest()); err != nil {
+		t.Fatalf("Reconcile() ownership update error = %v", err)
+	}
+	result, err := r.Reconcile(ctx, mcpToolRequest())
+	if err != nil {
+		t.Fatalf("Reconcile() while legacy cleanup failed: %v", err)
+	}
+	if executor.claimName != "" || executor.waitReadyCalled || len(executor.deletedActorIDs) != 0 {
+		t.Fatalf("executor claimed=%q waited=%t deleted=%v, want legacy actor untouched while cleanup failed", executor.claimName, executor.waitReadyCalled, executor.deletedActorIDs)
+	}
+	var got corev1alpha1.Tool
+	if err := r.Get(ctx, mcpToolRequest().NamespacedName, &got); err != nil {
+		t.Fatalf("Get tool: %v", err)
+	}
+	if got.Status.Available || !strings.Contains(got.Status.Error, "are leased") || result.RequeueAfter <= 0 {
+		t.Fatalf("available=%t error=%q requeueAfter=%v, want unavailable tool retrying a busy pool", got.Status.Available, got.Status.Error, result.RequeueAfter)
+	}
+	var gotLease coordinationv1.Lease
+	leaseKey := types.NamespacedName{Name: legacyLease.Name, Namespace: legacyLease.Namespace}
+	if err := r.Get(ctx, leaseKey, &gotLease); err != nil {
+		t.Fatalf("Get legacy lease: %v", err)
+	}
+	if substratePoolActorLeaseHeldByTool(&gotLease, tool) || gotLease.Labels[substratePoolActorLeaseHolderUIDLabel] != string(legacyTask.UID) {
+		t.Fatalf("lease = %#v, want legacy Task ownership preserved", gotLease)
+	}
+
+	// Once the legacy owner confirms deletion, the Tool may claim a fresh actor.
+	if err := r.Get(ctx, types.NamespacedName{Name: legacyTask.Name, Namespace: legacyTask.Namespace}, legacyTask); err != nil {
+		t.Fatalf("Get legacy Task: %v", err)
+	}
+	legacyTask.Status.ExecutionWorkspace.Phase = corev1alpha1.ExecutionWorkspacePhaseDeleted
+	legacyTask.Status.ExecutionWorkspace.Reason = corev1alpha1.ExecutionWorkspaceReasonDeleted
+	if err := r.Status().Update(ctx, legacyTask); err != nil {
+		t.Fatalf("Update legacy cleanup status: %v", err)
+	}
+	executor.claimCreated = true
+	if _, err := r.Reconcile(ctx, mcpToolRequest()); err != nil {
+		t.Fatalf("Reconcile() after legacy cleanup succeeded: %v", err)
+	}
+	if executor.claimName != actorID || !executor.waitReadyCalled {
+		t.Fatalf("executor claimed=%q waited=%t, want actor %q after cleanup", executor.claimName, executor.waitReadyCalled, actorID)
+	}
+	if err := r.Get(ctx, mcpToolRequest().NamespacedName, &got); err != nil {
+		t.Fatalf("Get tool after cleanup: %v", err)
+	}
+	if !got.Status.Available || got.Status.Actor == nil || got.Status.Actor.ActorID != actorID {
+		t.Fatalf("tool status = %#v, want available Tool using cleaned-up actor", got.Status)
+	}
+	if err := r.Get(ctx, leaseKey, &gotLease); err != nil {
+		t.Fatalf("Get lease after cleanup: %v", err)
+	}
+	if !substratePoolActorLeaseHeldByTool(&gotLease, &got) {
+		t.Fatalf("lease annotations = %#v, want Tool ownership after cleanup", gotLease.Annotations)
 	}
 }
 

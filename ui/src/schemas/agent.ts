@@ -51,13 +51,7 @@ export const agentSpecSchema = z.object({
   resources: z.any().optional(),
   secretRef: z.object({ name: z.string() }).optional(),
   session: z.object({
-    persistence: z.string().optional(),
-    ttl: z.string().optional(),
     maxMessages: z.number().optional(),
-  }).optional(),
-  rateLimit: z.object({
-    requestsPerMinute: z.number().optional(),
-    tokensPerMinute: z.number().optional(),
   }).optional(),
   coordination: z.object({
     enabled: z.boolean(),

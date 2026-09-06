@@ -68,9 +68,15 @@ const (
 )
 
 type PromptEvent struct {
-	Type       PromptEventType
-	Sequence   int64
-	Timestamp  time.Time
+	Type     PromptEventType
+	Sequence int64
+	// Timestamp is assigned when the event is enqueued for the consumer.
+	Timestamp time.Time
+	// ReceivedAt is when the session received the notification from the
+	// child, stamped before any pre-acceptance buffering, so it preserves
+	// the phase the child emitted the event in even when the event is
+	// enqueued later.
+	ReceivedAt time.Time
 	Update     *SessionNotification
 	Permission *PermissionRequestEvent
 	// Size is the raw notification payload size counted against the prompt's
@@ -591,6 +597,9 @@ func (s *RuntimeSession) handleRequest(ctx context.Context, request IncomingRequ
 }
 
 func (s *RuntimeSession) emitLocked(active *activePrompt, event PromptEvent) {
+	if event.ReceivedAt.IsZero() {
+		event.ReceivedAt = time.Now().UTC()
+	}
 	if !active.accepted && event.Type != PromptEventAccepted {
 		if len(active.preAccepted) >= s.config.MaxBufferedEvents || active.bufferedBytes+event.Size > s.config.MaxBufferedEventBytes {
 			s.markOverflowedLocked(active)

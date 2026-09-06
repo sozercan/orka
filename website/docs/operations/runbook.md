@@ -1,3 +1,7 @@
+---
+description: "What to do when an Orka installation looks stuck, and why each remedy works."
+---
+
 # Operations runbook
 
 This page is for the person keeping an Orka installation healthy. It explains
@@ -10,23 +14,26 @@ If you only have a symptom, start with the
 
 ## One active controller, by design
 
-Orka runs a single controller Pod that owns all reconciliation. Two mechanisms
-enforce this:
+Run Orka with one controller replica. Its reconciliation and storage model has
+two relevant constraints:
 
 - **Leader election.** Controller replicas coordinate through a Kubernetes
   Lease, and only the leader reconciles.
 - **A local state store.** The controller keeps durable state (execution
   snapshots, monitor inventory, scan history) on a PersistentVolumeClaim that
-  most storage classes provision as `ReadWriteOnce` — attachable to one node at
-  a time. The Deployment uses the `Recreate` strategy so a new Pod never starts
-  while the old one still holds the volume.
+  most storage classes provision as `ReadWriteOnce`. That permits read-write
+  mounts on one node, including multiple Pods on that node. The Deployment uses
+  `Recreate` to stop the old Pod before starting its replacement during an upgrade.
+
+:::danger[Do not scale the controller above one replica]
+`ReadWriteOnce` is not a single-Pod lock. A second replica on the same node can open
+the same SQLite file; a replica on another node may remain `Pending` with a `Multi-Attach`
+warning. Keep one replica. Leader election coordinates reconciliation but does not make
+the local store safe for multiple controller processes.
+:::
 
 What this means in practice:
 
-- **Do not scale the controller above one replica.** A second replica cannot
-  attach the volume and sits in `Pending` with a `Multi-Attach` volume warning.
-  Worse, if the leader is then disrupted, both Pods can end up `Pending` — a
-  scaled-up controller is *less* available, not more.
 - **Failover is node replacement, not a hot standby.** If the controller's node
   dies, expect a short outage (a few minutes) while Kubernetes reschedules the
   Pod and reattaches the volume. In-flight work is not lost: running agent

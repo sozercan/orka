@@ -3,7 +3,6 @@ package harness
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestRuntimeSessionStateTransitions(t *testing.T) {
@@ -44,21 +43,5 @@ func TestRuntimeSessionValidationRequiresOwnership(t *testing.T) {
 	session.Owner = RuntimeSessionOwner{Namespace: "default", SessionName: "session-a", Provider: ProviderKindKubernetesService}
 	if err := session.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
-	}
-}
-
-func TestRuntimeSessionTransitionUpdatesTimestamp(t *testing.T) {
-	session := RuntimeSession{
-		ID:            "runtime-a",
-		Owner:         RuntimeSessionOwner{Namespace: "default", SessionName: "session-a", Provider: ProviderKindKubernetesService},
-		State:         RuntimeSessionStatePending,
-		CleanupPolicy: RuntimeCleanupPolicyDelete,
-	}
-	now := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
-	if err := session.Transition(RuntimeSessionStateBooting, now); err != nil {
-		t.Fatalf("Transition() error = %v", err)
-	}
-	if session.State != RuntimeSessionStateBooting || !session.UpdatedAt.Equal(now) {
-		t.Fatalf("session = %#v, want booting with timestamp", session)
 	}
 }

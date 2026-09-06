@@ -143,8 +143,10 @@ treats the missing pool as cleanup proof and fresh demand recreates it by name.
   the pool reconciler plus suspend/resume/snapshot semantics behind the same
   binding contract; the Task-facing API and dispatcher remain unchanged.
 - The legacy worker-path workspace resolution (`runAgentInWorkspace`,
-  router-based exec) remains in-tree but is not reachable from the agent path;
-  its agent-sandbox `templateRef` semantics are retired for agent Tasks.
+  router-based exec) was unreachable from the agent path and has since been
+  removed from `workers/common`; its agent-sandbox `templateRef` semantics are
+  retired for agent Tasks. The `internal/workspace` agent-sandbox adapter
+  remains for the direct-adapter smoke in the live agent-sandbox E2E.
 - Live E2E promotion (claim → execute → continue → cancel → restart → cleanup
   through Vekil-backed runtimes) is tracked by issue #343's acceptance list;
   the agent-sandbox kind workflow can now exercise the Task path once runtime

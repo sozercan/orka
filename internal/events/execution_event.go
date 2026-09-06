@@ -129,11 +129,6 @@ func stringSet(values []string) map[string]struct{} {
 	return set
 }
 
-// ExecutionEventTypes returns the stable execution event taxonomy.
-func ExecutionEventTypes() []string {
-	return append([]string(nil), executionEventTypes...)
-}
-
 // TerminalTaskEventTypes returns task-level terminal events that complete a task
 // execution stream.
 func TerminalTaskEventTypes() []string {
@@ -144,11 +139,6 @@ func TerminalTaskEventTypes() []string {
 func IsTerminalTaskEventType(value string) bool {
 	_, ok := terminalTaskEventTypeSet[strings.TrimSpace(value)]
 	return ok
-}
-
-// TerminalApprovalEventTypes returns approval terminal events that close an approval request.
-func TerminalApprovalEventTypes() []string {
-	return append([]string(nil), terminalApprovalEventTypes...)
 }
 
 // IsTerminalApprovalEventType reports whether value is an approval terminal event.

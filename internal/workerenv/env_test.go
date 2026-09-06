@@ -200,7 +200,7 @@ func TestAgentSandboxEnvVarsDisabledReturnsEmpty(t *testing.T) {
 	}
 }
 
-func TestExecutionWorkspaceEnvRenderAndParse(t *testing.T) {
+func TestExecutionWorkspaceEnvRender(t *testing.T) {
 	env := ExecutionWorkspaceEnv{
 		Enabled:           true,
 		Provider:          "substrate",
@@ -223,22 +223,24 @@ func TestExecutionWorkspaceEnvRenderAndParse(t *testing.T) {
 		values[envVar.Name] = envVar.Value
 	}
 
-	parsed := ParseExecutionWorkspaceEnv(func(name string) string { return values[name] })
-	if !parsed.Enabled {
-		t.Fatal("parsed execution workspace env is not enabled")
+	want := map[string]string{
+		ExecutionWorkspaceEnabled:               "true",
+		ExecutionWorkspaceProvider:              env.Provider,
+		ExecutionWorkspaceClaimName:             env.ClaimName,
+		ExecutionWorkspaceBoot:                  "true",
+		ExecutionWorkspaceClaimTimeoutSeconds:   "120",
+		ExecutionWorkspaceCommandTimeoutSeconds: "1800",
+		ExecutionWorkspaceStatusEndpoint:        env.StatusEndpoint,
+		ExecutionWorkspaceDepth:                 "0",
 	}
-	if parsed.Provider != env.Provider || parsed.ClaimName != env.ClaimName {
-		t.Fatalf("parsed provider/claim = %s/%s, want %s/%s", parsed.Provider, parsed.ClaimName, env.Provider, env.ClaimName)
-	}
-	if parsed.ClaimTimeout != env.ClaimTimeout || parsed.CommandTimeout != env.CommandTimeout {
-		t.Fatalf("parsed timeouts = %s/%s, want %s/%s", parsed.ClaimTimeout, parsed.CommandTimeout, env.ClaimTimeout, env.CommandTimeout)
-	}
-	if !parsed.Boot {
-		t.Fatal("parsed boot = false, want true")
+	for name, wantValue := range want {
+		if values[name] != wantValue {
+			t.Fatalf("%s = %q, want %q", name, values[name], wantValue)
+		}
 	}
 }
 
-func TestSubstrateEnvRenderAndParse(t *testing.T) {
+func TestSubstrateEnvRender(t *testing.T) {
 	env := SubstrateEnv{
 		APIEndpoint:             "api.ate-system.svc:443",
 		APICAFile:               "/var/run/orka/substrate/ca.crt",
@@ -257,23 +259,24 @@ func TestSubstrateEnvRenderAndParse(t *testing.T) {
 		values[envVar.Name] = envVar.Value
 	}
 
-	parsed := ParseSubstrateEnv(func(name string) string { return values[name] })
-	if parsed.APIEndpoint != env.APIEndpoint || parsed.RouterURL != env.RouterURL {
-		t.Fatalf("parsed endpoints = %#v, want %#v", parsed, env)
+	want := map[string]string{
+		SubstrateAPIEndpoint:             env.APIEndpoint,
+		SubstrateAPIInsecureSkipVerify:   "true",
+		SubstrateRouterURL:               env.RouterURL,
+		SubstrateSessionIdentityToken:    env.SessionIdentityToken,
+		SubstrateSessionIdentityRequired: "true",
+		SubstrateSessionIdentityAudience: env.SessionIdentityAudience,
+		SubstrateSessionIdentityAppID:    env.SessionIdentityAppID,
+		SubstrateSessionIdentityUserID:   env.SessionIdentityUserID,
 	}
-	if !parsed.APIInsecureSkipVerify {
-		t.Fatal("parsed insecure skip verify = false, want true")
-	}
-	if parsed.SessionIdentityToken != env.SessionIdentityToken ||
-		!parsed.SessionIdentityRequired ||
-		parsed.SessionIdentityAudience != env.SessionIdentityAudience ||
-		parsed.SessionIdentityAppID != env.SessionIdentityAppID ||
-		parsed.SessionIdentityUserID != env.SessionIdentityUserID {
-		t.Fatalf("parsed SessionIdentity env = %#v, want %#v", parsed, env)
+	for name, wantValue := range want {
+		if values[name] != wantValue {
+			t.Fatalf("%s = %q, want %q", name, values[name], wantValue)
+		}
 	}
 }
 
-func TestAgentSandboxEnvRenderAndParse(t *testing.T) {
+func TestAgentSandboxEnvRender(t *testing.T) {
 	env := AgentSandboxEnv{
 		Enabled:           true,
 		RouterURL:         "http://sandbox-router",
@@ -293,25 +296,23 @@ func TestAgentSandboxEnvRenderAndParse(t *testing.T) {
 	for _, envVar := range env.EnvVars() {
 		values[envVar.Name] = envVar.Value
 	}
-	if values[AgentSandboxDepth] != "0" {
-		t.Fatalf("%s = %q, want 0", AgentSandboxDepth, values[AgentSandboxDepth])
-	}
 
-	parsed := ParseAgentSandboxEnv(func(name string) string { return values[name] })
-	if !parsed.Enabled {
-		t.Fatal("parsed sandbox env is not enabled")
+	want := map[string]string{
+		AgentSandboxEnabled:               "true",
+		AgentSandboxDepth:                 "0",
+		AgentSandboxTemplateName:          env.TemplateName,
+		AgentSandboxTemplateNamespace:     env.TemplateNamespace,
+		AgentSandboxClaimNamespace:        env.ClaimNamespace,
+		AgentSandboxReusePolicy:           env.ReusePolicy,
+		AgentSandboxReuseKey:              env.ReuseKey,
+		AgentSandboxCleanupPolicy:         env.CleanupPolicy,
+		AgentSandboxClaimTimeoutSeconds:   "120",
+		AgentSandboxCommandTimeoutSeconds: "1800",
 	}
-	if parsed.TemplateName != env.TemplateName || parsed.TemplateNamespace != env.TemplateNamespace {
-		t.Fatalf("parsed template = %s/%s, want %s/%s", parsed.TemplateNamespace, parsed.TemplateName, env.TemplateNamespace, env.TemplateName)
-	}
-	if parsed.ClaimNamespace != env.ClaimNamespace {
-		t.Fatalf("parsed claim namespace = %q, want %q", parsed.ClaimNamespace, env.ClaimNamespace)
-	}
-	if parsed.CleanupPolicy != env.CleanupPolicy || parsed.ReusePolicy != env.ReusePolicy || parsed.ReuseKey != env.ReuseKey {
-		t.Fatalf("parsed policies = %#v, want %#v", parsed, env)
-	}
-	if parsed.ClaimTimeout != env.ClaimTimeout || parsed.CommandTimeout != env.CommandTimeout {
-		t.Fatalf("parsed timeouts = %s/%s, want %s/%s", parsed.ClaimTimeout, parsed.CommandTimeout, env.ClaimTimeout, env.CommandTimeout)
+	for name, wantValue := range want {
+		if values[name] != wantValue {
+			t.Fatalf("%s = %q, want %q", name, values[name], wantValue)
+		}
 	}
 }
 

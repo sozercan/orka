@@ -52,7 +52,7 @@ function rawStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
   }
 }
 
-export interface ChatSelection {
+interface ChatSelection {
   provider: string
   model: string
 }

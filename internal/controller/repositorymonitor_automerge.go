@@ -19,17 +19,21 @@ import (
 )
 
 const (
-	repositoryMonitorActionAutomerge          = "pr_automerge"
-	repositoryMonitorAutomergeStateMerged     = "merged"
-	repositoryMonitorAutomergeStateMergeReady = "merge_ready"
-	repositoryMonitorAutomergeStateBlocked    = "blocked"
-	repositoryMonitorAutomergeStateFailed     = "failed"
-	repositoryMonitorAutomergeStateStarted    = "started"
-	repositoryMonitorAutomergeStatePending    = repositoryMonitorReviewTaskStatePending
-	repositoryMonitorAutomergeReasonDisabled  = "automerge_disabled"
-	repositoryMonitorCommandIntentAutomerge   = "automerge"
-	repositoryMonitorAutomergeGateEnv         = "ORKA_REPOSITORY_MONITOR_AUTOMERGE_GATE"
-	repositoryMonitorAutomergeMethodSquash    = "squash"
+	repositoryMonitorActionAutomerge                     = "pr_automerge"
+	repositoryMonitorAutomergeStateMerged                = "merged"
+	repositoryMonitorAutomergeStateMergeReady            = "merge_ready"
+	repositoryMonitorAutomergeStateBlocked               = "blocked"
+	repositoryMonitorAutomergeStateFailed                = "failed"
+	repositoryMonitorAutomergeStateStarted               = "started"
+	repositoryMonitorAutomergeStatePending               = repositoryMonitorReviewTaskStatePending
+	repositoryMonitorAutomergeReasonDisabled             = "automerge_disabled"
+	repositoryMonitorAutomergeReasonCIPending            = "ci_pending"
+	repositoryMonitorAutomergeReasonCICheckRetry         = "ci_check_error_retry"
+	repositoryMonitorAutomergeReasonMergeabilityPending  = "mergeability_pending"
+	repositoryMonitorAutomergeReasonValidationCheckRetry = "validation_check_error_retry"
+	repositoryMonitorCommandIntentAutomerge              = "automerge"
+	repositoryMonitorAutomergeGateEnv                    = "ORKA_REPOSITORY_MONITOR_AUTOMERGE_GATE"
+	repositoryMonitorAutomergeMethodSquash               = "squash"
 )
 
 func (r *RepositoryMonitorReconciler) tryProcessPullRequestAutomergeCommand(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, run *store.MonitorRun, command *store.CommandEvent, owner, repository string, pr repositoryMonitorPullRequest, item *store.MonitorItem) (bool, error) {
@@ -38,7 +42,7 @@ func (r *RepositoryMonitorReconciler) tryProcessPullRequestAutomergeCommand(ctx 
 	}
 	verdict, reason := r.repositoryMonitorAutomergeGate(ctx, monitor, command, pr, item)
 	if verdict != repositoryMonitorIssueVerdictReady {
-		if reason == "ci_pending" || reason == "ci_check_error_retry" || reason == "mergeability_pending" {
+		if reason == repositoryMonitorAutomergeReasonCIPending || reason == repositoryMonitorAutomergeReasonCICheckRetry || reason == repositoryMonitorAutomergeReasonMergeabilityPending || reason == repositoryMonitorAutomergeReasonValidationCheckRetry {
 			item.AutomergeState = repositoryMonitorAutomergeStatePending
 			item.SkipReason = reason
 			if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
@@ -217,21 +221,49 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorAutomergeGate(ctx context
 		return repositoryMonitorIssuePhaseBlocked, repositoryMonitorSkipReasonBlockedLabel
 	case item.LastVerdict != repositoryMonitorReviewVerdictPassed || item.LastReviewedHeadSHA != pr.HeadSHA:
 		return repositoryMonitorIssuePhaseBlocked, "orka_review_not_passed"
+	}
+	validationAllowed, err := r.repositoryMonitorValidationAllowsAutomerge(ctx, monitor, item, pr.HeadSHA)
+	if err != nil {
+		return repositoryMonitorIssuePhaseBlocked, repositoryMonitorAutomergeReasonValidationCheckRetry
+	}
+	if !validationAllowed {
+		return repositoryMonitorIssuePhaseBlocked, "orka_validation_not_passed"
+	}
+	switch {
 	case repositoryMonitorAutomergeRepairStateBlocks(item.RepairState):
 		return repositoryMonitorIssuePhaseBlocked, "active_or_failed_repair_state"
 	case strings.TrimSpace(pr.MergeableState) == "" || strings.EqualFold(pr.MergeableState, "unknown"):
-		return repositoryMonitorIssuePhaseBlocked, "mergeability_pending"
+		return repositoryMonitorIssuePhaseBlocked, repositoryMonitorAutomergeReasonMergeabilityPending
 	case !repositoryMonitorAutomergeMergeableStateCanCheckCI(pr.MergeableState):
 		return repositoryMonitorIssuePhaseBlocked, "pull_request_not_mergeable"
 	}
 	ci, err := r.repositoryMonitorCheckCI(ctx, monitor, pr.HeadSHA)
 	if err != nil {
-		return repositoryMonitorIssuePhaseBlocked, "ci_check_error_retry"
+		return repositoryMonitorIssuePhaseBlocked, repositoryMonitorAutomergeReasonCICheckRetry
 	}
 	if !ci.passed {
 		return repositoryMonitorIssuePhaseBlocked, ci.reason
 	}
 	return repositoryMonitorIssueVerdictReady, ""
+}
+
+func (r *RepositoryMonitorReconciler) repositoryMonitorValidationAllowsAutomerge(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, headSHA string) (bool, error) {
+	if r.Store == nil || item == nil || strings.TrimSpace(item.LastReviewID) == "" {
+		return false, nil
+	}
+	record, err := r.Store.GetReviewRecord(ctx, monitor.Namespace, item.LastReviewID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("load automerge validation review record: %w", err)
+	}
+	if record.MonitorName != monitor.Name || record.Kind != repositoryMonitorPullRequestKind ||
+		record.Number != item.Number || record.HeadSHA != headSHA || record.Verdict != repositoryMonitorReviewVerdictPassed ||
+		!repositoryMonitorReviewRecordAllowsAutomerge(monitor, record) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func repositoryMonitorAutomergeMergeableStateCanCheckCI(state string) bool {
@@ -367,7 +399,7 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorCheckCI(ctx context.Conte
 		return repositoryMonitorCIResult{reason: "ci_not_green"}, nil
 	}
 	if len(pending) > 0 {
-		return repositoryMonitorCIResult{reason: "ci_pending"}, nil
+		return repositoryMonitorCIResult{reason: repositoryMonitorAutomergeReasonCIPending}, nil
 	}
 	status, err := r.repositoryMonitorCheckCommitStatus(ctx, baseURL, owner, repo, token, sha)
 	if err != nil {
@@ -407,7 +439,7 @@ func (r *RepositoryMonitorReconciler) repositoryMonitorCheckCommitStatus(ctx con
 	case "success":
 		return repositoryMonitorCIResult{passed: true}, nil
 	case repositoryMonitorAutomergeStatePending:
-		return repositoryMonitorCIResult{reason: "ci_pending"}, nil
+		return repositoryMonitorCIResult{reason: repositoryMonitorAutomergeReasonCIPending}, nil
 	default:
 		return repositoryMonitorCIResult{reason: "ci_not_green"}, nil
 	}

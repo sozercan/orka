@@ -7,15 +7,11 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { PageHeader } from '@/components/layout/page-header'
 import { useCreateRepositoryMonitorCommand, useRepositoryMonitor, useRepositoryMonitorActions, useRepositoryMonitorCommands, useRepositoryMonitorImplementationJobs, useRepositoryMonitorItems, useRepositoryMonitorMutations, useRepositoryMonitorRuns, useRepositoryMonitorWorkActions, useRunRepositoryMonitor } from '@/hooks/use-monitors'
 import { repositoryMonitorDisplayName } from './repository-monitor-display'
+import { formatTimestamp } from '@/lib/time'
 
 function shortSHA(value?: string) {
   if (!value) return '-'
   return value.slice(0, 8)
-}
-
-function formatTime(value?: string) {
-  if (!value) return 'Never'
-  return new Date(value).toLocaleString()
 }
 
 function publishBadgeVariant(phase?: string): 'default' | 'destructive' | 'outline' | 'secondary' {
@@ -212,8 +208,6 @@ export function RepositoryMonitorDetail({ monitorName }: { monitorName: string }
             </CardContent>
           </Card>
 
-
-
           <Card>
             <CardHeader>
               <CardTitle>Actions</CardTitle>
@@ -229,7 +223,7 @@ export function RepositoryMonitorDetail({ monitorName }: { monitorName: string }
                       <Badge variant={action.verdict === 'failed' ? 'destructive' : 'secondary'}>{action.actionKind}</Badge>
                     </div>
                     <div className="mt-1 text-xs text-muted-foreground">
-                      {action.kind} #{action.number} · {action.verdict || 'recorded'} · {formatTime(action.createdAt)}
+                      {action.kind} #{action.number} · {action.verdict || 'recorded'} · {formatTimestamp(action.createdAt)}
                     </div>
                     {action.summary ? <div className="mt-1 text-xs">{action.summary}</div> : null}
                   </div>
@@ -253,7 +247,7 @@ export function RepositoryMonitorDetail({ monitorName }: { monitorName: string }
                       <Badge variant={command.status === 'accepted' ? 'default' : command.status === 'rejected' ? 'destructive' : 'secondary'}>{command.status || 'unknown'}</Badge>
                     </div>
                     <div className="mt-1 text-xs text-muted-foreground">
-                      {command.kind} #{command.number} · {command.intent || command.label} · {formatTime(command.createdAt)}
+                      {command.kind} #{command.number} · {command.intent || command.label} · {formatTimestamp(command.createdAt)}
                     </div>
                     {command.error ? <div className="mt-1 text-xs text-destructive">{command.error}</div> : null}
                   </div>
@@ -277,7 +271,7 @@ export function RepositoryMonitorDetail({ monitorName }: { monitorName: string }
                       <Badge variant={action.status === 'blocked' || action.status === 'failed' || action.status === 'cancelled' ? 'destructive' : action.status === 'succeeded' ? 'default' : 'secondary'}>{action.status}</Badge>
                     </div>
                     <div className="mt-1 text-xs text-muted-foreground">
-                      {action.targetKind} #{action.targetNumber} · {action.desiredAction || action.intent} · {action.phase || 'queued'} · {formatTime(action.updatedAt)}
+                      {action.targetKind} #{action.targetNumber} · {action.desiredAction || action.intent} · {action.phase || 'queued'} · {formatTimestamp(action.updatedAt)}
                     </div>
                     {action.taskName ? <div className="mt-1 font-mono text-xs">Task: {action.taskName}</div> : null}
                     {action.blockedReason || action.error ? (
@@ -328,7 +322,7 @@ export function RepositoryMonitorDetail({ monitorName }: { monitorName: string }
                       <span className="font-mono text-xs">{mutation.operation}</span>
                       <Badge variant={mutation.status === 'failed' ? 'destructive' : mutation.status === 'succeeded' ? 'default' : 'secondary'}>{mutation.status || 'recorded'}</Badge>
                     </div>
-                    <div className="mt-1 text-xs text-muted-foreground">{mutation.targetKind} #{mutation.targetNumber} · {mutation.reason || 'mutation'} · {formatTime(mutation.createdAt)}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">{mutation.targetKind} #{mutation.targetNumber} · {mutation.reason || 'mutation'} · {formatTimestamp(mutation.createdAt)}</div>
                     {mutation.githubURL ? <div className="mt-1 truncate text-xs">{mutation.githubURL}</div> : null}
                     {mutation.error ? <div className="mt-1 text-xs text-destructive">{mutation.error}</div> : null}
                   </div>
@@ -352,7 +346,7 @@ export function RepositoryMonitorDetail({ monitorName }: { monitorName: string }
                       <Badge variant={run.phase === 'succeeded' ? 'default' : 'secondary'}>{run.phase}</Badge>
                     </div>
                     <div className="mt-1 text-xs text-muted-foreground">
-                      {run.trigger} · {formatTime(run.startedAt)}
+                      {run.trigger} · {formatTimestamp(run.startedAt)}
                     </div>
                   </div>
                 ))

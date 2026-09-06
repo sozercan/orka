@@ -1,15 +1,10 @@
-# Archived SandboxTemplate from the pre-ACP execution-workspace prototype.
-#
-# The current ACP v2 path does not consume this template and rejects
-# Task.spec.execution.workspace. A future sandbox-backed v2 supervisor must
-# receive only sanitized workspace artifacts; Git read/publication credentials
-# and direct SCM publication must remain in the separate Workspace/Publisher.
-#
-# For prototype archaeology only, override the image before applying:
-#
-#   sed "s|REPLACE_RUNTIME_IMAGE|${ORKA_SANDBOX_RUNTIME_IMAGE}|" \
-#     hack/demos/cluster/templates/orka-live-template.yaml | kubectl apply -f -
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
+# SandboxTemplate for the demo cluster's agent-sandbox execution workspaces.
+# install-agent-sandbox.sh substitutes the digest-pinned runtime image and
+# applies it in the controller's watched namespace; workspace-backed ACP
+# RuntimePools (Task.spec.execution.workspace, provider agent-sandbox) render
+# SandboxClaims against it. Git read/publication credentials never enter the
+# sandbox: the clean-room Workspace/Publisher owns SCM publication.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
   name: orka-live-template

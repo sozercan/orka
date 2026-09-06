@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/orka-agents/orka/internal/redact"
+	"github.com/orka-agents/orka/internal/security"
 )
 
 // Review context bounds. The encoded orka.prReview.context.v1 payload is
@@ -324,23 +325,28 @@ func repositoryMonitorReviewContextLastPatchIndex(files []repositoryMonitorRevie
 // inside it are marked truncated until a patch is attached, or unavailable
 // when GitHub supplied none.
 func repositoryMonitorReviewContextIdentityEntry(file repositoryMonitorPullRequestFileResponse, capped bool) repositoryMonitorReviewContextFile {
-	entry := repositoryMonitorReviewContextFileEntry(file)
 	if capped {
-		entry.Patch = ""
+		// The patch is never rendered for a capped entry, so it is not
+		// sanitized either: identity-only entries stay cheap.
+		entry := repositoryMonitorReviewContextFileIdentity(file)
 		entry.PatchOmitted = repositoryMonitorReviewContextPatchCapped
 		return entry
 	}
-	return repositoryMonitorReviewContextDropPatch(entry)
+	return repositoryMonitorReviewContextDropPatch(repositoryMonitorReviewContextFileEntry(file))
 }
 
-func repositoryMonitorReviewContextFileEntry(file repositoryMonitorPullRequestFileResponse) repositoryMonitorReviewContextFile {
-	entry := repositoryMonitorReviewContextFile{
+func repositoryMonitorReviewContextFileIdentity(file repositoryMonitorPullRequestFileResponse) repositoryMonitorReviewContextFile {
+	return repositoryMonitorReviewContextFile{
 		Path:         repositoryMonitorReviewContextBoundedField(file.Filename, repositoryMonitorReviewContextMaxPathBytes),
 		PreviousPath: repositoryMonitorReviewContextBoundedField(file.PreviousFilename, repositoryMonitorReviewContextMaxPathBytes),
 		Status:       repositoryMonitorReviewContextBoundedField(file.Status, repositoryMonitorReviewContextMaxStatusBytes),
 		Additions:    max(file.Additions, 0),
 		Deletions:    max(file.Deletions, 0),
 	}
+}
+
+func repositoryMonitorReviewContextFileEntry(file repositoryMonitorPullRequestFileResponse) repositoryMonitorReviewContextFile {
+	entry := repositoryMonitorReviewContextFileIdentity(file)
 	patch := repositoryMonitorReviewContextSanitize(file.Patch)
 	if patch == "" {
 		entry.PatchOmitted = repositoryMonitorReviewContextPatchUnavailable
@@ -395,7 +401,13 @@ func repositoryMonitorReviewContextPathAltered(file repositoryMonitorPullRequest
 }
 
 func repositoryMonitorReviewContextBoundedField(value string, maxBytes int) string {
-	value = strings.TrimSpace(repositoryMonitorReviewContextSanitize(value))
+	shadow := strings.NewReplacer("\n", "", "\t", "").Replace(value)
+	if sanitizedShadow := repositoryMonitorReviewContextSanitize(shadow); sanitizedShadow != shadow {
+		value = sanitizedShadow
+	} else {
+		value = repositoryMonitorReviewContextSanitize(value)
+	}
+	value = strings.TrimSpace(value)
 	value = strings.ReplaceAll(strings.ReplaceAll(value, "\n", " "), "\t", " ")
 	if len(value) <= maxBytes {
 		return value
@@ -421,14 +433,22 @@ func repositoryMonitorReviewContextBoundedField(value string, maxBytes int) stri
 // checkout, so the change set must be marked incomplete. The original text is
 // never retained.
 func repositoryMonitorReviewContextDeletedLinesAltered(patch string) bool {
-	for line := range strings.SplitSeq(patch, "\n") {
-		// GitHub file patches are hunk fragments without "--- a/…" file
-		// headers, so every "-"-prefixed line is deleted content — including
-		// one whose original text begins with "--".
-		if !strings.HasPrefix(line, "-") {
-			continue
-		}
-		if repositoryMonitorReviewContextSanitize(line) != line {
+	// GitHub file patches are hunk fragments without "--- a/…" file
+	// headers, so every "-"-prefixed line is deleted content — including
+	// one whose original text begins with "--".
+	if !strings.HasPrefix(patch, "-") && !strings.Contains(patch, "\n-") {
+		return false
+	}
+	// Sanitize the whole patch rather than each deleted line alone so a
+	// credential spanning adjacent deleted lines is seen the way the
+	// review context will render it.
+	original := strings.Split(patch, "\n")
+	sanitized := strings.Split(repositoryMonitorReviewContextSanitize(patch), "\n")
+	if len(original) != len(sanitized) {
+		return true
+	}
+	for i, line := range original {
+		if strings.HasPrefix(line, "-") && line != sanitized[i] {
 			return true
 		}
 	}
@@ -460,6 +480,12 @@ func patchMatchesLineCounts(patch string, additions, deletions int) bool {
 	return adds == additions && dels == deletions
 }
 
+// repositoryMonitorReviewContextSecretWindowLines bounds how many adjacent
+// patch lines are reconstructed when looking for a credential that only
+// becomes recognizable once its physical lines are joined (a YAML scalar
+// folded or escaped across lines, a value continued on the next line).
+const repositoryMonitorReviewContextSecretWindowLines = 8
+
 func repositoryMonitorReviewContextSanitize(value string) string {
 	stripped := strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {
@@ -476,7 +502,86 @@ func repositoryMonitorReviewContextSanitize(value string) string {
 		}
 		return r
 	}, strings.ToValidUTF8(value, ""))
-	return redact.SensitiveText(stripped)
+	// Newlines and tabs survive the strip because they carry diff and code
+	// structure, but both can split a credential past the redactor: a tab
+	// within one line, a line break across two patch lines. Detection runs
+	// on a shadow of each line with its diff marker and tabs removed; a
+	// line the full secret policy recognizes is withheld outright, and so is
+	// every line of a short window of adjacent lines that the policy only
+	// recognizes once they are joined back together.
+	lines := strings.Split(stripped, "\n")
+	prefixes := make([]string, len(lines))
+	shadows := make([]string, len(lines))
+	withheld := make([]bool, len(lines))
+	for i, line := range lines {
+		if len(line) > 0 && (line[0] == '+' || line[0] == '-' || line[0] == ' ') {
+			prefixes[i] = line[:1]
+		}
+		shadows[i] = strings.ReplaceAll(line[len(prefixes[i]):], "\t", "")
+	}
+	for i, line := range lines {
+		shadow := shadows[i]
+		if redacted := redact.SensitiveText(shadow); redacted != shadow {
+			if strings.ContainsRune(line, '\t') {
+				lines[i] = prefixes[i] + redacted
+			} else {
+				lines[i] = redact.SensitiveText(line)
+			}
+			continue
+		}
+		if security.LooksLikeSecret(shadow) {
+			lines[i] = prefixes[i] + "[REDACTED]"
+			withheld[i] = true
+			continue
+		}
+		lines[i] = redact.SensitiveText(line)
+	}
+	for i := range lines {
+		if withheld[i] || !repositoryMonitorReviewContextLineMayContinue(shadows[i]) {
+			continue
+		}
+		var window strings.Builder
+		window.WriteString(shadows[i])
+		for j := i + 1; j < len(lines) && j < i+repositoryMonitorReviewContextSecretWindowLines; j++ {
+			if withheld[j] {
+				break
+			}
+			window.WriteString("\n" + shadows[j])
+			if !security.LooksLikeSecret(window.String()) {
+				continue
+			}
+			for k := i; k <= j; k++ {
+				lines[k] = prefixes[k] + "[REDACTED]"
+				withheld[k] = true
+			}
+			break
+		}
+	}
+	// A final whole-text pass keeps any cross-line reassembly the redactor
+	// itself performs.
+	return redact.SensitiveText(strings.Join(lines, "\n"))
+}
+
+// repositoryMonitorReviewContextLineMayContinue reports whether a line could
+// start an assignment whose value continues on the following lines: it
+// carries a key separator and ends with an escaped line break, an open
+// quote, a bare key, or a YAML block-scalar indicator. Only such lines seed
+// the multi-line reconstruction, which keeps the policy cost proportional to
+// the patch rather than to the patch times the window size.
+func repositoryMonitorReviewContextLineMayContinue(shadow string) bool {
+	trimmed := strings.TrimRight(shadow, " ")
+	if trimmed == "" || !strings.ContainsAny(trimmed, ":=") {
+		return false
+	}
+	if strings.HasSuffix(trimmed, "\\") || strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, "=") {
+		return true
+	}
+	for _, indicator := range []string{"|", ">", "|-", ">-", "|+", ">+"} {
+		if strings.HasSuffix(trimmed, ": "+indicator) || strings.HasSuffix(trimmed, ":"+indicator) {
+			return true
+		}
+	}
+	return strings.Count(trimmed, "\"")%2 == 1 || strings.Count(trimmed, "'")%2 == 1
 }
 
 func repositoryMonitorReviewContextEncodedSize(reviewContext repositoryMonitorReviewContext) int {

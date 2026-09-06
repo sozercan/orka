@@ -3926,3 +3926,19 @@ func TestSettleACPClassWorkspaceQuotaWaitDefersToSuccessor(t *testing.T) {
 		t.Fatalf("the workspace must survive the quota wait for the queued continuation: %v", err)
 	}
 }
+
+// liveACPSessionContinuationExists reports whether any live, non-terminal
+// Task in the workspace's namespace targets this exact workspace incarnation
+// through its Session. The reader uses the Task CRD's server-side selectable
+// field; list errors fail closed as outstanding demand.
+func liveACPSessionContinuationExists(
+	ctx context.Context,
+	reader client.Reader,
+	workspace *workspacev1alpha1.ExecutionWorkspace,
+) (bool, error) {
+	successors, err := liveACPSessionContinuations(ctx, reader, workspace, "")
+	if err != nil {
+		return true, err
+	}
+	return len(successors) > 0, nil
+}

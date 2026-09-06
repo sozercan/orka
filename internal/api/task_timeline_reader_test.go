@@ -48,21 +48,6 @@ func TestTaskTimelineReaderListThroughAllowsExactLimitAndRejectsNext(t *testing.
 	}
 }
 
-func TestTaskTimelineReaderListRecentThroughPreservesForkOverflowEvent(t *testing.T) {
-	ctx := context.Background()
-	eventStore := storetest.NewFakeExecutionEventStore()
-	appendReaderEvents(t, eventStore, events.ExecutionEventTypeModelMessage, 5)
-	reader := newTaskTimelineReader(eventStore, defaultNamespace, taskTimelineTestTaskName)
-
-	listed, err := reader.listRecentThrough(ctx, 5, 3)
-	if err != nil {
-		t.Fatalf("listRecentThrough error = %v", err)
-	}
-	if len(listed) != 3 || listed[0].Seq != 3 || listed[2].Seq != 5 {
-		t.Fatalf("listRecentThrough seqs = %v, want 3..5", eventSeqs(listed))
-	}
-}
-
 func TestTaskTimelineReaderListRecentContextThroughCoalescesAssistantChunksBeforeRetention(t *testing.T) {
 	ctx := context.Background()
 	eventStore := storetest.NewFakeExecutionEventStore()
@@ -236,14 +221,6 @@ func appendReaderEvent(t *testing.T, eventStore store.ExecutionEventStore, event
 	if _, err := eventStore.AppendExecutionEvent(context.Background(), &event); err != nil {
 		t.Fatalf("AppendExecutionEvent: %v", err)
 	}
-}
-
-func eventSeqs(values []store.ExecutionEvent) []int64 {
-	out := make([]int64, 0, len(values))
-	for _, value := range values {
-		out = append(out, value.Seq)
-	}
-	return out
 }
 
 type recordingExecutionEventStore struct {

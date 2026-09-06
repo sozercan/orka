@@ -1,8 +1,9 @@
 ---
 slug: /autonomous-tasks
+description: "Letting a coordinator agent plan, run, and re-plan on its own until a goal is met."
 ---
 
-# Autonomous Task Execution
+# Autonomous Task execution
 
 Autonomous mode enables long-running, self-driving development loops. A coordinator agent can autonomously decompose a high-level goal into sub-tasks, implement them, test, iterate, and continue working until the goal is complete.
 
@@ -55,9 +56,9 @@ spec:
   prompt: "Implement a REST API with user authentication, CRUD operations, and tests"
 ```
 
-## How It Works
+## How it works
 
-### Controller Loop
+### Controller loop
 
 The controller manages the autonomous loop at the Kubernetes level:
 
@@ -66,7 +67,7 @@ The controller manages the autonomous loop at the Kubernetes level:
 - The task's `status.iteration` tracks the current iteration number
 - Termination conditions are checked after each Job completes
 
-### Plan State
+### Plan state
 
 The LLM manages its own plan using the `update_plan` tool:
 
@@ -85,7 +86,7 @@ Plan state includes:
 - **goal_complete**: Whether the goal has been achieved
 - **plan_document**: Freeform markdown plan managed by the LLM
 
-### Termination Conditions
+### Termination conditions
 
 The autonomous loop stops when any of these conditions are met:
 
@@ -96,7 +97,7 @@ The autonomous loop stops when any of these conditions are met:
 
 ## Monitoring
 
-### Task Status
+### Task status
 
 The task status shows the current iteration:
 
@@ -130,7 +131,7 @@ Response:
 }
 ```
 
-### Pausing and Resuming
+### Pausing and resuming
 
 Suspend an autonomous task:
 
@@ -140,7 +141,7 @@ kubectl patch task build-feature --type=merge -p '{"spec":{"suspend":true}}'
 
 The current iteration will complete, then the task will stop.
 
-## Human Approvals
+## Human approvals
 
 An autonomous agent can run for many iterations without a human in the loop.
 For the steps that should not happen unattended — deploying, spending money,
@@ -170,9 +171,9 @@ While parked, the task stays in a waiting state and the loop does not advance.
 Decide from the CLI:
 
 ```bash
-orka task approvals <task>                  # list pending approvals with IDs
-orka task approve <task> <approvalID>
-orka task decline <task> <approvalID>
+orka task approvals '<task>'                  # list pending approvals with IDs
+orka task approve '<task>' '<approvalID>'
+orka task decline '<task>' '<approvalID>'
 ```
 
 or from the dashboard: the task detail page has an **Approvals** tab with
@@ -184,7 +185,7 @@ One timing note: approvals are derived from the task's execution event stream,
 so a decision issued in the same instant the task parks can briefly return
 `approval not found`. Re-run the command a moment later.
 
-## Environment Variables
+## Environment variables
 
 These environment variables are injected into autonomous worker pods:
 

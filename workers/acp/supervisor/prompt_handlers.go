@@ -288,6 +288,9 @@ func (s *Server) handleStartPrompt(w http.ResponseWriter, r *http.Request) {
 			if run.Release != nil {
 				run.Release(event)
 			}
+			if withholdAgentDiagnostic(state, prompt, event) {
+				continue
+			}
 			for _, ready := range compactor.push(event, time.Now()) {
 				mapAndEncode(ready)
 			}
@@ -413,25 +416,18 @@ func promptTerminalDiagnostic(result acp.PromptResult) (string, string) {
 	return outcome, stopReason
 }
 
-// redactedPromptErrorDetail removes controls (C0, DEL, and C1) and redacts the
-// complete error text before bounding it for a log field. Line breaks and
-// tabs become spaces; every other control rune is dropped rather than
-// replaced so a control inserted inside a credential-shaped token cannot
-// split it into fragments that survive redaction and can be reassembled by a
-// reader.
+// redactedPromptErrorDetail removes control and format runes before redacting
+// the complete error text and bounding it for a log field. Dropping every
+// separator reassembles credentials split across lines or tabs so the
+// redactor can recognize the complete value.
 func redactedPromptErrorDetail(err error) string {
 	if err == nil {
 		return ""
 	}
 	cleaned := strings.Map(func(r rune) rune {
 		switch {
-		case r == '\n' || r == '\r' || r == '\t':
-			return ' '
 		case unicode.IsControl(r):
 			return -1
-		// Unicode format runes (zero-width spaces, joiners, directional
-		// marks) are as invisible as controls and can split a credential
-		// past the redactor; drop them before redaction too.
 		case unicode.Is(unicode.Cf, r):
 			return -1
 		}
@@ -1515,15 +1511,6 @@ func workspaceDeltaRepositoryControlPath(changedPath string) bool {
 		(strings.HasPrefix(lower, "charts/") && strings.Contains(lower, "secret"))
 }
 
-func buildWorkspaceDelta(
-	baseline *workspacedelta.Snapshot,
-	workspace string,
-	intent workspacedelta.Intent,
-	limits harnessv2.WorkspaceDeltaLimits,
-) (workspacedelta.Result, error) {
-	return buildWorkspaceDeltaContext(context.Background(), baseline, workspace, intent, limits)
-}
-
 func buildWorkspaceDeltaContext(
 	ctx context.Context,
 	baseline *workspacedelta.Snapshot,
@@ -1540,11 +1527,67 @@ func buildWorkspaceDeltaContext(
 	)
 }
 
-func workspaceDeltaContentPolicyViolation(artifact []byte, limits harnessv2.WorkspaceDeltaLimits) (string, error) {
-	return workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits)
+// baselineCaptureOptions returns the delta options for trusted baseline
+// captures. The ContentFlagger records which baseline files already carry
+// secret-like content before any agent execution, so the delta content policy
+// can exempt pre-existing repository content (a vulnerable app's hardcoded
+// demo credential) while still rejecting secrets a prompt introduced.
+func (s *Server) baselineCaptureOptions() workspacedelta.Options {
+	options := s.cfg.DeltaOptions
+	options.ContentFlagger = func(content []byte) bool {
+		return security.LooksLikeSecret(string(content))
+	}
+	options.ContentFingerprinter = func(content []byte) []string {
+		return security.SecretLikeLineDigests(string(content))
+	}
+	return options
 }
 
-func workspaceDeltaContentPolicyViolationContext(ctx context.Context, artifact []byte, limits harnessv2.WorkspaceDeltaLimits) (string, error) {
+// workspaceDeltaBaselineExempts reports whether the secret-like content of
+// the changed file at path is entirely pre-existing. Every secret-like line
+// must match a baseline fingerprint (as a multiset) that covers the line's
+// code block together with the previous and next code blocks and every
+// blank or comment-only line in between — the only places an expression
+// continuation could still reach the credential — and once
+// those known lines are removed nothing secret-like may remain. Appending,
+// replacing, continuing, or relocating a credential is rejected, and so is
+// any edit in the neighbouring code blocks (fail closed); an untouched demo
+// credential with edits elsewhere in the file stays publishable.
+func workspaceDeltaBaselineExempts(baseline *workspacedelta.Snapshot, changedPath string, content []byte) bool {
+	if baseline == nil || !baseline.BaselineContentFlagged(changedPath) {
+		return false
+	}
+	// Fingerprints are a multiset: a known block copied to a second place in
+	// the file reproduces its digest but exceeds the baseline count, which
+	// rejects the relocated credential.
+	budget := map[string]int{}
+	for _, digest := range baseline.BaselineContentFingerprints(changedPath) {
+		budget[digest]++
+	}
+	if len(budget) == 0 {
+		return false
+	}
+	text := string(content)
+	for _, digest := range security.SecretLikeLineDigests(text) {
+		if budget[digest] == 0 {
+			return false
+		}
+		budget[digest]--
+	}
+	known := make(map[string]struct{}, len(budget))
+	for digest := range budget {
+		known[digest] = struct{}{}
+	}
+	return !security.LooksLikeSecret(security.StripLinesByDigest(text, known))
+}
+
+// workspaceDeltaContentPolicyViolationContext scans the delta artifact for
+// policy violations. baselineExempts, when non-nil, reports whether the
+// secret-like content of the named workspace-relative file is entirely
+// pre-existing in the trusted pre-prompt baseline (see
+// workspaceDeltaBaselineExempts); only then is the file exempt from the
+// secret-like rejection.
+func workspaceDeltaContentPolicyViolationContext(ctx context.Context, artifact []byte, limits harnessv2.WorkspaceDeltaLimits, baselineExempts func(changedPath string, content []byte) bool) (string, error) {
 	if len(artifact) == 0 || (!limits.RejectBinaryFiles && !limits.RejectSecretLikeContent) {
 		return "", nil
 	}
@@ -1584,7 +1627,11 @@ func workspaceDeltaContentPolicyViolationContext(ctx context.Context, artifact [
 			return "workspace delta contains binary file content: " + strings.TrimPrefix(header.Name, "files/"), nil
 		}
 		if limits.RejectSecretLikeContent && security.LooksLikeSecret(string(content)) {
-			return "workspace delta contains secret-like file content: " + strings.TrimPrefix(header.Name, "files/"), nil
+			changedPath := strings.TrimPrefix(header.Name, "files/")
+			if fileContent && baselineExempts != nil && baselineExempts(changedPath, content) {
+				continue
+			}
+			return "workspace delta contains secret-like file content: " + changedPath, nil
 		}
 	}
 }
@@ -1777,18 +1824,22 @@ func (s *Server) handleWorkspaceDelta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta path looks secret-like", nil, false)
 		return
 	}
-	if violation, policyErr := workspaceDeltaContentPolicyViolationContext(r.Context(), result.Artifact, request.Limits); policyErr != nil {
+	// Check exact prompt-scoped credentials before content policy builds a
+	// diagnostic containing an agent-controlled file path.
+	if workspaceDeltaContainsSessionCredential(result.Artifact, state) {
+		s.poisonSession(state, "workspace delta contains a session credential")
+		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta contains a session credential", nil, false)
+		return
+	}
+	if violation, policyErr := workspaceDeltaContentPolicyViolationContext(r.Context(), result.Artifact, request.Limits, func(changedPath string, content []byte) bool {
+		return workspaceDeltaBaselineExempts(state.baseline, changedPath, content)
+	}); policyErr != nil {
 		s.poisonSession(state, "workspace delta content policy could not be verified")
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta content policy could not be verified", nil, false)
 		return
 	} else if violation != "" {
 		s.poisonSession(state, violation)
 		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, violation, nil, false)
-		return
-	}
-	if workspaceDeltaContainsSessionCredential(result.Artifact, state) {
-		s.poisonSession(state, "workspace delta contains a session credential")
-		writeError(w, http.StatusConflict, harnessv2.ErrorCodeSessionPoisoned, "workspace delta contains a session credential", nil, false)
 		return
 	}
 	if entryCount > int(request.Limits.MaxEntries) || int64(len(result.Artifact)) > request.Limits.MaxBytes {

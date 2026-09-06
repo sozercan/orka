@@ -39,3 +39,9 @@ rules:
   - delete
   - get
   - list
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - tasks/approvals
+  verbs:
+  - update

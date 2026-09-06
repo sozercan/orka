@@ -332,6 +332,7 @@ func acpClassTestReconciler(t *testing.T, objects ...client.Object) *TaskReconci
 			&workspacev1alpha1.ExecutionWorkspaceClass{},
 			&workspacev1alpha1.ExecutionWorkspaceProvider{},
 			&corev1alpha1.Task{},
+			&corev1alpha1.RuntimePool{},
 		)
 	if len(objects) > 0 {
 		builder = builder.WithObjects(objects...)

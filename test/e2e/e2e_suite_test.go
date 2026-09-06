@@ -239,6 +239,18 @@ var _ = BeforeSuite(func() {
 	_, err = utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
+	By("granting the E2E caller access to the external API")
+	cmd = exec.Command("kubectl", "create", "rolebinding", "e2e-api-editor",
+		"-n", namespace, "--clusterrole=orka-api-editor-role",
+		fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
+		"--dry-run=client", "-o", "yaml")
+	apiRoleBinding, err := utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to render E2E API RoleBinding")
+	cmd = exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(apiRoleBinding)
+	_, err = utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to apply E2E API RoleBinding")
+
 	By("resolving the controller-manager deployment name")
 	var controllerManagerDeployment string
 	Eventually(func(g Gomega) {

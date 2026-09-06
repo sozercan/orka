@@ -58,7 +58,8 @@ describe('Overview', () => {
     await waitFor(() => {
       expect(screen.getAllByText('Not authorized').length).toBeGreaterThanOrEqual(6)
     })
-    expect(screen.getByText(/Not authorized to list tasks \(scope missing\)/)).toBeInTheDocument()
+    // Both task surfaces — phase distribution and recent tasks — show it.
+    expect(screen.getAllByText(/Not authorized to list tasks \(scope missing\)/)).toHaveLength(2)
     expect(screen.getAllByText(/lacks/).map((el) => el.textContent)).toEqual(
       expect.arrayContaining([expect.stringContaining('agents'), expect.stringContaining('tools'), expect.stringContaining('tasks')]),
     )

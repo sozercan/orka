@@ -79,8 +79,7 @@ describe('agentSpecSchema', () => {
       skills: [{ configMapRef: { name: 'skill-cm', key: 'skill.md' } }],
       resources: { limits: { memory: '256Mi' } },
       secretRef: { name: 'api-keys' },
-      session: { persistence: 'always', ttl: '1h', maxMessages: 100 },
-      rateLimit: { requestsPerMinute: 60, tokensPerMinute: 10000 },
+      session: { maxMessages: 100 },
       coordination: {
         enabled: true,
         allowedAgents: [{ name: 'helper', namespace: 'default' }],

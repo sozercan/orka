@@ -1296,17 +1296,8 @@ func agentSandboxListedArtifact(artifactPath string, entry sandbox.FileEntry) (A
 		Path:    cleanPath,
 		Size:    entry.Size,
 		Mode:    agentSandboxDefaultFileMode,
-		ModTime: agentSandboxModTime(entry.ModTime),
+		ModTime: entry.ModTime,
 	}, nil
-}
-
-func agentSandboxModTime(seconds float64) time.Time {
-	if seconds <= 0 {
-		return time.Time{}
-	}
-	sec := int64(seconds)
-	nsec := max(int64((seconds-float64(sec))*1e9), 0)
-	return time.Unix(sec, nsec)
 }
 
 func agentSandboxError(op string, err error) error {

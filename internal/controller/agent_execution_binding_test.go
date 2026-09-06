@@ -538,7 +538,7 @@ func TestEnsureAgentExecutionBindingUsesUncachedExistingBinding(t *testing.T) {
 	}
 }
 
-func TestQueueACPRuntimeTaskUsesFrozenSnapshotAfterLiveInputsMutate(t *testing.T) {
+func TestQueueACPRuntimeTaskUsesFrozenSnapshotAndCurrentImageAfterLiveInputsMutate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	task := bindingTestTask()
@@ -584,7 +584,8 @@ func TestQueueACPRuntimeTaskUsesFrozenSnapshotAfterLiveInputsMutate(t *testing.T
 	mutatedAgent := agent.DeepCopy()
 	mutatedAgent.Spec.Model.Name = "mutated/model"
 	mutatedAgent.Spec.SystemPrompt = &corev1alpha1.PromptSource{Inline: "mutable system prompt must be ignored"}
-	reconciler.ACPRuntimeImages.Codex = "docker.io/example/mutated@sha256:" + strings.Repeat("b", 64)
+	approvedImage := "docker.io/example/mutated@sha256:" + strings.Repeat("b", 64)
+	reconciler.ACPRuntimeImages.Codex = approvedImage
 
 	if _, err := reconciler.queueACPRuntimeTask(ctx, mutatedTask, mutatedAgent); err != nil {
 		t.Fatal(err)
@@ -593,9 +594,12 @@ func TestQueueACPRuntimeTaskUsesFrozenSnapshotAfterLiveInputsMutate(t *testing.T
 	if err := reconciler.List(ctx, &pools); err != nil {
 		t.Fatal(err)
 	}
-	if len(pools.Items) != 1 || pools.Items[0].Spec.Runtime.Image != wantImage ||
+	if len(pools.Items) != 1 || pools.Items[0].Spec.Runtime.Image != approvedImage ||
 		pools.Items[0].Spec.Runtime.Profile.Digest != wantProfileDigest {
-		t.Fatalf("RuntimePool did not use frozen plan: %#v", pools.Items)
+		t.Fatalf("RuntimePool did not combine the current image with the frozen profile: %#v", pools.Items)
+	}
+	if pools.Items[0].Spec.Runtime.Image == wantImage {
+		t.Fatalf("RuntimePool resurrected the superseded frozen image %q", wantImage)
 	}
 	queued := &corev1alpha1.Task{}
 	if err := reconciler.Get(ctx, client.ObjectKeyFromObject(task), queued); err != nil {

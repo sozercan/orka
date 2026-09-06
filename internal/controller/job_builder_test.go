@@ -152,9 +152,6 @@ func TestNewJobBuilder(t *testing.T) {
 	if builder.AIWorkerServiceAccountName != AIWorkerServiceAccount {
 		t.Errorf("AIWorkerServiceAccountName = %s, want %s", builder.AIWorkerServiceAccountName, AIWorkerServiceAccount)
 	}
-	if builder.VendorWorkerServiceAccountName != VendorWorkerServiceAccount {
-		t.Errorf("VendorWorkerServiceAccountName = %s, want %s", builder.VendorWorkerServiceAccountName, VendorWorkerServiceAccount)
-	}
 	if builder.ContainerWorkerServiceAccountName != ContainerWorkerServiceAccount {
 		t.Errorf("ContainerWorkerServiceAccountName = %s, want %s", builder.ContainerWorkerServiceAccountName, ContainerWorkerServiceAccount)
 	}
@@ -163,7 +160,6 @@ func TestNewJobBuilder(t *testing.T) {
 func TestJobBuilder_Build_UsesConfiguredWorkerServiceAccountNames(t *testing.T) {
 	builder := setupJobBuilder()
 	builder.AIWorkerServiceAccountName = testAIWorkerServiceAccountName
-	builder.VendorWorkerServiceAccountName = testVendorWorkerServiceAccountName
 	builder.ContainerWorkerServiceAccountName = testContainerWorkerServiceAccountName
 
 	tests := []struct {
@@ -187,14 +183,6 @@ func TestJobBuilder_Build_UsesConfiguredWorkerServiceAccountNames(t *testing.T) 
 			want: testAIWorkerServiceAccountName,
 		},
 		{
-			name: "agent",
-			task: &corev1alpha1.Task{
-				ObjectMeta: metav1.ObjectMeta{Name: "agent-task", Namespace: defaultNS},
-				Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "test prompt"},
-			},
-			want: testVendorWorkerServiceAccountName,
-		},
-		{
 			name: "container",
 			task: &corev1alpha1.Task{
 				ObjectMeta: metav1.ObjectMeta{Name: "container-task", Namespace: defaultNS},
@@ -215,7 +203,14 @@ func TestJobBuilder_Build_UsesConfiguredWorkerServiceAccountNames(t *testing.T) 
 						labels.AnnotationAgentRuntimeAuthOnly: scheduledRunLabelValue,
 					},
 				},
-				Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "test prompt"},
+				Spec: corev1alpha1.TaskSpec{
+					Type: corev1alpha1.TaskTypeAI,
+					AI: &corev1alpha1.AISpec{
+						Provider: "anthropic",
+						Model:    "test-model",
+						Prompt:   "test prompt",
+					},
+				},
 			},
 			want: testContainerWorkerServiceAccountName,
 		},
@@ -235,7 +230,6 @@ func TestJobBuilder_Build_UsesConfiguredWorkerServiceAccountNames(t *testing.T) 
 func TestJobBuilder_WorkerServiceAccountForTask_EmptyNamesUseDefaults(t *testing.T) {
 	builder := setupJobBuilder()
 	builder.AIWorkerServiceAccountName = ""
-	builder.VendorWorkerServiceAccountName = ""
 	builder.ContainerWorkerServiceAccountName = ""
 
 	tests := []struct {
@@ -244,7 +238,6 @@ func TestJobBuilder_WorkerServiceAccountForTask_EmptyNamesUseDefaults(t *testing
 		want     string
 	}{
 		{name: "ai", taskType: corev1alpha1.TaskTypeAI, want: AIWorkerServiceAccount},
-		{name: "agent", taskType: corev1alpha1.TaskTypeAgent, want: VendorWorkerServiceAccount},
 		{name: "container", taskType: corev1alpha1.TaskTypeContainer, want: ContainerWorkerServiceAccount},
 	}
 
@@ -255,28 +248,6 @@ func TestJobBuilder_WorkerServiceAccountForTask_EmptyNamesUseDefaults(t *testing
 				t.Fatalf("workerServiceAccountForTask() = %q, want %q", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestJobBuilder_Build_AgentTaskForExplicitJobBackend(t *testing.T) {
-	builder := setupJobBuilder()
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: testTask, Namespace: defaultNS},
-		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, Prompt: "do work"},
-	}
-	job, err := builder.Build(context.Background(), task, nil, nil)
-	if err != nil {
-		t.Fatalf("Build(agent) error = %v, want explicit job backend support", err)
-	}
-	container := job.Spec.Template.Spec.Containers[0]
-	if container.Image != builder.AIWorkerImage {
-		t.Fatalf("Image = %q, want AI worker image %q", container.Image, builder.AIWorkerImage)
-	}
-	if len(container.Command) != 1 || container.Command[0] != "/worker" {
-		t.Fatalf("Command = %#v, want /worker", container.Command)
-	}
-	if job.Spec.Template.Spec.ServiceAccountName != VendorWorkerServiceAccount {
-		t.Fatalf("ServiceAccountName = %q, want vendor worker", job.Spec.Template.Spec.ServiceAccountName)
 	}
 }
 
@@ -1709,68 +1680,6 @@ func hasAgentEnvFromSecret(envFrom []corev1.EnvFromSource) bool {
 	return false
 }
 
-func agentSandboxEnvNames() []string {
-	return []string{
-		workerenv.AgentSandboxEnabled,
-		workerenv.AgentSandboxRouterURL,
-		workerenv.AgentSandboxTemplateName,
-		workerenv.AgentSandboxTemplateNamespace,
-		workerenv.AgentSandboxClaimNamespace,
-		workerenv.AgentSandboxReusePolicy,
-		workerenv.AgentSandboxReuseKey,
-		workerenv.AgentSandboxCleanupPolicy,
-		workerenv.AgentSandboxWarmPoolPolicy,
-		workerenv.AgentSandboxNamespaceStrategy,
-		workerenv.AgentSandboxClaimTimeoutSeconds,
-		workerenv.AgentSandboxCommandTimeoutSeconds,
-		workerenv.AgentSandboxDepth,
-	}
-}
-
-func TestJobBuilder_BuildWithOptions_NonAgentTask_IgnoresSandboxWorkspaceEnv(t *testing.T) {
-	builder := setupJobBuilder()
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "container-task-sandbox",
-			Namespace: defaultNS,
-			UID:       types.UID("12345678-1234-1234-1234-123456789012"),
-		},
-		Spec: corev1alpha1.TaskSpec{
-			Type:    corev1alpha1.TaskTypeContainer,
-			Image:   "busybox:latest",
-			Command: []string{"sh", "-c"},
-			Args:    []string{"echo hello"},
-		},
-	}
-	request := &AgentSandboxWorkspaceRequest{
-		RouterURL:         "http://agent-sandbox-router.default.svc",
-		TemplateName:      "workspace-template",
-		TemplateNamespace: "sandbox-system",
-		ClaimNamespace:    "sandbox-system",
-		ReusePolicy:       corev1alpha1.WorkspaceReusePolicySession,
-		ReuseKey:          "session-123",
-		CleanupPolicy:     corev1alpha1.WorkspaceCleanupPolicyRetain,
-		WarmPoolPolicy:    AgentSandboxWarmPoolPolicyTemplate,
-		NamespaceStrategy: AgentSandboxNamespaceStrategyController,
-		ClaimTimeout:      2 * time.Minute,
-		CommandTimeout:    30 * time.Minute,
-	}
-
-	job, err := builder.BuildWithOptions(context.Background(), task, nil, nil, JobBuildOptions{
-		AgentSandboxWorkspace: request,
-	})
-	if err != nil {
-		t.Fatalf("BuildWithOptions() error = %v", err)
-	}
-
-	envVars := job.Spec.Template.Spec.Containers[0].Env
-	for _, name := range agentSandboxEnvNames() {
-		if _, found := findEnvVar(envVars, name); found {
-			t.Errorf("unexpected sandbox env var %s for non-agent task", name)
-		}
-	}
-}
-
 func TestJobBuilder_Build_ContainerTask_GitSecretVolume_DirectMountOptIn(t *testing.T) {
 	t.Setenv(directGitCredentialsEnvVar, "true")
 
@@ -2151,9 +2060,7 @@ func TestAddSecretVolumes_ProviderOpenAI(t *testing.T) {
 		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI},
 	}
 	job, _ := jb.Build(context.Background(), task, nil, nil)
-	if err := jb.addSecretVolumes(context.Background(), job, task, nil, provider); err != nil {
-		t.Fatalf("addSecretVolumes() error = %v", err)
-	}
+	jb.addSecretVolumes(context.Background(), job, task, nil, provider)
 	found := false
 	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == testOpenAIAPIKey && env.ValueFrom != nil &&
@@ -2181,9 +2088,7 @@ func TestAddSecretVolumes_ProviderAnthropic(t *testing.T) {
 		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI},
 	}
 	job, _ := jb.Build(context.Background(), task, nil, nil)
-	if err := jb.addSecretVolumes(context.Background(), job, task, nil, provider); err != nil {
-		t.Fatalf("addSecretVolumes() error = %v", err)
-	}
+	jb.addSecretVolumes(context.Background(), job, task, nil, provider)
 	found := false
 	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == "ANTHROPIC_API_KEY" && env.ValueFrom != nil &&
@@ -2206,9 +2111,7 @@ func TestAddSecretVolumes_TaskSecret(t *testing.T) {
 		},
 	}
 	job, _ := jb.Build(context.Background(), task, nil, nil)
-	if err := jb.addSecretVolumes(context.Background(), job, task, nil, nil); err != nil {
-		t.Fatalf("addSecretVolumes() error = %v", err)
-	}
+	jb.addSecretVolumes(context.Background(), job, task, nil, nil)
 	found := false
 	for _, v := range job.Spec.Template.Spec.Volumes {
 		if v.Name == testTaskConfigVolume && v.Secret != nil && v.Secret.SecretName == "task-secret" {
@@ -2234,9 +2137,7 @@ func TestAddSecretVolumes_AgentSecret(t *testing.T) {
 		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI},
 	}
 	job, _ := jb.Build(context.Background(), task, nil, nil)
-	if err := jb.addSecretVolumes(context.Background(), job, task, agent, nil); err != nil {
-		t.Fatalf("addSecretVolumes() error = %v", err)
-	}
+	jb.addSecretVolumes(context.Background(), job, task, agent, nil)
 	foundVol := false
 	for _, v := range job.Spec.Template.Spec.Volumes {
 		if v.Name == "agent-secrets" && v.Secret != nil && v.Secret.SecretName == testAgentSecretName {
@@ -2257,34 +2158,6 @@ func TestAddSecretVolumes_AgentSecret(t *testing.T) {
 	}
 }
 
-func TestAddSecretVolumes_AgentEnvFromReservesTraceContextEnv(t *testing.T) {
-	jb := setupJobBuilder()
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: testTask, Namespace: defaultNS, UID: "uid-1234-5678"},
-		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
-	}
-	agent := &corev1alpha1.Agent{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: defaultNS},
-		Spec: corev1alpha1.AgentSpec{
-			SecretRef: &corev1.LocalObjectReference{Name: testAgentSecretName},
-		},
-	}
-	job, _ := jb.Build(context.Background(), task, nil, nil)
-	if err := jb.addSecretVolumes(context.Background(), job, task, agent, nil); err != nil {
-		t.Fatalf("addSecretVolumes() error = %v", err)
-	}
-
-	for _, name := range []string{workerenv.TraceParent, workerenv.TraceState, workerenv.TraceBaggage} {
-		got, ok := findEnvVar(job.Spec.Template.Spec.Containers[0].Env, name)
-		if !ok || got.Value != "" || got.ValueFrom != nil {
-			t.Fatalf("reserved trace env %s = %#v, found=%v", name, got, ok)
-		}
-	}
-	if _, ok := findEnvVar(job.Spec.Template.Spec.Containers[0].Env, workerenv.EnableTelemetry); ok {
-		t.Fatalf("%s should not be blank-reserved for agent envFrom", workerenv.EnableTelemetry)
-	}
-}
-
 func TestAddSecretVolumes_AIAgentEnvFromReservesTelemetryEnv(t *testing.T) {
 	jb := setupJobBuilder()
 	task := &corev1alpha1.Task{
@@ -2298,9 +2171,7 @@ func TestAddSecretVolumes_AIAgentEnvFromReservesTelemetryEnv(t *testing.T) {
 		},
 	}
 	job, _ := jb.Build(context.Background(), task, nil, nil)
-	if err := jb.addSecretVolumes(context.Background(), job, task, agent, nil); err != nil {
-		t.Fatalf("addSecretVolumes() error = %v", err)
-	}
+	jb.addSecretVolumes(context.Background(), job, task, agent, nil)
 
 	for _, name := range []string{
 		workerenv.EnableTelemetry,
@@ -2351,9 +2222,7 @@ func TestAddSecretVolumes_FallbackProvider(t *testing.T) {
 		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI},
 	}
 	job, _ := jb.Build(context.Background(), task, nil, nil)
-	if err := jb.addSecretVolumes(context.Background(), job, task, agent, nil); err != nil {
-		t.Fatalf("addSecretVolumes() error = %v", err)
-	}
+	jb.addSecretVolumes(context.Background(), job, task, agent, nil)
 	found := false
 	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == "ORKA_AI_FALLBACK_0_API_KEY" && env.ValueFrom != nil {
@@ -2436,9 +2305,7 @@ func TestAddSecretVolumes_ProviderAzureOpenAI(t *testing.T) {
 		Spec:       corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAI},
 	}
 	job, _ := jb.Build(context.Background(), task, nil, nil)
-	if err := jb.addSecretVolumes(context.Background(), job, task, nil, provider); err != nil {
-		t.Fatalf("addSecretVolumes() error = %v", err)
-	}
+	jb.addSecretVolumes(context.Background(), job, task, nil, provider)
 	found := false
 	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == testOpenAIAPIKey {
@@ -2507,10 +2374,10 @@ func TestAddAIEnvVars_FallbackProviders(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// addAgentWorkspaceEnvVars
+// addWorkspaceEnvVars
 // ---------------------------------------------------------------------------
 
-func TestAddAgentWorkspaceEnvVars_AllFields(t *testing.T) {
+func TestAddWorkspaceEnvVars_AllFields(t *testing.T) {
 	jb := setupJobBuilder()
 	task := &corev1alpha1.Task{
 		Spec: corev1alpha1.TaskSpec{
@@ -2525,7 +2392,7 @@ func TestAddAgentWorkspaceEnvVars_AllFields(t *testing.T) {
 			},
 		},
 	}
-	envVars := jb.addAgentWorkspaceEnvVars(nil, task)
+	envVars := jb.addWorkspaceEnvVars(nil, task)
 	expectedVars := map[string]string{
 		"ORKA_GIT_REPO":            "https://github.com/org/repo",
 		"ORKA_GIT_BRANCH":          "main",
@@ -3225,40 +3092,6 @@ func TestJobBuilder_buildEnvVars_IgnoresTaskSuppliedAITelemetryEnv(t *testing.T)
 	}
 }
 
-func TestJobBuilder_buildEnvVars_IgnoresTaskSuppliedAgentTelemetryEnv(t *testing.T) {
-	builder := setupJobBuilder()
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: testTask, Namespace: defaultNS},
-		Spec: corev1alpha1.TaskSpec{
-			Type:   corev1alpha1.TaskTypeAgent,
-			Prompt: "p",
-			Env: []corev1.EnvVar{
-				{Name: workerenv.EnableTelemetry, Value: scheduledRunLabelValue},
-				{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "otel-collector:4317"},
-				{Name: workerenv.TraceParent, Value: "00-" + strings.Repeat("1", 32) + "-" + strings.Repeat("2", 16) + "-01"},
-				{Name: workerenv.TraceState, Value: "vendor=value"},
-				{Name: "CUSTOM_ENV", Value: "kept"},
-			},
-		},
-	}
-
-	envVars := builder.buildEnvVars(context.Background(), task, nil, nil)
-	for _, name := range []string{workerenv.TraceParent, workerenv.TraceState} {
-		if _, ok := findEnvVar(envVars, name); ok {
-			t.Fatalf("task-supplied %s should be ignored for agent workers", name)
-		}
-	}
-	if got, ok := findEnvVar(envVars, workerenv.EnableTelemetry); !ok || got.Value != scheduledRunLabelValue {
-		t.Fatalf("%s = %#v, found=%v", workerenv.EnableTelemetry, got, ok)
-	}
-	if got, ok := findEnvVar(envVars, "OTEL_EXPORTER_OTLP_ENDPOINT"); !ok || got.Value != "otel-collector:4317" {
-		t.Fatalf("OTEL_EXPORTER_OTLP_ENDPOINT = %#v, found=%v", got, ok)
-	}
-	if got, ok := findEnvVar(envVars, "CUSTOM_ENV"); !ok || got.Value != "kept" {
-		t.Fatalf("CUSTOM_ENV = %#v, found=%v", got, ok)
-	}
-}
-
 func TestJobBuilder_buildEnvVars_PreservesContainerTelemetryEnv(t *testing.T) {
 	builder := setupJobBuilder()
 	task := &corev1alpha1.Task{
@@ -3336,63 +3169,21 @@ func TestJobBuilder_buildEnvVars_Telemetry(t *testing.T) {
 		t.Fatalf("%s must not be copied into task workloads, got %#v", workerenv.TraceBaggage, got)
 	}
 
-	agentTask := task.DeepCopy()
-	agentTask.Spec.Type = corev1alpha1.TaskTypeAgent
-	envVars = builder.buildEnvVars(context.Background(), agentTask, nil, nil)
-	if _, ok := findEnvVar(envVars, workerenv.EnableTelemetry); ok {
-		t.Fatal("agent runtime tasks should not receive AI-worker telemetry enablement until the harness path consumes it")
-	}
-
 	containerTask := task.DeepCopy()
 	containerTask.Spec.Type = corev1alpha1.TaskTypeContainer
 	envVars = builder.buildEnvVars(context.Background(), containerTask, nil, nil)
 	if _, ok := findEnvVar(envVars, workerenv.EnableTelemetry); ok {
 		t.Fatal("generic container tasks must not receive telemetry enablement")
 	}
-
-}
-
-func TestJobBuilderAddAgentToolsEnvVarsDefaultsOpenCodeToolsOnlyWhenOmitted(t *testing.T) {
-	builder := setupJobBuilder()
-	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
-	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
-		Type: corev1alpha1.AgentRuntimeOpencode,
-	}}}
-
-	envVars := builder.addAgentToolsEnvVars(nil, task, agent)
-	if got, ok := findEnvVar(envVars, workerenv.AllowedTools); !ok || got.Value != "Read,Write,Edit,Bash,Glob,Grep" {
-		t.Fatalf("%s = %#v, found=%v", workerenv.AllowedTools, got, ok)
-	}
-
-	agent.Spec.Runtime.DefaultAllowedTools = []string{}
-	envVars = builder.addAgentToolsEnvVars(nil, task, agent)
-	if got, ok := findEnvVar(envVars, workerenv.AllowedTools); ok {
-		t.Fatalf("explicit empty %s unexpectedly emitted: %#v", workerenv.AllowedTools, got)
-	}
-
-	agent.Spec.Runtime.DefaultAllowedTools = nil
-	task.Spec.AgentRuntime = &corev1alpha1.AgentRuntimeSpec{AllowedTools: []string{}}
-	envVars = builder.addAgentToolsEnvVars(nil, task, agent)
-	if got, ok := findEnvVar(envVars, workerenv.AllowedTools); ok {
-		t.Fatalf("explicit empty task override %s unexpectedly emitted: %#v", workerenv.AllowedTools, got)
-	}
 }
 
 func TestReadOnlyAgentRuntimeGuardsAllowOpencode(t *testing.T) {
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Annotations: map[string]string{labels.AnnotationAgentReadOnly: scheduledRunLabelValue},
-		},
-	}
 	agent := &corev1alpha1.Agent{
 		Spec: corev1alpha1.AgentSpec{
 			Runtime: &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeOpencode},
 		},
 	}
 
-	if err := validateReadOnlyAgentRuntime(task, agent); err != nil {
-		t.Fatalf("validateReadOnlyAgentRuntime() error = %v, want OpenCode accepted", err)
-	}
 	if got := readOnlyAgentRuntimeType(agent); got != corev1alpha1.AgentRuntimeOpencode {
 		t.Fatalf("readOnlyAgentRuntimeType() = %q, want opencode", got)
 	}
@@ -3458,178 +3249,18 @@ func TestReadOnlyAgentAllowedToolsStayWorkspaceScoped(t *testing.T) {
 	}
 }
 
-func TestAddSecretVolumes_RuntimeAuthOnlyFiltersGitHubToken(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = corev1alpha1.AddToScheme(scheme)
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "implementation-runtime", Namespace: defaultNS},
-		Data: map[string][]byte{
-			workerenv.OpenAIAPIKey: []byte("x"),
-			workerenv.GitHubToken:  []byte("y"),
-		},
-	}
-	immutable := true
-	taskConfig := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "implementation-task-config", Namespace: defaultNS, UID: "uid-implementation-task-config"},
-		Data: map[string][]byte{
-			workerenv.OpenAIAPIKey: []byte("task-pinned"),
-			"CONFIG_VALUE":         []byte("task-only"),
-		},
-		Immutable: &immutable,
-	}
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, taskConfig).Build()
-	jb := NewJobBuilder(fc)
-	jb.ControllerURL = testControllerURL
-	agent := &corev1alpha1.Agent{
-		ObjectMeta: metav1.ObjectMeta{Name: "implementer", Namespace: defaultNS, UID: "uid-implementer"},
-		Spec: corev1alpha1.AgentSpec{
-			Runtime:   &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeCodex},
-			SecretRef: &corev1.LocalObjectReference{Name: secret.Name},
-		},
-	}
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testTask,
-			Namespace: defaultNS,
-			UID:       "uid-1234-5678",
-			Annotations: map[string]string{
-				labels.AnnotationAgentRuntimeAuthOnly:                  scheduledRunLabelValue,
-				repositoryMonitorIssueAnnotationActionKind:             repositoryMonitorIssueActionImplementation,
-				repositoryMonitorIssueAnnotationRuntimeAgentUID:        "uid-implementer",
-				repositoryMonitorIssueAnnotationRuntimeAgentGeneration: "0",
-				repositoryMonitorIssueAnnotationRuntimeAuthUID:         "uid-implementation-task-config",
-				repositoryMonitorIssueAnnotationRuntimeAuthFields:      workerenv.OpenAIAPIKey,
-			},
-		},
-		Spec: corev1alpha1.TaskSpec{
-			Type:      corev1alpha1.TaskTypeAgent,
-			SecretRef: &corev1alpha1.SecretReference{Name: taskConfig.Name},
-		},
-	}
-	job, err := jb.Build(context.Background(), task, agent, nil)
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
-	if job.Spec.Template.Spec.ServiceAccountName != ContainerWorkerServiceAccount {
-		t.Fatalf("service account = %q, want result-only %q", job.Spec.Template.Spec.ServiceAccountName, ContainerWorkerServiceAccount)
-	}
-	for _, source := range job.Spec.Template.Spec.Containers[0].EnvFrom {
-		if source.SecretRef != nil && source.SecretRef.Name == secret.Name {
-			t.Fatal("implementation runtime secret was mounted with envFrom")
-		}
-	}
-	for _, volume := range job.Spec.Template.Spec.Volumes {
-		if volume.Name == testTaskConfigVolume || (volume.Secret != nil && volume.Secret.SecretName == taskConfig.Name) {
-			t.Fatal("runtime-auth-only task secret was mounted as a volume")
-		}
-	}
-	for _, mount := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
-		if mount.Name == testTaskConfigVolume || mount.MountPath == "/secrets/task" {
-			t.Fatal("runtime-auth-only task secret was mounted into the worker container")
-		}
-	}
-	if env, ok := findEnvVar(job.Spec.Template.Spec.Containers[0].Env, workerenv.OpenAIAPIKey); !ok || env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil || env.ValueFrom.SecretKeyRef.Name != taskConfig.Name {
-		t.Fatalf("scoped model credential env = %#v, found=%v", env, ok)
-	}
-	if _, ok := findEnvVar(job.Spec.Template.Spec.Containers[0].Env, workerenv.GitHubToken); ok {
-		t.Fatalf("%s was exposed to implementation task", workerenv.GitHubToken)
-	}
-}
-
-func TestAddSecretVolumes_RuntimeAuthOnlyUnpinnedTaskSecretUsesAgentRuntime(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = corev1alpha1.AddToScheme(scheme)
-	agentRuntime := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agent-runtime", Namespace: defaultNS}, Data: map[string][]byte{
-		workerenv.OpenAIAPIKey: []byte("agent-value"),
-	}}
-	taskConfig := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "task-config", Namespace: defaultNS}, Data: map[string][]byte{
-		"CONFIG_VALUE": []byte("task-only"),
-	}}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agentRuntime, taskConfig).Build()
-	builder := NewJobBuilder(fakeClient)
-	builder.ControllerURL = testControllerURL
-	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{
-		Runtime:   &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeCodex},
-		SecretRef: &corev1.LocalObjectReference{Name: agentRuntime.Name},
-	}}
-	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: testTask, Namespace: defaultNS, Annotations: map[string]string{
-		labels.AnnotationAgentRuntimeAuthOnly: scheduledRunLabelValue,
-	}}, Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent, SecretRef: &corev1alpha1.SecretReference{Name: taskConfig.Name}}}
-	job, err := builder.Build(context.Background(), task, agent, nil)
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
-	env, ok := findEnvVar(job.Spec.Template.Spec.Containers[0].Env, workerenv.OpenAIAPIKey)
-	if !ok || env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil || env.ValueFrom.SecretKeyRef.Name != agentRuntime.Name {
-		t.Fatalf("runtime env = %#v found=%v, want agent runtime Secret", env, ok)
-	}
-}
-
-func TestAddSecretVolumes_RuntimeAuthOnlyRejectsFoundryCredentials(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = corev1alpha1.AddToScheme(scheme)
-	runtimeConfig := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "foundry-runtime-config", Namespace: defaultNS},
-		Data: map[string][]byte{
-			"CLAUDE_CODE_USE_FOUNDRY":         []byte("1"),
-			"ANTHROPIC_FOUNDRY_API_KEY":       []byte("x"),
-			workerenv.AnthropicFoundryBaseURL: []byte("https://foundry.example.test/anthropic"),
-		},
-	}
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(runtimeConfig).Build()
-	jb := NewJobBuilder(fc)
-	jb.ControllerURL = testControllerURL
-	agent := &corev1alpha1.Agent{
-		ObjectMeta: metav1.ObjectMeta{Name: "foundry-implementer", Namespace: defaultNS},
-		Spec: corev1alpha1.AgentSpec{
-			Runtime:   &corev1alpha1.AgentCLIRuntime{Type: corev1alpha1.AgentRuntimeClaude},
-			SecretRef: &corev1.LocalObjectReference{Name: runtimeConfig.Name},
-		},
-	}
-	task := &corev1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: testTask, Namespace: defaultNS, UID: "uid-foundry", Annotations: map[string]string{
-			labels.AnnotationAgentRuntimeAuthOnly: scheduledRunLabelValue,
-		}},
-		Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent},
-	}
-	if _, err := jb.Build(context.Background(), task, agent, nil); err == nil || !strings.Contains(err.Error(), "contains no supported credentials") {
-		t.Fatalf("Build() error = %v, want unsupported Foundry credential rejection", err)
-	}
-}
-
-func TestValidateReadOnlyAgentRuntimeAllowsCodexReadOnlyAgentMode(t *testing.T) {
+func TestValidateReadOnlyBuiltInAgentRuntimeAllowsCodexReadOnlyAgentMode(t *testing.T) {
 	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
 		labels.AnnotationAgentReadOnly: scheduledRunLabelValue,
-	}}}
-	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
-		Type: corev1alpha1.AgentRuntimeCodex,
 	}}}
 	// Codex read-only tasks run in the native read-only agent mode with a
 	// kernel-enforced read-only sandbox, so validation accepts them.
 	if err := validateReadOnlyBuiltInAgentRuntime(task, corev1alpha1.AgentRuntimeCodex); err != nil {
 		t.Fatalf("validateReadOnlyBuiltInAgentRuntime() error = %v, want codex accepted", err)
 	}
-	if err := validateReadOnlyAgentRuntime(task, agent); err != nil {
-		t.Fatalf("validateReadOnlyAgentRuntime() error = %v, want codex accepted", err)
-	}
 	if err := validateReadOnlyBuiltInAgentRuntime(task, corev1alpha1.AgentRuntimeCopilot); err == nil ||
 		!strings.Contains(err.Error(), "copilot runtime credentials") {
 		t.Fatalf("validateReadOnlyBuiltInAgentRuntime(copilot) error = %v, want fail-closed rejection", err)
-	}
-}
-func TestValidateReadOnlyAgentRuntimeRejectsExternalRuntimeRef(t *testing.T) {
-	task := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
-		labels.AnnotationAgentReadOnly: scheduledRunLabelValue,
-	}}}
-	agent := &corev1alpha1.Agent{Spec: corev1alpha1.AgentSpec{Runtime: &corev1alpha1.AgentCLIRuntime{
-		Type:       corev1alpha1.AgentRuntimeClaude,
-		RuntimeRef: &corev1alpha1.AgentRuntimeReference{Name: "external-runtime"},
-	}}}
-	if err := validateReadOnlyAgentRuntime(task, agent); err == nil || !strings.Contains(err.Error(), "external runtimeRef") {
-		t.Fatalf("validateReadOnlyAgentRuntime() error = %v, want external runtimeRef rejection", err)
 	}
 }
 

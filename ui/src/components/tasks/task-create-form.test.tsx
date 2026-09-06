@@ -152,7 +152,7 @@ describe('TaskCreateForm', () => {
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith('Task created')
     })
-    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks' })
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks/$taskId', params: { taskId: 'new-task' } })
   })
 
   it('tokenizes the container command like a shell, keeping quoted arguments intact', async () => {
@@ -208,7 +208,7 @@ describe('TaskCreateForm', () => {
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith('Task created')
     })
-    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks' })
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks/$taskId', params: { taskId: 'new-task' } })
   })
 
   it('cancel button navigates to tasks', async () => {
@@ -252,7 +252,7 @@ describe('TaskCreateForm', () => {
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith('Task created')
     })
-    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks' })
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks/$taskId', params: { taskId: 'new-task' } })
   })
 
   it('AI type lists only Agents without a built-in runtime and submits agentRef', async () => {
@@ -521,7 +521,7 @@ describe('TaskCreateForm', () => {
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith('Task created')
     })
-    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks' })
+    expect(mockNavigate).toHaveBeenCalledWith({ to: '/tasks/$taskId', params: { taskId: 'new-task' } })
   })
 
   it('toggles advanced options visibility', async () => {

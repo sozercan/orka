@@ -35,7 +35,6 @@ func TestNewServer(t *testing.T) {
 
 	config := ServerConfig{
 		Port:           8080,
-		MetricsPort:    9090,
 		WatchNamespace: "default",
 		ExecutionMode:  executionmode.HarnessV1,
 	}
@@ -184,15 +183,11 @@ func TestCustomErrorHandler(t *testing.T) {
 func TestServerConfig(t *testing.T) {
 	config := ServerConfig{
 		Port:           8080,
-		MetricsPort:    9090,
 		WatchNamespace: "custom-ns",
 	}
 
 	if config.Port != 8080 {
 		t.Errorf("Port = %d, want 8080", config.Port)
-	}
-	if config.MetricsPort != 9090 {
-		t.Errorf("MetricsPort = %d, want 9090", config.MetricsPort)
 	}
 	if config.WatchNamespace != "custom-ns" {
 		t.Errorf("WatchNamespace = %s, want custom-ns", config.WatchNamespace)

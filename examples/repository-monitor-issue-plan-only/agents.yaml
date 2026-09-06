@@ -2,7 +2,6 @@ apiVersion: core.orka.ai/v1alpha1
 kind: Agent
 metadata:
   name: issue-researcher
-  namespace: default
 spec:
   model:
     name: claude-sonnet-4.6

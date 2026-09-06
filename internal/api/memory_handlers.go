@@ -7,6 +7,7 @@ MIT License - see LICENSE file for details.
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -320,6 +321,14 @@ func (h *Handlers) ApplyMemoryProposal(c fiber.Ctx) error {
 		return err
 	}
 	apply.Namespace = namespace
+	if ui := GetUserInfo(c); ui != nil && ui.AuthType == AuthTypeTokenReview {
+		// The store may resolve either an applied ID or a source-proposal link.
+		// Authorize its final choice within the transaction, including retries.
+		apply.AuthorizeExistingMemory = func(ctx context.Context, namespace, id string) error {
+			return authorizeKubernetesResourceAction(ctx, h.clientset, ui,
+				namespace, "get", "core.orka.ai", "memories", id)
+		}
+	}
 	if apply.AppliedBy == "" {
 		if ui := GetUserInfo(c); ui != nil {
 			apply.AppliedBy = ui.Username
@@ -327,6 +336,9 @@ func (h *Handlers) ApplyMemoryProposal(c fiber.Ctx) error {
 	}
 	memory, err := h.memoryProposalStore.ApplyMemoryProposal(c.Context(), apply)
 	if err != nil {
+		if forbidden, ok := errors.AsType[*fiber.Error](err); ok && forbidden.Code == fiber.StatusForbidden {
+			return forbidden
+		}
 		return memoryStoreError("apply memory proposal", "memory proposal", err)
 	}
 	return c.JSON(memory)

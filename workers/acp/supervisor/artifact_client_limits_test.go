@@ -34,7 +34,7 @@ func TestArtifactClientUsesSeparateBoundedDefaults(t *testing.T) {
 	t.Parallel()
 
 	var calls atomic.Int32
-	client, err := NewArtifactClient("https://artifact.example", &http.Client{Transport: artifactLimitRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+	client, err := newDefaultArtifactClient("https://artifact.example", &http.Client{Transport: artifactLimitRoundTripperFunc(func(*http.Request) (*http.Response, error) {
 		calls.Add(1)
 		return nil, fmt.Errorf("unexpected artifact transport call")
 	})}, nil)

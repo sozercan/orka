@@ -65,7 +65,7 @@ describe('GatewayBindingDetail', () => {
 
     render(<GatewayBindingDetail name="support-binding" />)
 
-    expect(await screen.findByText('Could not load GatewayBinding support-binding.')).toBeInTheDocument()
+    expect(await screen.findByText('Could not load GatewayBinding support-binding')).toBeInTheDocument()
     expect(screen.queryByText('GatewayBinding not found.')).not.toBeInTheDocument()
   })
 

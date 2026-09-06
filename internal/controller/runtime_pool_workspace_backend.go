@@ -1516,11 +1516,9 @@ func runtimePoolWorkspacePodLabelsMatch(sandbox *sandboxv1beta1.Sandbox, pod *co
 		return false
 	}
 	expected := cloneStringMap(sandbox.Spec.PodTemplate.ObjectMeta.Labels)
-	// agent-sandbox reserves agents.x-k8s.io/* labels and does not propagate
-	// the claim UID from the Sandbox PodTemplate onto the Pod. The exact claim
-	// identity is instead attested above through the claim -> Sandbox -> Pod
-	// owner chain and the controller-owned claim labels on the Sandbox.
-	delete(expected, sandboxextv1beta1.SandboxIDLabel)
+	// agent-sandbox v1.0 propagates the claim UID from the Sandbox PodTemplate
+	// onto the Pod. Keep it in the exact label comparison so the realized Pod
+	// remains bound to the claim -> Sandbox -> Pod identity attested above.
 	expected[sandboxcontrollers.SandboxNameHashLabel] = sandboxcontrollers.NameHash(sandbox.Name)
 	return reflect.DeepEqual(expected, pod.Labels)
 }

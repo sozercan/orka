@@ -131,4 +131,36 @@ type entry struct {
 	protected  bool
 	sourceMode uint32
 	content    []byte
+	// flagged records the Options.ContentFlagger verdict for the content this
+	// entry was captured with. It lives only in the in-memory Snapshot and
+	// never enters the manifest.
+	flagged bool
+	// fingerprints records the Options.ContentFingerprinter output for the
+	// captured content; like flagged it never enters the manifest.
+	fingerprints []string
+}
+
+// BaselineContentFlagged reports whether the file captured at path was
+// flagged by the capture ContentFlagger. Paths use the same slash-separated
+// workspace-relative form as delta change paths. A nil snapshot, an unknown
+// path, or a capture without a ContentFlagger reports false.
+func (s *Snapshot) BaselineContentFlagged(path string) bool {
+	if s == nil {
+		return false
+	}
+	e, ok := s.entries[path]
+	return ok && e.flagged
+}
+
+// BaselineContentFingerprints returns the fingerprints the capture
+// ContentFingerprinter recorded for the file at path (nil when unknown).
+func (s *Snapshot) BaselineContentFingerprints(path string) []string {
+	if s == nil {
+		return nil
+	}
+	e, ok := s.entries[path]
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), e.fingerprints...)
 }

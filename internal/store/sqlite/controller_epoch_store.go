@@ -12,7 +12,7 @@ import (
 
 // GetControllerEpoch returns the current durable controller epoch.
 func (s *Store) GetControllerEpoch(ctx context.Context, name string) (*store.ControllerEpoch, error) {
-	name, err := normalizeControllerEpochName(name)
+	name, err := store.NormalizeControllerEpochName(name)
 	if err != nil {
 		return nil, err
 	}
@@ -28,7 +28,7 @@ func (s *Store) GetControllerEpoch(ctx context.Context, name string) (*store.Con
 // already committed target epoch is idempotent.
 func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.ControllerEpochCAS) (*store.ControllerEpoch, error) {
 	change.Name = strings.TrimSpace(change.Name)
-	name, err := normalizeControllerEpochName(change.Name)
+	name, err := store.NormalizeControllerEpochName(change.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +46,7 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 	if change.NewEpoch < 1 {
 		return nil, store.ValidationErrorf("controller new epoch must be at least 1")
 	}
-	change.UpdatedAt = normalizeControlTime(change.UpdatedAt)
+	change.UpdatedAt = store.NormalizeControlTime(change.UpdatedAt)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -57,7 +57,7 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 	current, err := getControllerEpoch(ctx, tx, change.Name)
 	if errors.Is(err, store.ErrNotFound) {
 		if change.ExpectedVersion != 0 || change.ExpectedEpoch != 0 || change.NewEpoch != 1 {
-			return nil, controlConflict("controller epoch %q does not exist; creation requires expected version/epoch 0 and new epoch 1", change.Name)
+			return nil, store.ConflictErrorf("controller epoch %q does not exist; creation requires expected version/epoch 0 and new epoch 1", change.Name)
 		}
 		created := store.ControllerEpoch{
 			Name:          change.Name,
@@ -75,7 +75,7 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 		)
 		if err != nil {
 			if isSQLiteConstraintError(err) {
-				return nil, controlConflict("controller epoch %q was created concurrently", change.Name)
+				return nil, store.ConflictErrorf("controller epoch %q was created concurrently", change.Name)
 			}
 			return nil, err
 		}
@@ -92,10 +92,10 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 		if current.HolderID == change.HolderID && current.RequestDigest == change.RequestDigest {
 			return &current, nil
 		}
-		return nil, controlConflict("controller epoch %q target %d already exists with different holder or digest", change.Name, change.NewEpoch)
+		return nil, store.ConflictErrorf("controller epoch %q target %d already exists with different holder or digest", change.Name, change.NewEpoch)
 	}
 	if current.Version != change.ExpectedVersion || current.Epoch != change.ExpectedEpoch {
-		return nil, controlConflict("controller epoch %q is version %d epoch %d, expected version %d epoch %d", change.Name, current.Version, current.Epoch, change.ExpectedVersion, change.ExpectedEpoch)
+		return nil, store.ConflictErrorf("controller epoch %q is version %d epoch %d, expected version %d epoch %d", change.Name, current.Version, current.Epoch, change.ExpectedVersion, change.ExpectedEpoch)
 	}
 	if change.NewEpoch != change.ExpectedEpoch+1 {
 		return nil, store.ValidationErrorf("controller epoch must advance exactly by one: expected new epoch %d", change.ExpectedEpoch+1)
@@ -131,7 +131,7 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 // after a crash between authoritative acquisition and mirror persistence, but
 // never rewinds or replaces conflicting evidence at the same epoch.
 func (s *Store) SyncControllerEpochMirror(ctx context.Context, authoritative store.ControllerEpoch) error {
-	name, err := normalizeControllerEpochName(authoritative.Name)
+	name, err := store.NormalizeControllerEpochName(authoritative.Name)
 	if err != nil {
 		return err
 	}
@@ -146,8 +146,8 @@ func (s *Store) SyncControllerEpochMirror(ctx context.Context, authoritative sto
 	if authoritative.Epoch < 1 || authoritative.Version < 1 {
 		return store.ValidationErrorf("mirrored controller epoch and version must be positive")
 	}
-	authoritative.AcquiredAt = normalizeControlTime(authoritative.AcquiredAt)
-	authoritative.UpdatedAt = normalizeControlTime(authoritative.UpdatedAt)
+	authoritative.AcquiredAt = store.NormalizeControlTime(authoritative.AcquiredAt)
+	authoritative.UpdatedAt = store.NormalizeControlTime(authoritative.UpdatedAt)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -164,7 +164,7 @@ func (s *Store) SyncControllerEpochMirror(ctx context.Context, authoritative sto
 		)
 		if err != nil {
 			if isSQLiteConstraintError(err) {
-				return controlConflict("controller epoch mirror %q was created concurrently", authoritative.Name)
+				return store.ConflictErrorf("controller epoch mirror %q was created concurrently", authoritative.Name)
 			}
 			return fmt.Errorf("create controller epoch mirror: %w", err)
 		}
@@ -177,14 +177,14 @@ func (s *Store) SyncControllerEpochMirror(ctx context.Context, authoritative sto
 		return fmt.Errorf("read controller epoch mirror: %w", err)
 	}
 	if current.Epoch > authoritative.Epoch {
-		return controlConflict(
+		return store.ConflictErrorf(
 			"controller epoch mirror %q is ahead at %d, authoritative epoch is %d",
 			authoritative.Name, current.Epoch, authoritative.Epoch,
 		)
 	}
 	if current.Epoch == authoritative.Epoch {
 		if current.HolderID != authoritative.HolderID || current.RequestDigest != authoritative.RequestDigest {
-			return controlConflict(
+			return store.ConflictErrorf(
 				"controller epoch mirror %q conflicts at epoch %d", authoritative.Name, authoritative.Epoch,
 			)
 		}

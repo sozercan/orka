@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -87,9 +88,12 @@ const (
 	repositoryMonitorIssueAnnotationRuntimeAuthFields      = "orka.ai/monitor-runtime-auth-fields"
 	repositoryMonitorIssueAnnotationRuntimeAuthTask        = "orka.ai/monitor-runtime-auth-task"
 	repositoryMonitorIssueAnnotationRuntimeAuthSourceUID   = "orka.ai/monitor-runtime-auth-source-uid"
+	repositoryMonitorIssueAnnotationPullRequestTitle       = "orka.ai/monitor-pull-request-title"
 	repositoryMonitorIssuePatchSchemaVersion               = "orka.patch.v1"
 	repositoryMonitorIssueJSONScanLimit                    = 256 * 1024
 	repositoryMonitorIssueJSONDecodeAttempts               = 32
+	repositoryMonitorIssuePRTitleMaxRunes                  = 256
+	repositoryMonitorIssueProposedPRTitleField             = "proposedPullRequestTitle"
 	repositoryMonitorRuntimeAuthMetadataName               = "runtimeAuthName"
 	repositoryMonitorRuntimeAuthMetadataUID                = "runtimeAuthUID"
 	repositoryMonitorRuntimeAuthMetadataResourceVersion    = "runtimeAuthResourceVersion"
@@ -732,8 +736,8 @@ func buildRepositoryMonitorIssueActionPrompt(monitor *corev1alpha1.RepositoryMon
 		instruction = "Create an implementation plan from the issue text and existing prior action context. Do not edit files, post comments, push, or mutate GitHub. Avoid tool use unless absolutely necessary; do not perform an exhaustive repository review. Keep the plan concise and actionable so implementation can inspect the actual code later. Current Orka patch artifacts are text-only: do not plan binary/generated assets (for example .ico, screenshots, archives, compiled outputs, or vendored blobs). If a binary asset would be useful, leave it out of allowedFiles and document a follow-up/manual asset step instead."
 		schema = `{"schemaVersion":"orka.issuePlan.v1","repo":"owner/repo","issueNumber":123,"snapshotDigest":"sha256:...","status":"ready|blocked|needs_human","summary":"...","acceptanceCriteria":[],"steps":[],"validationCommands":[],"allowedFiles":["text/source/docs files only; no binary/generated assets"],"risk":"low|medium|high","categories":["security|database-migration|other"],"requiresHumanApproval":true}`
 	case repositoryMonitorIssueActionImplementation:
-		instruction = "Implement the approved plan for this issue as a tracer-bullet vertical slice. Keep scope tight and prefer the smallest reviewable source/docs patch that proves the intended route. Make the planned code/documentation changes first; do not run tests before making changes. If the approved plan is too broad for one bounded agent turn, do not keep iterating indefinitely: return a blocked or needs_human JSON result that says the issue should be decomposed with orka:to-issues. Current Orka patch artifacts are text-only: do not create or modify binary/generated assets (for example .ico, screenshots, archives, compiled outputs, or vendored blobs), even if they appear in the plan; use text/source/docs changes and mention any omitted binary asset as a follow-up. After edits, run focused validation only for the files/packages you changed; avoid long full-repository test suites inside this task because CI/Orka repair will run broad validation after the PR is opened. Leave final changes for Orka to commit and push through the configured push branch. Do not open a pull request yourself. Never write realistic secret values (API keys, tokens, passwords) into any file, including docs, examples, and tests; use placeholders such as ${env:VAR} or <your-api-key>, because a workspace delta containing secret-like content is rejected before publication."
-		schema = `{"schemaVersion":"orka.issueImplementation.v1","repo":"owner/repo","issueNumber":123,"snapshotDigest":"sha256:...","status":"patch_ready|blocked|needs_human","summary":"...","validation":[]}`
+		instruction = "Implement the approved plan for this issue as a tracer-bullet vertical slice. Keep scope tight and prefer the smallest reviewable source/docs patch that proves the intended route. Make the planned code/documentation changes first; do not run tests before making changes. If the approved plan is too broad for one bounded agent turn, do not keep iterating indefinitely: return a blocked or needs_human JSON result that says the issue should be decomposed with orka:to-issues. Current Orka patch artifacts are text-only: do not create or modify binary/generated assets (for example .ico, screenshots, archives, compiled outputs, or vendored blobs), even if they appear in the plan; use text/source/docs changes and mention any omitted binary asset as a follow-up. After edits, run focused validation only for the files/packages you changed; avoid long full-repository test suites inside this task because CI/Orka repair will run broad validation after the PR is opened. Set proposedPullRequestTitle to a concise title describing the implemented change without an issue number. Leave final changes for Orka to commit and push through the configured push branch. Do not open a pull request yourself. Never write realistic secret values (API keys, tokens, passwords) into any file, including docs, examples, and tests; use placeholders such as ${env:VAR} or <your-api-key>, because a workspace delta containing secret-like content is rejected before publication."
+		schema = `{"schemaVersion":"orka.issueImplementation.v1","repo":"owner/repo","issueNumber":123,"snapshotDigest":"sha256:...","status":"patch_ready|blocked|needs_human","summary":"...","proposedPullRequestTitle":"feat(scope): describe the implemented change","validation":[]}`
 	case repositoryMonitorIssueActionDecompose:
 		instruction = "Decompose this issue into small, independently implementable child issue drafts. Do not create issues or mutate GitHub; return drafts only."
 		schema = `{"schemaVersion":"orka.issueDecomposition.v1","repo":"owner/repo","issueNumber":123,"snapshotDigest":"sha256:...","status":"ready|blocked","summary":"...","childIssues":[{"title":"...","body":"...","labels":[]}]}`
@@ -1168,7 +1172,7 @@ func repositoryMonitorImplementationResultBody(envelope map[string]any, sr *comm
 			maps.Copy(agentBody, parsed)
 		}
 	}
-	for _, key := range []string{"schemaVersion", "status", "verdict", "summary", "validation", "needsHuman", "confidence"} {
+	for _, key := range []string{"schemaVersion", "status", "verdict", "summary", repositoryMonitorIssueProposedPRTitleField, "validation", "needsHuman", "confidence"} {
 		if value, ok := agentBody[key]; ok {
 			body[key] = value
 		}
@@ -1259,7 +1263,7 @@ func (r *RepositoryMonitorReconciler) applyIssueActionRecord(ctx context.Context
 				item.SkipReason = reason
 			}
 		case repositoryMonitorIssueActionMutateToPR:
-			phase, prNumber, reason, err := r.finishIssueMutation(ctx, monitor, item, record, task)
+			phase, prNumber, reason, err := r.finishIssueMutation(ctx, monitor, item, record, task, repositoryMonitorIssueTaskPullRequestTitle(task))
 			if err != nil {
 				return false, err
 			}
@@ -1383,15 +1387,6 @@ func repositoryMonitorPlanRiskRequiresApproval(monitor *corev1alpha1.RepositoryM
 		}
 	}
 	return false
-}
-
-func repositoryMonitorPlanReadyVerdict(verdict string) bool {
-	switch strings.ToLower(strings.TrimSpace(verdict)) {
-	case repositoryMonitorIssueVerdictReady:
-		return true
-	default:
-		return false
-	}
 }
 
 func repositoryMonitorPlanApprovableVerdict(verdict string) bool {
@@ -1614,7 +1609,7 @@ func (r *RepositoryMonitorReconciler) finishIssueImplementation(ctx context.Cont
 			Summary: "ACP workspace delivery verified", PushBranch: branch, HeadSHA: headSHA,
 		})
 		copyRecord.PayloadJSON = string(payload)
-		phase, prNumber, reason, err := r.finishIssueMutation(ctx, monitor, item, &copyRecord, task)
+		phase, prNumber, reason, err := r.finishIssueMutation(ctx, monitor, item, &copyRecord, task, repositoryMonitorImplementationProposedPullRequestTitle(record))
 		if err != nil {
 			return "", "", "", err
 		}
@@ -1743,7 +1738,7 @@ func (r *RepositoryMonitorReconciler) ensureRepositoryMonitorGitHubMutationStart
 	return mutation, nil
 }
 
-func (r *RepositoryMonitorReconciler) finishIssueMutation(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, record *store.ActionRecord, task *corev1alpha1.Task) (string, int, string, error) {
+func (r *RepositoryMonitorReconciler) finishIssueMutation(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, record *store.ActionRecord, task *corev1alpha1.Task, proposedPullRequestTitle string) (string, int, string, error) {
 	sr := common.ParseStructuredResult(record.PayloadJSON)
 	configuredBranch := repositoryMonitorIssueTaskPushBranch(task)
 	pushMutationID := "ghmut-" + repositoryMonitorShortHash(record.ID+"-push-"+configuredBranch)
@@ -1808,7 +1803,7 @@ func (r *RepositoryMonitorReconciler) finishIssueMutation(ctx context.Context, m
 	prNumber, _ := strconv.Atoi(createMutation.ExternalID)
 	if createMutation.Status != repositoryMonitorRunPhaseSucceeded {
 		var err error
-		prURL, prNumber, err = r.createIssueImplementationPullRequest(ctx, monitor, item, task, configuredBranch)
+		prURL, prNumber, err = r.createIssueImplementationPullRequest(ctx, monitor, item, task, configuredBranch, proposedPullRequestTitle)
 		if err != nil {
 			createMutation.Status = repositoryMonitorRunPhaseFailed
 			createMutation.Error = err.Error()
@@ -2292,6 +2287,9 @@ func (r *RepositoryMonitorReconciler) createRepositoryMonitorIssueMutationTask(c
 				repositoryMonitorIssueAnnotationSnapshotDigest: item.SnapshotDigest,
 				repositoryMonitorIssueAnnotationActionKind:     repositoryMonitorIssueActionMutateToPR,
 				repositoryMonitorIssueAnnotationCommandID:      record.CommandEventID,
+				repositoryMonitorIssueAnnotationPullRequestTitle: repositoryMonitorImplementationPullRequestTitle(
+					repositoryMonitorImplementationProposedPullRequestTitle(record), item.Title, item.Number,
+				),
 			},
 		},
 		Spec: corev1alpha1.TaskSpec{
@@ -2324,6 +2322,17 @@ func numberFieldFromJSON(payload, key string) int64 {
 	return numberField(body, key)
 }
 
+func repositoryMonitorImplementationProposedPullRequestTitle(record *store.ActionRecord) string {
+	if record == nil {
+		return ""
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(record.PayloadJSON), &body); err != nil {
+		return ""
+	}
+	return stringField(body, repositoryMonitorIssueProposedPRTitleField)
+}
+
 func repositoryMonitorIssueTaskPushBranch(task *corev1alpha1.Task) string {
 	if task == nil {
 		return ""
@@ -2334,7 +2343,52 @@ func repositoryMonitorIssueTaskPushBranch(task *corev1alpha1.Task) string {
 	return ""
 }
 
-func (r *RepositoryMonitorReconciler) createIssueImplementationPullRequest(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, task *corev1alpha1.Task, headBranch string) (string, int, error) {
+func repositoryMonitorIssuePullRequestTitle(issueTitle string, issueNumber int64) string {
+	return repositoryMonitorImplementationPullRequestTitle("", issueTitle, issueNumber)
+}
+
+func repositoryMonitorImplementationPullRequestTitle(proposedTitle, issueTitle string, issueNumber int64) string {
+	issueReference := fmt.Sprintf("(#%d)", issueNumber)
+	fallbackTitle := fmt.Sprintf("Implement issue #%d", issueNumber)
+	normalize := func(value string) string {
+		normalized := strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+				return ' '
+			}
+			return r
+		}, value)
+		normalized = strings.Join(strings.Fields(normalized), " ")
+		if normalized == issueReference {
+			return ""
+		}
+		return strings.TrimSpace(strings.TrimSuffix(normalized, " "+issueReference))
+	}
+
+	normalized := normalize(proposedTitle)
+	if normalized == "" {
+		normalized = normalize(issueTitle)
+	}
+	if normalized == "" || normalized == fallbackTitle {
+		return fallbackTitle
+	}
+
+	suffix := " " + issueReference
+	maxTitleRunes := repositoryMonitorIssuePRTitleMaxRunes - len([]rune(suffix))
+	runes := []rune(normalized)
+	if len(runes) > maxTitleRunes {
+		normalized = strings.TrimSpace(string(runes[:maxTitleRunes]))
+	}
+	return normalized + suffix
+}
+
+func repositoryMonitorIssueTaskPullRequestTitle(task *corev1alpha1.Task) string {
+	if task == nil {
+		return ""
+	}
+	return task.Annotations[repositoryMonitorIssueAnnotationPullRequestTitle]
+}
+
+func (r *RepositoryMonitorReconciler) createIssueImplementationPullRequest(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, item *store.MonitorItem, task *corev1alpha1.Task, headBranch, proposedPullRequestTitle string) (string, int, error) {
 	token, err := r.repositoryMonitorForgeToken(ctx, monitor)
 	if err != nil {
 		return "", 0, err
@@ -2353,7 +2407,7 @@ func (r *RepositoryMonitorReconciler) createIssueImplementationPullRequest(ctx c
 		return prURL, prNumber, nil
 	}
 	body := map[string]any{
-		"title": fmt.Sprintf("fix: address issue #%d", item.Number),
+		"title": repositoryMonitorImplementationPullRequestTitle(proposedPullRequestTitle, item.Title, item.Number),
 		"head":  headBranch,
 		"base":  effectiveRepositoryMonitorBranch(monitor),
 		"body":  renderRepositoryMonitorIssuePRBody(item, task),

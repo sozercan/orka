@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.27.0 AS builder
+FROM golang:1.27.1 AS builder
 
 WORKDIR /workspace
 

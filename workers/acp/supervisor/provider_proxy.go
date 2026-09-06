@@ -25,6 +25,7 @@ import (
 
 	"github.com/orka-agents/orka/internal/providerproxy"
 	"github.com/orka-agents/orka/internal/redact"
+	"github.com/orka-agents/orka/internal/security"
 )
 
 const (
@@ -142,10 +143,15 @@ type providerProxySession struct {
 	inferenceSuccesses int32
 	inferenceFailures  int32
 	issuedInference    uint64
-	lastSuccessSeq     uint64
-	lastFailureSeq     uint64
-	lastUpstreamStatus int
-	lastUpstreamDetail string
+	// firstInferenceResponseStartedAt is when the first non-error inference
+	// response of the active prompt began relaying to the child. Model output
+	// can only be derived from those bytes, so assistant text the child
+	// emitted before that instant cannot be model output.
+	firstInferenceResponseStartedAt time.Time
+	lastSuccessSeq                  uint64
+	lastFailureSeq                  uint64
+	lastUpstreamStatus              int
+	lastUpstreamDetail              string
 	// admissionClosed rejects new requests for the active prompt once the
 	// ACP child has settled its turn, while in-flight relays keep their
 	// gate context and drain normally.
@@ -341,10 +347,6 @@ func randomProxySecret(size int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
-func (s *providerProxySession) activate(promptID string, expiresAt, now time.Time) error {
-	return s.activateWithMaxTurns(promptID, 50, expiresAt, now)
-}
-
 func (s *providerProxySession) activateWithMaxTurns(promptID string, maxTurns int32, expiresAt, now time.Time) error {
 	promptID = strings.TrimSpace(promptID)
 	if promptID == "" || maxTurns <= 0 || !expiresAt.After(now) {
@@ -368,6 +370,7 @@ func (s *providerProxySession) activateWithMaxTurns(promptID string, maxTurns in
 	s.inferenceSuccesses = 0
 	s.inferenceFailures = 0
 	s.issuedInference = 0
+	s.firstInferenceResponseStartedAt = time.Time{}
 	s.lastSuccessSeq = 0
 	s.lastFailureSeq = 0
 	s.lastUpstreamStatus = 0
@@ -584,23 +587,6 @@ func (s *providerProxySession) consumeInferenceRequest(promptID string, class pr
 	return nil
 }
 
-// beginInferenceRequest starts the in-flight accounting for one authorized
-// inference-route request. It runs at route authorization — before the body
-// is read or validated — so a child that settles while an inference POST is
-// still being read cannot slip past the settlement drain; metadata classes
-// are a no-op.
-func (s *providerProxySession) beginInferenceRequest(class providerRequestClass) {
-	if s == nil || class != providerRequestInference {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.inflightInference == 0 {
-		s.drainedInference = make(chan struct{})
-	}
-	s.inflightInference++
-}
-
 // releaseInferenceRequest ends the in-flight accounting for one authorized
 // inference-route request; metadata classes are a no-op.
 func (s *providerProxySession) releaseInferenceRequest(class providerRequestClass) {
@@ -734,6 +720,37 @@ func (s *providerProxySession) attachInferenceFailureDetail(promptID string, cla
 // end_turn, which must not become a successful Task. Completion order is
 // irrelevant: a later-issued failure stays unrecovered even if an
 // earlier-issued request succeeds afterwards.
+// markInferenceResponseStarted records that a non-error inference response
+// for the active prompt is about to be relayed to the child; only the first
+// one per prompt is timestamped.
+func (s *providerProxySession) markInferenceResponseStarted(promptID string, class providerRequestClass, now time.Time) {
+	if s == nil || class != providerRequestInference {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnPromptID != strings.TrimSpace(promptID) || !s.firstInferenceResponseStartedAt.IsZero() {
+		return
+	}
+	s.firstInferenceResponseStartedAt = now
+}
+
+// modelOutputPossibleAt reports whether a non-error inference response for
+// the active prompt had begun relaying to the child by at: whether assistant
+// text the child emitted at that instant could be model output. Comparing
+// against the instant an ACP event was received, rather than the current
+// state, keeps the answer correct when the prompt stream consumer drains a
+// queued event only after the proxy has moved on.
+func (s *providerProxySession) modelOutputPossibleAt(promptID string, at time.Time) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnPromptID == strings.TrimSpace(promptID) &&
+		!s.firstInferenceResponseStartedAt.IsZero() && !at.Before(s.firstInferenceResponseStartedAt)
+}
+
 func (s *providerProxySession) upstreamFailureUnrecovered(promptID string) (bool, int, string) {
 	if s == nil {
 		return false, 0, ""
@@ -755,6 +772,10 @@ func (s *providerProxySession) upstreamFailureUnrecovered(promptID string) (bool
 // upstream echoed into its error message. Non-printable runes are dropped
 // before redaction so a control character cannot split a token past the
 // redactor.
+// providerUpstreamDetailWithheld replaces an upstream detail that still
+// matches the secret policy after redaction.
+const providerUpstreamDetailWithheld = "upstream error detail withheld: credential-shaped content"
+
 func sanitizeProviderUpstreamDetail(detail string) string {
 	// Drop non-printable runes first: U+0085 and friends are both controls
 	// and Unicode whitespace, so splitting into fields before removing them
@@ -763,8 +784,9 @@ func sanitizeProviderUpstreamDetail(detail string) string {
 	var printable strings.Builder
 	for _, r := range detail {
 		switch {
-		case r == '\n' || r == '\r' || r == '\t':
-			printable.WriteRune(' ')
+		// Separators are dropped, not spaced: a credential wrapped across a
+		// line break or tab must reassemble into one contiguous token for
+		// the redactor, matching the other ACP sanitizers.
 		case r == utf8.RuneError || !unicode.IsPrint(r):
 			continue
 		default:
@@ -781,13 +803,20 @@ func sanitizeProviderUpstreamDetail(detail string) string {
 	}
 	sanitized := strings.TrimSpace(redact.SensitiveText(strings.Join(kept, " ")))
 	limit := providerUpstreamDetailMaxBytes
-	if len(sanitized) <= limit {
-		return sanitized
+	if len(sanitized) > limit {
+		for limit > 0 && !utf8.RuneStart(sanitized[limit]) {
+			limit--
+		}
+		sanitized = strings.TrimSpace(sanitized[:limit])
 	}
-	for limit > 0 && !utf8.RuneStart(sanitized[limit]) {
-		limit--
+	// The redactor knows a fixed set of credential shapes; the broader
+	// secret policy recognizes more (a bare AWS access-key ID, for one).
+	// A detail that still looks like a credential after redaction is
+	// withheld entirely rather than persisted in durable Task state.
+	if sanitized != "" && security.LooksLikeSecret(sanitized) {
+		return providerUpstreamDetailWithheld
 	}
-	return strings.TrimSpace(sanitized[:limit])
+	return sanitized
 }
 
 // providerUpstreamErrorDetail extracts a human-readable detail from a
@@ -824,6 +853,22 @@ type countingWriter struct {
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
+	return n, err
+}
+
+// deliveredSSEWriter scans only the prefix accepted by the downstream
+// client. A ResponseWriter may return both n > 0 and an error, so
+// io.MultiWriter cannot preserve this delivery boundary.
+type deliveredSSEWriter struct {
+	w       io.Writer
+	scanner *sseTerminalErrorScanner
+}
+
+func (w *deliveredSSEWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if n > 0 {
+		_, _ = w.scanner.Write(p[:n])
+	}
 	return n, err
 }
 
@@ -1068,7 +1113,12 @@ func (p *providerProxy) relayUpstreamResponse(
 	var streamScanner *sseTerminalErrorScanner
 	if !upstreamFailed && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		streamScanner = &sseTerminalErrorScanner{}
-		body = io.TeeReader(body, streamScanner)
+		// The scanner attaches on the WRITE side below, so it sees only
+		// bytes the child actually received. A marker read upstream but
+		// never delivered must not count as delivered.
+	}
+	if !upstreamFailed {
+		session.markInferenceResponseStarted(promptID, requestClass, time.Now().UTC())
 	}
 	providerproxy.CopyResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
@@ -1076,7 +1126,11 @@ func (p *providerProxy) relayUpstreamResponse(
 	// flowing to the ACP child without buffering delays.
 	flusher, _ := w.(http.Flusher)
 	relayed := &countingWriter{w: w}
-	err := providerproxy.StreamBoundedResponse(relayed, body, p.maxResponseBytes, flusher)
+	var destination io.Writer = relayed
+	if streamScanner != nil {
+		destination = &deliveredSSEWriter{w: relayed, scanner: streamScanner}
+	}
+	err := providerproxy.StreamBoundedResponse(destination, body, p.maxResponseBytes, flusher)
 	streamFailed := func() bool {
 		if streamScanner == nil {
 			return false
@@ -1098,23 +1152,23 @@ func (p *providerProxy) relayUpstreamResponse(
 	if err != nil {
 		if !upstreamFailed {
 			if errors.Is(err, providerproxy.ErrDestinationWrite) || ctx.Err() != nil {
-				// The upstream delivered a healthy 2xx; the ACP child closed
-				// its side of the relay (Codex drops an SSE stream once it
-				// has read what it needs), which surfaces either as a
-				// destination write error or, because the upstream request
-				// context is derived from the child's request, as a
-				// cancelled upstream read. Neither is upstream evidence of
-				// failure. It is accounted as a success only when response
-				// bytes actually reached the child; a relay abandoned before
-				// any body byte was delivered proves nothing about the
-				// inference and is left unaccounted, so a later-issued
-				// abandoned request cannot mask an earlier failure the child
-				// settled on.
+				// A child disconnect is not upstream evidence by itself. A
+				// partially delivered SSE response still needs a terminal
+				// marker, while a zero-byte relay remains unaccounted and a
+				// partially delivered non-SSE response stays unaccounted.
 				if streamFailed() {
 					recordStreamFailure()
-				} else if relayed.n > 0 {
-					session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
+				} else if relayed.n > 0 && streamScanner != nil {
+					if !streamScanner.completed {
+						recordIncompleteStream()
+					} else {
+						session.recordInferenceOutcome(promptID, requestClass, seq, response.StatusCode, "")
+					}
 				}
+				// A partially delivered non-SSE body is left unaccounted:
+				// it proves nothing about the inference outcome, and an
+				// unaccounted request can neither mask an earlier failure
+				// nor certify success.
 			} else {
 				// A 2xx whose body overran the response limit or broke
 				// mid-stream on the upstream side never delivered a usable
@@ -1153,8 +1207,18 @@ type sseTerminalErrorScanner struct {
 	lineWindow []byte
 	compactLen int
 	failed     bool
-	completed  bool
-	detail     string
+	// pendingMarker is the error payload marker matched on the current
+	// line. The failure latches once the whole line has been seen so the
+	// recorded detail carries the complete error payload rather than the
+	// prefix up to the marker.
+	pendingMarker []byte
+	// awaitingErrorData is set after an error event line (`event: error`):
+	// the failure latches on the following data line, whose payload is the
+	// detail, or on the blank line/end of stream that closes the event.
+	awaitingErrorData bool
+	eventMarker       []byte
+	completed         bool
+	detail            string
 }
 
 const (
@@ -1180,14 +1244,19 @@ var sseTerminalErrorPayloadMarkers = [][]byte{
 var sseTerminalSuccessEventMarkers = [][]byte{
 	[]byte("event:message_stop"),
 	[]byte("event:response.completed"),
+	[]byte("event:response.incomplete"),
 }
 
 var sseTerminalSuccessPayloadMarkers = [][]byte{
 	[]byte(`"type":"message_stop"`),
 	[]byte(`"type":"response.completed"`),
+	[]byte(`"type":"response.incomplete"`),
 }
 
 var sseDoneMarker = []byte("data:[DONE]")
+
+// sseDataFieldPrefix is the whitespace-stripped SSE data field name.
+var sseDataFieldPrefix = []byte("data:")
 
 func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
 	if c.failed {
@@ -1209,6 +1278,11 @@ func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
 			continue
 		}
 		c.compactLen++
+		if c.pendingMarker != nil {
+			// The verdict is already known; keep buffering the rest of the
+			// line so the detail is the full payload.
+			continue
+		}
 		if len(c.lineWindow) < sseScannerWindowBytes {
 			c.lineWindow = append(c.lineWindow, b)
 		} else {
@@ -1216,16 +1290,17 @@ func (c *sseTerminalErrorScanner) Write(p []byte) (int, error) {
 			c.lineWindow[len(c.lineWindow)-1] = b
 		}
 		c.scanWindow()
-		if c.failed {
-			return len(p), nil
-		}
 	}
 	return len(p), nil
 }
 
-// flush scans any residual unterminated line at end of stream.
+// flush scans any residual unterminated line at end of stream and settles a
+// failure that was still waiting for the end of its line or data payload.
 func (c *sseTerminalErrorScanner) flush() {
-	if c.compactLen > 0 && !c.failed {
+	if c.failed {
+		return
+	}
+	if c.compactLen > 0 || c.pendingMarker != nil || c.awaitingErrorData {
 		c.finishLine()
 		c.resetLine()
 	}
@@ -1234,7 +1309,7 @@ func (c *sseTerminalErrorScanner) flush() {
 func (c *sseTerminalErrorScanner) scanWindow() {
 	for _, marker := range sseTerminalErrorPayloadMarkers {
 		if bytes.HasSuffix(c.lineWindow, marker) {
-			c.markFailure(marker)
+			c.pendingMarker = marker
 			return
 		}
 	}
@@ -1247,9 +1322,27 @@ func (c *sseTerminalErrorScanner) scanWindow() {
 }
 
 func (c *sseTerminalErrorScanner) finishLine() {
+	if c.pendingMarker != nil {
+		c.markFailure(c.pendingMarker)
+		return
+	}
+	if c.awaitingErrorData {
+		switch {
+		case c.compactLen == 0:
+			// Blank line: the error event carried no data payload.
+			c.markFailure(c.eventMarker)
+		case bytes.HasPrefix(c.lineWindow, sseDataFieldPrefix):
+			c.markFailure(c.eventMarker)
+		default:
+			// Another field of the same event (id:, retry:): keep waiting
+			// for its data line.
+		}
+		return
+	}
 	for _, marker := range sseTerminalErrorEventMarkers {
 		if c.compactLen == len(marker) && bytes.Equal(c.lineWindow, marker) {
-			c.markFailure(marker)
+			c.awaitingErrorData = true
+			c.eventMarker = marker
 			return
 		}
 	}
@@ -1267,8 +1360,16 @@ func (c *sseTerminalErrorScanner) finishLine() {
 
 func (c *sseTerminalErrorScanner) markFailure(marker []byte) {
 	c.failed = true
+	c.pendingMarker = nil
+	c.awaitingErrorData = false
 	if len(c.linePrefix) < sseScannerDetailPrefixBytes {
-		c.detail = providerUpstreamErrorDetail(bytes.TrimSuffix(c.linePrefix, []byte{'\r'}))
+		payload := bytes.TrimSpace(bytes.TrimSuffix(c.linePrefix, []byte{'\r'}))
+		// Strip the SSE field name so a JSON payload parses and yields the
+		// provider's message instead of the raw `data: {...}` line.
+		if rest, ok := bytes.CutPrefix(payload, sseDataFieldPrefix); ok {
+			payload = bytes.TrimSpace(rest)
+		}
+		c.detail = providerUpstreamErrorDetail(payload)
 	}
 	if c.detail == "" {
 		c.detail = string(marker)

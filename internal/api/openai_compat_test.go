@@ -1526,6 +1526,70 @@ func TestOpenAICompat_ContextTokenAuthorizationRequiresProviderScopeForModels(t 
 	}
 }
 
+func TestOpenAICompatContextTokenDoesNotRevealDisallowedProviderExistence(t *testing.T) {
+	issuer := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, issuer, "")
+	token := issueTestContextToken(t, issuer, nil, map[string]any{
+		"scope": ContextTokenScopeProvidersUse,
+		"tctx": map[string]any{
+			"allowedProviders": []string{"openai"},
+		},
+	})
+	// The token grants the "openai" provider type, so a Provider of another
+	// type is disallowed whatever its name; its existence must not show.
+	provider := &corev1alpha1.Provider{
+		ObjectMeta: metav1.ObjectMeta{Name: "hidden", Namespace: "default"},
+		Spec: corev1alpha1.ProviderSpec{
+			Type:         corev1alpha1.ProviderTypeAnthropic,
+			DefaultModel: "claude-sonnet-4-20250514",
+			SecretRef:    corev1alpha1.ProviderSecretRef{Name: "hidden-secret"},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "hidden-secret", Namespace: "default"},
+		Data:       map[string][]byte{"api-key": []byte("test-key")},
+	}
+
+	var responses []string
+	for _, tc := range []struct {
+		name    string
+		objects []runtime.Object
+	}{
+		{name: "existing provider", objects: []runtime.Object{provider, secret}},
+		{name: "missing provider"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, app := setupTestOpenAIHandler(tc.objects...)
+			authz, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: ContextTokenAuthorizationModeEnforce})
+			if err != nil {
+				t.Fatalf("NewContextTokenAuthorizationConfig returned error: %v", err)
+			}
+			handler.contextTokenAuthorization = authz
+			app.Use(NewAuthMiddleware(handler.client, AuthConfig{ContextTokens: ctxTokenConfig}))
+			app.Post("/openai/v1/chat/completions", handler.HandleChatCompletions)
+
+			req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(`{"model":"hidden/claude-sonnet-4-20250514","messages":[{"role":"user","content":"hello"}]}`))
+			req.Header.Set(TransactionTokenHeaderName, token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("Test request failed: %v", err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("StatusCode = %d, want %d: %s", resp.StatusCode, http.StatusForbidden, body)
+			}
+			responses = append(responses, string(body))
+		})
+	}
+	if len(responses) != 2 || responses[0] != responses[1] {
+		t.Fatalf("existing and missing disallowed Providers produced distinguishable responses: %q", responses)
+	}
+}
+
 func TestOpenAICompat_ContextTokenAuthorizationFiltersListModels(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")

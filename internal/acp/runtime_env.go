@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -282,21 +281,6 @@ func (a *UIDAllocator) Remaining() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.capacity - a.allocated
-}
-
-func EnvironmentMap(env []string) map[string]string {
-	result := make(map[string]string, len(env))
-	for _, entry := range env {
-		name, value, ok := strings.Cut(entry, "=")
-		if ok {
-			result[name] = value
-		}
-	}
-	return result
-}
-
-func SessionIdentityLabel(uid, generation int64) string {
-	return "uid-" + strconv.FormatInt(uid, 10) + "-g" + strconv.FormatInt(generation, 10)
 }
 
 // DurableWorkspaceBinding is the committed identity of a durable session

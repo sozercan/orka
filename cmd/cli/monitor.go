@@ -907,7 +907,7 @@ func monitorDoctorSummary(monitor any) map[string]any {
 		cliNamespaceQuery:     nestedString(root, monitorSummaryKeyMetadata, cliNamespaceQuery),
 	}
 	if spec != nil {
-		summary["repository"] = firstString(spec, "repository", "repoURL", "repositoryURL")
+		summary["repository"] = firstString(spec, "repoURL", "repositoryURL", "repository")
 		summary["branch"] = firstString(spec, "branch")
 	}
 	if status != nil {

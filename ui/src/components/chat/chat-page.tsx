@@ -57,9 +57,31 @@ export function ChatPage() {
     setProvider('')
     setModel('')
   }, [providerGone, setProvider, setModel])
+  // Without a server default provider an empty pick cannot send at all, so
+  // when the namespace lists exactly one ready Provider it is preselected;
+  // any other shape leaves the picker empty and disables sending with a hint.
+  const readyProviders = providers.filter((p) => p.ready !== false)
+  const soleReadyProvider =
+    activeNamespace === namespace &&
+    provider === '' &&
+    config !== undefined &&
+    !config.provider &&
+    readyProviders.length === 1 &&
+    providers.length === 1
+      ? readyProviders[0]
+      : undefined
+  useEffect(() => {
+    if (!soleReadyProvider) return
+    setProvider(soleReadyProvider.name)
+    setModel(soleReadyProvider.defaultModel ?? '')
+  }, [soleReadyProvider, setProvider, setModel])
+  const hasServerDefault = Boolean(config?.provider)
+  const noProviderSelected = !provider && config !== undefined && !hasServerDefault
   const providersErrorMessage = providersError
     ? providersForbidden
-      ? `Not authorized to list Providers in ${namespace}; only the server default is available.`
+      ? hasServerDefault
+        ? `Not authorized to list Providers in ${namespace}; only the server default is available.`
+        : `Not authorized to list Providers in ${namespace}; an explicit Provider is required to send.`
       : `Providers unavailable: ${providersError instanceof Error ? providersError.message : 'unknown error'}`
     : undefined
   const serverDefaultLabel = config?.provider
@@ -98,12 +120,12 @@ export function ChatPage() {
             )}
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2">
-            <Select value={provider || SERVER_DEFAULT} onValueChange={handleProviderChange} disabled={isStreaming}>
+            <Select value={provider || (hasServerDefault ? SERVER_DEFAULT : '')} onValueChange={handleProviderChange} disabled={isStreaming}>
               <SelectTrigger className="h-7 w-auto min-w-40 text-xs" aria-label="Chat provider">
                 <SelectValue placeholder="Provider" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value={SERVER_DEFAULT}>{serverDefaultLabel}</SelectItem>
+                {hasServerDefault && <SelectItem value={SERVER_DEFAULT}>{serverDefaultLabel}</SelectItem>}
                 {providers.map((p) => (
                   <SelectItem key={p.name} value={p.name}>
                     {p.name}
@@ -149,7 +171,7 @@ export function ChatPage() {
       <ChatMessageList />
 
       {/* Input */}
-      <ChatInput onSend={sendMessage} />
+      <ChatInput onSend={sendMessage} disabled={noProviderSelected} disabledHint={noProviderSelected ? 'Choose a provider before sending.' : undefined} />
     </div>
   )
 }

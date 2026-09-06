@@ -11,7 +11,7 @@ const (
 func TestMonitorDoctorSummaryKeepsHealthFieldsOnly(t *testing.T) {
 	monitor := map[string]any{
 		monitorSummaryKeyMetadata: map[string]any{monitorSummaryKeyName: "vekil-monitor", cliNamespaceQuery: configTestNamespace, "managedFields": []any{map[string]any{"manager": "kubectl"}}},
-		doctorTestKeySpec:         map[string]any{"repository": "https://github.com/example/vekil", "branch": "trunk", "credentialRef": map[string]any{monitorSummaryKeyName: "forge-credential"}},
+		doctorTestKeySpec:         map[string]any{"repository": "vekil", "repoURL": "https://github.com/example/vekil", "branch": "trunk", "credentialRef": map[string]any{monitorSummaryKeyName: "forge-credential"}},
 		monitorSummaryKeyStatus: map[string]any{
 			doctorTestKeyPhase: doctorTestPhaseReady, "lastRunID": "monrun-1", "openIssues": float64(16), "blockedItems": float64(3),
 			"conditions": []any{map[string]any{monitorSummaryKeyType: doctorTestPhaseReady, monitorSummaryKeyStatus: "True", "reason": "RunSucceeded", "observedGeneration": float64(7)}},

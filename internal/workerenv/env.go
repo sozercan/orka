@@ -4,8 +4,8 @@ Copyright (c) 2026.
 MIT License - see LICENSE file for details.
 */
 
-// Package workerenv defines the environment-variable contract shared by the
-// controller job builder and worker binaries.
+// Package workerenv defines the process contract shared by the controller job
+// builder and worker binaries.
 package workerenv
 
 import (
@@ -153,6 +153,7 @@ const (
 	GitRepo              = "ORKA_GIT_REPO"
 	GitBranch            = "ORKA_GIT_BRANCH"
 	GitRef               = "ORKA_GIT_REF"
+	GitRefShallow        = "ORKA_GIT_REF_SHALLOW"
 	WorkspaceSubpath     = "ORKA_WORKSPACE_SUBPATH"
 	WorkspacePrepared    = "ORKA_WORKSPACE_PREPARED"
 	ForkRepo             = "ORKA_FORK_REPO"
@@ -230,6 +231,19 @@ const (
 	ServiceAccountTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 	ResultStdoutPrefix = "ORKA_RESULT_B64:"
+
+	// RepositoryValidationUnavailableExitCode identifies a validation worker
+	// that could not exec the configured validation command. The controller
+	// treats this as unavailable infrastructure rather than a command failure.
+	RepositoryValidationUnavailableExitCode = 125
+
+	// RepositoryValidationMaxProcesses bounds processes and threads created by
+	// one repository validation command.
+	RepositoryValidationMaxProcesses = 512
+
+	// RepositoryValidationMaxCommandBytes bounds the command selected by a
+	// repository reviewer and materialized for the validation container.
+	RepositoryValidationMaxCommandBytes = 8192
 )
 
 const trueString = "true"
@@ -586,33 +600,6 @@ func (e ExecutionWorkspaceEnv) EnvVars() []corev1.EnvVar {
 	}
 }
 
-// ParseExecutionWorkspaceEnv reads the generic execution workspace environment.
-func ParseExecutionWorkspaceEnv(getenv func(string) string) ExecutionWorkspaceEnv {
-	return ExecutionWorkspaceEnv{
-		Enabled:               IsTrue(getenv(ExecutionWorkspaceEnabled)),
-		Provider:              getenv(ExecutionWorkspaceProvider),
-		TemplateName:          getenv(ExecutionWorkspaceTemplateName),
-		TemplateNamespace:     getenv(ExecutionWorkspaceTemplateNamespace),
-		ClaimNamespace:        getenv(ExecutionWorkspaceClaimNamespace),
-		ClaimName:             getenv(ExecutionWorkspaceClaimName),
-		ReusePolicy:           getenv(ExecutionWorkspaceReusePolicy),
-		ReuseKey:              getenv(ExecutionWorkspaceReuseKey),
-		CleanupPolicy:         getenv(ExecutionWorkspaceCleanupPolicy),
-		Boot:                  IsTrue(getenv(ExecutionWorkspaceBoot)),
-		PoolName:              getenv(ExecutionWorkspacePoolName),
-		PoolNamespace:         getenv(ExecutionWorkspacePoolNamespace),
-		SnapshotRestoreURI:    getenv(ExecutionWorkspaceSnapshotRestoreURI),
-		SnapshotCheckpointURI: getenv(ExecutionWorkspaceSnapshotCheckpointURI),
-		SnapshotOnRelease:     IsTrue(getenv(ExecutionWorkspaceSnapshotOnRelease)),
-		ProcessMode:           getenv(ExecutionWorkspaceProcessMode),
-		ResidentKey:           getenv(ExecutionWorkspaceResidentKey),
-		ClaimTimeout:          time.Duration(parsePositiveInt(getenv(ExecutionWorkspaceClaimTimeoutSeconds))) * time.Second,
-		CommandTimeout:        time.Duration(parsePositiveInt(getenv(ExecutionWorkspaceCommandTimeoutSeconds))) * time.Second,
-		StatusEndpoint:        getenv(ExecutionWorkspaceStatusEndpoint),
-		Depth:                 parsePositiveInt(getenv(ExecutionWorkspaceDepth)),
-	}
-}
-
 // SubstrateEnv is the Substrate-specific worker env contract.
 type SubstrateEnv struct {
 	APIEndpoint             string
@@ -646,23 +633,6 @@ func (e SubstrateEnv) EnvVars() []corev1.EnvVar {
 		envVars = append(envVars, Env(SubstrateSessionIdentityToken, e.SessionIdentityToken))
 	}
 	return envVars
-}
-
-// ParseSubstrateEnv reads Substrate-specific worker env vars.
-func ParseSubstrateEnv(getenv func(string) string) SubstrateEnv {
-	return SubstrateEnv{
-		APIEndpoint:             getenv(SubstrateAPIEndpoint),
-		APICAFile:               getenv(SubstrateAPICAFile),
-		APIInsecureSkipVerify:   IsTrue(getenv(SubstrateAPIInsecureSkipVerify)),
-		RouterURL:               getenv(SubstrateRouterURL),
-		ActorDNSSuffix:          getenv(SubstrateActorDNSSuffix),
-		SessionIdentityToken:    getenv(SubstrateSessionIdentityToken),
-		SessionIdentityRequired: IsTrue(getenv(SubstrateSessionIdentityRequired)),
-		SessionIdentityMintCert: IsTrue(getenv(SubstrateSessionIdentityMintCert)),
-		SessionIdentityAudience: getenv(SubstrateSessionIdentityAudience),
-		SessionIdentityAppID:    getenv(SubstrateSessionIdentityAppID),
-		SessionIdentityUserID:   getenv(SubstrateSessionIdentityUserID),
-	}
 }
 
 // AgentSandboxEnv is the resolved sandbox workspace env contract passed to
@@ -702,24 +672,6 @@ func (e AgentSandboxEnv) EnvVars() []corev1.EnvVar {
 		Env(AgentSandboxClaimTimeoutSeconds, strconv.FormatInt(int64(e.ClaimTimeout/time.Second), 10)),
 		Env(AgentSandboxCommandTimeoutSeconds, strconv.FormatInt(int64(e.CommandTimeout/time.Second), 10)),
 		Env(AgentSandboxDepth, "0"),
-	}
-}
-
-// ParseAgentSandboxEnv reads the agent sandbox workspace environment.
-func ParseAgentSandboxEnv(getenv func(string) string) AgentSandboxEnv {
-	return AgentSandboxEnv{
-		Enabled:           IsTrue(getenv(AgentSandboxEnabled)),
-		RouterURL:         getenv(AgentSandboxRouterURL),
-		TemplateName:      getenv(AgentSandboxTemplateName),
-		TemplateNamespace: getenv(AgentSandboxTemplateNamespace),
-		ClaimNamespace:    getenv(AgentSandboxClaimNamespace),
-		ReusePolicy:       getenv(AgentSandboxReusePolicy),
-		ReuseKey:          getenv(AgentSandboxReuseKey),
-		CleanupPolicy:     getenv(AgentSandboxCleanupPolicy),
-		WarmPoolPolicy:    getenv(AgentSandboxWarmPoolPolicy),
-		NamespaceStrategy: getenv(AgentSandboxNamespaceStrategy),
-		ClaimTimeout:      time.Duration(parsePositiveInt(getenv(AgentSandboxClaimTimeoutSeconds))) * time.Second,
-		CommandTimeout:    time.Duration(parsePositiveInt(getenv(AgentSandboxCommandTimeoutSeconds))) * time.Second,
 	}
 }
 

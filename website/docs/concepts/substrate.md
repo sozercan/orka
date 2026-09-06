@@ -1,8 +1,9 @@
 ---
 slug: /substrate
+description: "Running an agent's workspace in an Agent Substrate gVisor actor, behind Orka's ACP lifecycle."
 ---
 
-# Agent Substrate Workspaces
+# Agent Substrate workspaces
 
 Agent Substrate is an externally installed and operated execution-workspace
 provider. Orka can host a built-in agent Task's ACP RuntimeSession inside a

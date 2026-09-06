@@ -64,15 +64,9 @@ spec:
               targetActors:
                 description: |-
                   TargetActors is the desired number of stateful actors tracked for this
-                  pool. It may exceed TargetWorkers to express oversubscription.
+                  pool. It may exceed the physical worker budget to express oversubscription.
                 format: int32
                 maximum: 1000
-                minimum: 0
-                type: integer
-              targetWorkers:
-                description: TargetWorkers is the intended physical worker budget
-                  for this pool.
-                format: int32
                 minimum: 0
                 type: integer
               templateRef:

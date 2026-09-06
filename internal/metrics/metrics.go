@@ -277,23 +277,6 @@ var (
 		},
 		[]string{"stream_type", "event_type"},
 	)
-
-	ExecutionEventDerivedLatency = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "orka_execution_event_derived_latency_seconds",
-			Help:    "Latency derived from execution event start/end pairs",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"measurement", "result"},
-	)
-
-	ExecutionEventDerivedFailuresTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "orka_execution_event_derived_failures_total",
-			Help: "Failure counts derived from execution event terminal/failure event types",
-		},
-		[]string{"category", "event_type"},
-	)
 )
 
 func init() {
@@ -329,8 +312,6 @@ func init() {
 		ExecutionEventStreamErrorsTotal,
 		ExecutionEventRedactionsTotal,
 		ExecutionEventTruncationsTotal,
-		ExecutionEventDerivedLatency,
-		ExecutionEventDerivedFailuresTotal,
 	)
 }
 
@@ -501,16 +482,6 @@ func CounterVecValue(counter *prometheus.CounterVec, labels ...string) float64 {
 		return 0
 	}
 	return m.GetCounter().GetValue()
-}
-
-// RecordExecutionEventDerivedLatency records one idempotent event-derived latency observation.
-func RecordExecutionEventDerivedLatency(measurement, result string, durationSeconds float64) {
-	ExecutionEventDerivedLatency.WithLabelValues(normalizeMetricLabel(measurement), normalizeMetricLabel(result)).Observe(durationSeconds)
-}
-
-// RecordExecutionEventDerivedFailure records one event-derived failure category.
-func RecordExecutionEventDerivedFailure(category, eventType string) {
-	ExecutionEventDerivedFailuresTotal.WithLabelValues(normalizeMetricLabel(category), normalizeMetricLabel(eventType)).Inc()
 }
 
 // RecordRepositoryMonitorCommand records a durable command event decision.

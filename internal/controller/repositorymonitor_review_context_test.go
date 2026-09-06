@@ -280,6 +280,34 @@ func TestRepositoryMonitorReviewContextRedactsCredentialsSplitByControlCharacter
 	}
 }
 
+func TestRepositoryMonitorReviewContextRedactsCredentialsSplitByPathSeparators(t *testing.T) {
+	t.Parallel()
+	const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	for _, tc := range []struct {
+		name      string
+		separator string
+	}{
+		{name: "newline", separator: "\n"},
+		{name: "tab", separator: "\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			split := secret[:11] + tc.separator + secret[11:]
+			files := []repositoryMonitorPullRequestFileResponse{{
+				Filename: "config/" + split + ".env",
+				Status:   repositoryMonitorReviewContextTestAdded,
+			}}
+			got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), files)
+			if len(got.Files) != 1 || !got.Truncated.Files {
+				t.Fatalf("context = %#v, want one altered path marked incomplete", got)
+			}
+			path := got.Files[0].Path
+			if strings.Contains(strings.ReplaceAll(path, " ", ""), secret) || !strings.Contains(path, "[REDACTED]") {
+				t.Fatalf("path = %q, want separator-joined credential redacted", path)
+			}
+		})
+	}
+}
+
 func TestRepositoryMonitorReviewContextRedactedDeletedLineMarksChangeSetIncomplete(t *testing.T) {
 	t.Parallel()
 	const secret = "ak-live-0123456789abcdef"
@@ -932,5 +960,53 @@ func TestRepositoryMonitorReviewContextInconsistentLineCountsMarkChangeSetIncomp
 	got := repositoryMonitorReviewContextFromFiles(repositoryMonitorReviewContextTestOwner, repositoryMonitorReviewContextTestName, repositoryMonitorReviewContextTestPR(), []repositoryMonitorPullRequestFileResponse{file})
 	if !got.Truncated.Files {
 		t.Fatalf("truncated = %#v, want files=true for a patch whose totals disagree with reported counts", got.Truncated)
+	}
+}
+
+func TestRepositoryMonitorReviewContextRedactsTabSplitCredential(t *testing.T) {
+	t.Parallel()
+	const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	split := "+\tconst k = \"" + secret[:11] + "\t" + secret[11:] + "\""
+	got := repositoryMonitorReviewContextSanitize(split)
+	if strings.Contains(got, secret[11:]) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("sanitize(%q) = %q, want tab-split credential redacted", split, got)
+	}
+	// Ordinary tab-indented code lines keep their tabs.
+	plain := "+\tif err != nil {"
+	if got := repositoryMonitorReviewContextSanitize(plain); got != plain {
+		t.Fatalf("sanitize(%q) = %q, want tabs preserved on credential-free lines", plain, got)
+	}
+}
+
+func TestRepositoryMonitorReviewContextWithholdsTabJoinedSecretDetectedByPolicy(t *testing.T) {
+	t.Parallel()
+	const secret = "AK" + "IA" + "ABCDEFGHIJ" + "KLMNOP"
+	split := "+const accessKey = \"" + secret[:14] + "\t" + secret[14:] + "\""
+	got := repositoryMonitorReviewContextSanitize(split)
+	if got != "+[REDACTED]" {
+		t.Fatalf("sanitize(%q) = %q, want the policy-detected line withheld", split, got)
+	}
+}
+
+func TestRepositoryMonitorReviewContextWithholdsCredentialSpanningPatchLines(t *testing.T) {
+	t.Parallel()
+	// A valid multi-line YAML credential: the quoted scalar escapes its line
+	// break, so the GitHub patch carries the value across two "+" lines and
+	// neither fragment is a credential on its own.
+	patch := "@@ -1,2 +1,3 @@\n context: value\n+password: \"correct-\\\n+  horse-battery-staple\"\n+other: fine\n"
+	got := repositoryMonitorReviewContextSanitize(patch)
+	if strings.Contains(got, "horse-battery") || strings.Contains(got, "correct-") {
+		t.Fatalf("sanitize(%q) = %q, want the line-spanning credential withheld", patch, got)
+	}
+	if !strings.Contains(got, "+[REDACTED]\n+[REDACTED]") {
+		t.Fatalf("sanitize(%q) = %q, want both fragments withheld with their diff markers", patch, got)
+	}
+	if !strings.Contains(got, " context: value") || !strings.Contains(got, "+other: fine") {
+		t.Fatalf("sanitize(%q) = %q, want credential-free lines preserved", patch, got)
+	}
+	// Credential-free multi-line YAML stays intact.
+	clean := "+description: >-\n+  folded prose line one\n+  and line two\n"
+	if got := repositoryMonitorReviewContextSanitize(clean); got != clean {
+		t.Fatalf("sanitize(%q) = %q, want unchanged", clean, got)
 	}
 }

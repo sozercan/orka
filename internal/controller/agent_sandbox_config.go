@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	sandboxextv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -216,174 +215,6 @@ func substrateTemplateNamespace(ws *corev1alpha1.ExecutionWorkspaceSpec, taskNam
 	return taskNamespace
 }
 
-// resolveExecutionWorkspaceRequest applies controller defaults to a Task execution workspace request.
-// It returns nil when the Task does not request an enabled execution workspace.
-func (r *TaskReconciler) resolveExecutionWorkspaceRequest(ctx context.Context, task *corev1alpha1.Task) (*ExecutionWorkspaceRequest, error) {
-	if task.Spec.Execution == nil || task.Spec.Execution.Workspace == nil || !task.Spec.Execution.Workspace.Enabled {
-		return nil, nil
-	}
-	if err := r.validateExecutionWorkspaceRequest(task); err != nil {
-		return nil, err
-	}
-
-	provider := resolveWorkspaceProvider(task.Spec.Execution.Workspace, r.ExecutionWorkspaceDefaultProvider)
-	if provider == corev1alpha1.WorkspaceProviderSubstrate {
-		return r.resolveSubstrateWorkspaceRequest(ctx, task)
-	}
-	return r.resolveAgentSandboxWorkspaceRequest(ctx, task)
-}
-
-func (r *TaskReconciler) resolveAgentSandboxWorkspaceRequest(ctx context.Context, task *corev1alpha1.Task) (*ExecutionWorkspaceRequest, error) {
-	cfg := r.AgentSandboxConfig.WithDefaults()
-	ws := task.Spec.Execution.Workspace
-
-	reusePolicy := ws.ReusePolicy
-	if reusePolicy == "" {
-		reusePolicy = corev1alpha1.WorkspaceReusePolicyNone
-	}
-	cleanupPolicy := ws.CleanupPolicy
-	if cleanupPolicy == "" {
-		cleanupPolicy = cfg.CleanupPolicy
-	}
-
-	templateNamespace := executionWorkspaceTemplateNamespace(ws, task.Namespace, cfg)
-	request := &ExecutionWorkspaceRequest{
-		Provider:          corev1alpha1.WorkspaceProviderAgentSandbox,
-		RouterURL:         cfg.RouterURL,
-		TemplateName:      executionWorkspaceTemplateName(ws, cfg),
-		TemplateNamespace: templateNamespace,
-		ClaimNamespace:    templateNamespace,
-		ReusePolicy:       reusePolicy,
-		CleanupPolicy:     cleanupPolicy,
-		WarmPoolPolicy:    cfg.WarmPoolPolicy,
-		NamespaceStrategy: cfg.NamespaceStrategy,
-		ClaimTimeout:      cfg.ClaimTimeout,
-		CommandTimeout:    cfg.CommandTimeout,
-	}
-	if reusePolicy == corev1alpha1.WorkspaceReusePolicySession && task.Spec.SessionRef != nil {
-		request.ReuseKey = task.Spec.SessionRef.Name
-	}
-
-	if err := r.validateExecutionWorkspaceWarmPoolExists(ctx, task, request); err != nil {
-		return nil, err
-	}
-
-	return request, nil
-}
-
-func (r *TaskReconciler) resolveSubstrateWorkspaceRequest(ctx context.Context, task *corev1alpha1.Task) (*ExecutionWorkspaceRequest, error) {
-	cfg := r.SubstrateConfig.WithDefaults()
-	ws := task.Spec.Execution.Workspace
-
-	reusePolicy := ws.ReusePolicy
-	if reusePolicy == "" {
-		reusePolicy = corev1alpha1.WorkspaceReusePolicyNone
-	}
-	cleanupPolicy := ws.CleanupPolicy
-	if cleanupPolicy == "" {
-		cleanupPolicy = cfg.CleanupPolicy
-	}
-	templateName := substrateTemplateName(ws, cfg)
-	templateNamespace := substrateTemplateNamespace(ws, task.Namespace, cfg)
-	snapshotRestoreURI, snapshotCheckpointURI, snapshotOnRelease := executionWorkspaceSnapshot(ws)
-	processMode, residentKey := executionWorkspaceHibernation(ws)
-	reuseKey := ""
-	claimName := deterministicSubstrateTaskActorID(string(task.UID), task.Status.Attempts+1)
-	poolTargetActors := int32(0)
-	if reusePolicy == corev1alpha1.WorkspaceReusePolicySession && task.Spec.SessionRef != nil {
-		reuseKey = task.Spec.SessionRef.Name
-		claimName = deterministicSubstrateSessionActorID(task.Namespace, templateNamespace, templateName, reuseKey)
-	}
-	if residentKey == "" && processMode == corev1alpha1.ExecutionWorkspaceProcessModeResident {
-		residentKey = deterministicSubstrateSessionActorID(task.Namespace, templateNamespace, templateName, firstNonEmpty(reuseKey, claimName))
-	}
-	poolName, poolNamespace := executionWorkspacePoolRef(ws, task.Namespace)
-	if poolName != "" {
-		if r.EnforceNamespaceIsolation && poolNamespace != task.Namespace {
-			return nil, fmt.Errorf(
-				"cross-namespace substrate actor poolRef not allowed when namespace isolation is enforced: pool %q in namespace %q, task in %q",
-				poolName,
-				poolNamespace,
-				task.Namespace,
-			)
-		}
-		pool, err := r.resolveExecutionWorkspacePool(ctx, poolNamespace, poolName, templateNamespace, templateName)
-		if err != nil {
-			return nil, err
-		}
-		prefix := deterministicSubstratePoolActorPrefix(poolNamespace, poolName)
-		ordinal := deterministicSubstratePoolActorOrdinal(
-			pool.Spec.TargetActors,
-			prefix,
-			task.Namespace,
-			string(task.UID),
-			fmt.Sprint(task.Status.Attempts+1),
-			reuseKey,
-		)
-		if reusePolicy == corev1alpha1.WorkspaceReusePolicySession && reuseKey != "" {
-			ordinal = deterministicSubstratePoolActorOrdinal(
-				pool.Spec.TargetActors,
-				prefix,
-				task.Namespace,
-				templateNamespace,
-				templateName,
-				reuseKey,
-			)
-		}
-		claimName = deterministicSubstratePoolActorID(prefix, ordinal)
-		cleanupPolicy = corev1alpha1.WorkspaceCleanupPolicyDelete
-		poolTargetActors = pool.Spec.TargetActors
-	}
-
-	request := &ExecutionWorkspaceRequest{
-		Provider:                           corev1alpha1.WorkspaceProviderSubstrate,
-		TemplateName:                       templateName,
-		TemplateNamespace:                  templateNamespace,
-		ClaimNamespace:                     templateNamespace,
-		ClaimName:                          claimName,
-		ReusePolicy:                        reusePolicy,
-		ReuseKey:                           reuseKey,
-		CleanupPolicy:                      cleanupPolicy,
-		Boot:                               ws.Boot,
-		PoolName:                           poolName,
-		PoolNamespace:                      poolNamespace,
-		PoolTargetActors:                   poolTargetActors,
-		SnapshotRestoreURI:                 snapshotRestoreURI,
-		SnapshotCheckpointURI:              snapshotCheckpointURI,
-		SnapshotOnRelease:                  snapshotOnRelease,
-		ProcessMode:                        processMode,
-		ResidentKey:                        residentKey,
-		ClaimTimeout:                       cfg.ClaimTimeout,
-		CommandTimeout:                     cfg.CommandTimeout,
-		SubstrateAPIEndpoint:               cfg.APIEndpoint,
-		SubstrateAPICAFile:                 cfg.APICAFile,
-		SubstrateAPIInsecureSkipVerify:     cfg.APIInsecureSkipVerify,
-		SubstrateRouterURL:                 cfg.RouterURL,
-		SubstrateActorDNSSuffix:            cfg.ActorDNSSuffix,
-		SubstrateBootstrapSecretName:       cfg.BootstrapSecretName,
-		SubstrateBootstrapSecretKey:        cfg.BootstrapSecretKey,
-		SubstrateSessionIdentitySecretName: cfg.SessionIdentitySecretName,
-		SubstrateSessionIdentitySecretKey:  cfg.SessionIdentitySecretKey,
-		SubstrateSessionIdentityRequired:   cfg.SessionIdentityRequired,
-		SubstrateSessionIdentityMintCert:   cfg.SessionIdentityMintCert,
-		SubstrateSessionIdentityAudience:   cfg.SessionIdentityAudience,
-		SubstrateSessionIdentityAppID:      cfg.SessionIdentityAppID,
-		SubstrateSessionIdentityUserID:     cfg.SessionIdentityUserID,
-	}
-
-	if err := r.validateSubstrateWorkspaceTemplate(ctx, task, request); err != nil {
-		return nil, err
-	}
-	return request, nil
-}
-
-func executionWorkspacePoolRef(ws *corev1alpha1.ExecutionWorkspaceSpec, taskNamespace string) (string, string) {
-	if ws == nil || ws.PoolRef == nil {
-		return "", ""
-	}
-	return substrateActorPoolReference(ws.PoolRef, taskNamespace)
-}
-
 func substrateActorPoolReference(ref *corev1alpha1.SubstrateActorPoolReference, defaultNamespace string) (string, string) {
 	if ref == nil {
 		return "", ""
@@ -397,19 +228,6 @@ func substrateActorPoolReference(ref *corev1alpha1.SubstrateActorPoolReference, 
 		namespace = defaultNamespace
 	}
 	return name, namespace
-}
-
-func (r *TaskReconciler) resolveExecutionWorkspacePool(
-	ctx context.Context,
-	poolNamespace string,
-	poolName string,
-	templateNamespace string,
-	templateName string,
-) (*corev1alpha1.SubstrateActorPool, error) {
-	if r == nil || r.Client == nil {
-		return nil, fmt.Errorf("substrate actor poolRef %q/%q cannot be resolved without a Kubernetes client", poolNamespace, poolName)
-	}
-	return resolveSubstrateActorPoolReference(ctx, r.Client, poolNamespace, poolName, templateNamespace, templateName)
 }
 
 func resolveSubstrateActorPoolReference(
@@ -467,52 +285,6 @@ func resolveSubstrateActorPoolReference(
 		)
 	}
 	return pool, nil
-}
-
-func (r *TaskReconciler) validateExecutionWorkspaceWarmPoolExists(ctx context.Context, task *corev1alpha1.Task, request *AgentSandboxWorkspaceRequest) error {
-	if r == nil || r.Client == nil || request == nil || request.TemplateName == "" {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	// The upstream agent-sandbox SDK v0.5 claims a SandboxWarmPool by name,
-	// so validate the effective namespace where the SandboxClaim will be created.
-	lookupNamespace := request.ClaimNamespace
-	if strings.TrimSpace(lookupNamespace) == "" {
-		lookupNamespace = request.TemplateNamespace
-	}
-	if strings.TrimSpace(lookupNamespace) == "" {
-		lookupNamespace = task.Namespace
-	}
-
-	warmPool := &sandboxextv1beta1.SandboxWarmPool{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: lookupNamespace, Name: request.TemplateName}, warmPool)
-	if err == nil {
-		return nil
-	}
-	if apierrors.IsNotFound(err) {
-		return fmt.Errorf(
-			"execution workspace warm pool %q not found in namespace %q",
-			request.TemplateName,
-			lookupNamespace,
-		)
-	}
-	return fmt.Errorf(
-		"failed to validate execution workspace warm pool %q in namespace %q: %w",
-		request.TemplateName,
-		lookupNamespace,
-		err,
-	)
-}
-
-func (r *TaskReconciler) validateSubstrateWorkspaceTemplate(ctx context.Context, task *corev1alpha1.Task, request *ExecutionWorkspaceRequest) error {
-	_ = task
-	if r == nil {
-		return nil
-	}
-	return validateSubstrateActorTemplateResource(ctx, r.Client, request)
 }
 
 func validateSubstrateActorTemplateResource(ctx context.Context, reader client.Reader, request *ExecutionWorkspaceRequest) error {

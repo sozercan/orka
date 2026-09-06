@@ -12,8 +12,12 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
+
+	sigsyaml "sigs.k8s.io/yaml"
 
 	"github.com/spf13/cobra"
 
@@ -184,7 +188,7 @@ func newSkillCreateCmd() *cobra.Command {
 }
 
 func newSkillImportCmd() *cobra.Command {
-	var name string
+	var name, description string
 	cmd := &cobra.Command{
 		Use:   "import <path/to/SKILL.md>",
 		Short: "Create a skill from a local SKILL.md file",
@@ -197,13 +201,16 @@ func newSkillImportCmd() *cobra.Command {
 			}
 
 			if name == "" {
-				// Derive name from filename
-				base := strings.TrimSuffix(filePath, ".md")
-				base = strings.TrimSuffix(base, ".MD")
-				parts := strings.Split(base, "/")
-				name = strings.ToLower(parts[len(parts)-1])
-				name = strings.ReplaceAll(name, " ", "-")
-				name = strings.ReplaceAll(name, "_", "-")
+				name = deriveSkillImportName(filePath, data)
+				if name == "" {
+					return fmt.Errorf("could not derive a skill name from %s; pass --name", filePath)
+				}
+			}
+			if description == "" {
+				description = deriveSkillImportDescription(data)
+			}
+			if description == "" {
+				description = fmt.Sprintf("Imported from %s", filePath)
 			}
 
 			c := newClientFromCmd(cmd)
@@ -211,7 +218,7 @@ func newSkillImportCmd() *cobra.Command {
 				"name":      name,
 				"namespace": c.Namespace,
 				"spec": map[string]any{
-					"description": fmt.Sprintf("Imported from %s", filePath),
+					"description": description,
 					"content": map[string]any{
 						"inline": string(data),
 					},
@@ -238,8 +245,178 @@ func newSkillImportCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&name, "name", "", "Override skill name (default: derived from filename)")
+	cmd.Flags().StringVar(&name, "name", "", "Override skill name (default: the SKILL.md H1 heading, then the parent directory of a SKILL.md, then the filename)")
+	cmd.Flags().StringVar(&description, "description", "", "Override skill description (default: the SKILL.md \"## Description\" section)")
 	return cmd
+}
+
+// deriveSkillImportName picks a Kubernetes-safe skill name for an imported
+// SKILL.md: the H1 heading when present, otherwise the parent directory when
+// the file itself is the conventional SKILL.md, otherwise the file name.
+func deriveSkillImportName(filePath string, data []byte) string {
+	frontmatter, body := splitSkillFrontmatter(data)
+	if name := sanitizeSkillName(frontmatter["name"]); name != "" {
+		return name
+	}
+	if heading := skillMarkdownHeading(body); heading != "" {
+		if name := sanitizeSkillName(heading); name != "" {
+			return name
+		}
+	}
+	cleaned := filepath.Clean(filePath)
+	base := filepath.Base(cleaned)
+	stem := strings.TrimSuffix(strings.TrimSuffix(base, ".md"), ".MD")
+	if strings.EqualFold(stem, "skill") {
+		if parent := filepath.Base(filepath.Dir(cleaned)); parent != "." && parent != string(filepath.Separator) && parent != "" {
+			if name := sanitizeSkillName(parent); name != "" {
+				return name
+			}
+		}
+	}
+	return sanitizeSkillName(stem)
+}
+
+// deriveSkillImportDescription returns the first paragraph under a
+// "## Description" heading, or the first non-heading paragraph when the file
+// has no description section.
+func deriveSkillImportDescription(data []byte) string {
+	frontmatter, body := splitSkillFrontmatter(data)
+	if description := truncateSkillDescription(frontmatter["description"]); description != "" {
+		return description
+	}
+	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
+	inDescription := false
+	firstParagraph := ""
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "#") {
+			title := strings.ToLower(strings.TrimSpace(strings.TrimLeft(line, "#")))
+			inDescription = title == "description"
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		if inDescription {
+			return truncateSkillDescription(line)
+		}
+		if firstParagraph == "" {
+			firstParagraph = line
+		}
+	}
+	return truncateSkillDescription(firstParagraph)
+}
+
+func skillMarkdownHeading(data []byte) string {
+	for raw := range strings.SplitSeq(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if heading, ok := strings.CutPrefix(line, "# "); ok {
+			return strings.TrimSpace(heading)
+		}
+		return ""
+	}
+	return ""
+}
+
+// sanitizeSkillName lowercases and collapses a free-form label into a
+// DNS-1123 label (a-z, 0-9, and interior dashes).
+func sanitizeSkillName(value string) string {
+	var b strings.Builder
+	lastDash := true
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	name := strings.Trim(b.String(), "-")
+	if len(name) > 63 {
+		name = strings.Trim(name[:63], "-")
+	}
+	return name
+}
+
+func truncateSkillDescription(value string) string {
+	const maxLen = 256
+	value = strings.TrimSpace(value)
+	if len(value) <= maxLen {
+		return value
+	}
+	// Cut on a rune boundary so a multibyte character crossing the limit
+	// cannot become invalid UTF-8 in the stored description.
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(value[:cut])
+}
+
+// splitSkillFrontmatter separates a leading YAML frontmatter block
+// (---\nkey: value\n---) from the Markdown body. Only simple scalar
+// `key: value` lines are read; quoted values are unquoted.
+func splitSkillFrontmatter(data []byte) (map[string]string, []byte) {
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	fields := map[string]string{}
+	if !strings.HasPrefix(text, "---\n") {
+		return fields, data
+	}
+	rest := text[len("---\n"):]
+	before, after, ok := strings.Cut(rest, "\n---")
+	if !ok {
+		return fields, data
+	}
+	// Parse the block as YAML so folded (`>-`) and literal (`|`) block
+	// scalars, multi-line flow scalars, and quoting are all honoured;
+	// only top-level scalar values are kept. A block that is not valid
+	// YAML falls back to the simple `key: value` line reader.
+	var parsed map[string]any
+	if err := sigsyaml.Unmarshal([]byte(before), &parsed); err == nil {
+		for key, value := range parsed {
+			if scalar, ok := skillFrontmatterScalar(value); ok && strings.TrimSpace(key) != "" && scalar != "" {
+				fields[strings.TrimSpace(key)] = scalar
+			}
+		}
+	} else {
+		for line := range strings.SplitSeq(before, "\n") {
+			key, value, ok := strings.Cut(line, ":")
+			if !ok {
+				continue
+			}
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
+				value = value[1 : len(value)-1]
+			}
+			if key != "" && value != "" {
+				fields[key] = value
+			}
+		}
+	}
+	body := after
+	body = strings.TrimPrefix(body, "\n")
+	return fields, []byte(body)
+}
+
+// skillFrontmatterScalar renders a parsed frontmatter value as trimmed text
+// when it is a scalar; lists and maps are not usable as name/description.
+func skillFrontmatterScalar(value any) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v), true
+	case bool, int, int64, float64:
+		return strings.TrimSpace(fmt.Sprint(v)), true
+	default:
+		return "", false
+	}
 }
 
 func newSkillUpdateCmd() *cobra.Command {
@@ -311,6 +488,11 @@ func newSkillInitCmd() *cobra.Command {
 			}
 			if name == "" {
 				name = "new-skill"
+				if dir != "." {
+					if derived := sanitizeSkillName(filepath.Base(filepath.Clean(dir))); derived != "" {
+						name = derived
+					}
+				}
 			}
 			if description == "" {
 				description = "Describe when and how to use this skill."

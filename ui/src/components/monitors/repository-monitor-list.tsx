@@ -4,22 +4,16 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ListAccessError } from '@/components/ui/list-access-error'
 import { PageHeader } from '@/components/layout/page-header'
 import { useRepositoryMonitors, useRunRepositoryMonitor } from '@/hooks/use-monitors'
 import type { RepositoryMonitor } from '@/schemas/monitor'
 import { repositoryMonitorDisplayName } from './repository-monitor-display'
-
-function timeAgo(ts?: string) {
-  if (!ts) return 'Never'
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(ts).getTime()) / 1000))
-  if (seconds < 60) return `${seconds}s ago`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  return `${Math.floor(seconds / 86400)}d ago`
-}
+import { timeAgo } from '@/lib/time'
 
 export function RepositoryMonitorList() {
-  const { data, isLoading } = useRepositoryMonitors()
+  const { data, isLoading, error } = useRepositoryMonitors()
+  const monitors = error ? [] : (data?.items ?? [])
 
   return (
     <div className="space-y-4">
@@ -48,7 +42,9 @@ export function RepositoryMonitorList() {
             </Card>
           ))}
         </div>
-      ) : (data?.items ?? []).length === 0 ? (
+      ) : error ? (
+        <Card><CardContent className="pt-6"><ListAccessError error={error} resource="repository monitors" /></CardContent></Card>
+      ) : monitors.length === 0 ? (
         <Card>
           <CardContent className="space-y-4 py-12 text-center">
             <div className="space-y-1">
@@ -65,7 +61,7 @@ export function RepositoryMonitorList() {
         </Card>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
-          {(data?.items ?? []).map((monitor) => (
+          {monitors.map((monitor) => (
             <RepositoryMonitorCard key={monitor.metadata.name} monitor={monitor} />
           ))}
         </div>
@@ -107,7 +103,7 @@ function RepositoryMonitorCard({ monitor }: { monitor: RepositoryMonitor }) {
             <span>Active repairs: <span className="font-medium text-foreground">{status?.activeRepairs ?? 0}</span></span>
           </div>
           <div>Open PRs: <span className="font-medium text-foreground">{status?.openPullRequests ?? 0}</span></div>
-          <div>Last run: <span className="font-medium text-foreground">{timeAgo(status?.lastRunTime ?? status?.lastSuccessfulRunTime)}</span></div>
+          <div>Last run: <span className="font-medium text-foreground">{timeAgo(status?.lastRunTime ?? status?.lastSuccessfulRunTime, { empty: 'Never' })}</span></div>
         </div>
         <div className="flex items-center justify-between">
           <Link to="/monitors/$monitorId" params={{ monitorId: monitor.metadata.name }}>

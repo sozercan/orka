@@ -54,7 +54,7 @@ describe('SessionList', () => {
     await waitFor(() => {
       expect(screen.getByText('Not authorized to view sessions')).toBeInTheDocument()
     })
-    expect(screen.getByText(/read permission \(not authorized\)/)).toBeInTheDocument()
+    expect(screen.getByText(/read permission for sessions \(not authorized\)/)).toBeInTheDocument()
     expect(screen.queryByText('No sessions found.')).not.toBeInTheDocument()
     expect(screen.queryByText(/"code":403/)).not.toBeInTheDocument()
   })
@@ -67,7 +67,8 @@ describe('SessionList', () => {
     )
     render(<SessionList />)
     await waitFor(() => {
-      expect(screen.getByText('Could not load sessions: invalid namespace')).toBeInTheDocument()
+      expect(screen.getByText('Could not load sessions')).toBeInTheDocument()
+      expect(screen.getByText('invalid namespace')).toBeInTheDocument()
     })
   })
 

@@ -3,10 +3,8 @@ name: Lint
 on:
   workflow_dispatch:
   push:
-    # PR branches are linted by the pull_request event, whose patch-based
-    # only-new-issues filter works. A push-event run on a fresh branch has no
-    # before-SHA, the compare API 404s, and the action falls back to
-    # unfiltered repo-wide linting that fails on pre-existing findings.
+    # PR branches are linted by the pull_request event. Keep push coverage on
+    # main without running the same branch change twice.
     branches:
       - main
     paths-ignore:
@@ -36,6 +34,8 @@ jobs:
     steps:
       - name: Clone the code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -51,7 +51,9 @@ jobs:
         with:
           version: v2.13.1
           install-mode: goinstall
-          only-new-issues: true
+          # GitHub refuses REST PR diffs over 20,000 lines. Compare revisions
+          # locally so large PRs still filter out pre-existing lint findings.
+          args: --new-from-rev=${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}
 
   ui-lint:
     name: UI Lint

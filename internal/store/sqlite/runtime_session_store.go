@@ -11,18 +11,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/orka-agents/orka/internal/harness"
 	"github.com/orka-agents/orka/internal/store"
-)
-
-const (
-	defaultRuntimeSessionLimit = 50
-	maxRuntimeSessionLimit     = 200
 )
 
 var _ harness.RuntimeSessionStore = (*Store)(nil)
@@ -59,76 +52,6 @@ func (s *Store) GetRuntimeSession(ctx context.Context, namespace string, id harn
 		return nil, err
 	}
 	return &session, nil
-}
-
-// ListRuntimeSessions returns RuntimeSessions matching filter, ordered by most recent update first.
-func (s *Store) ListRuntimeSessions(ctx context.Context, filter harness.RuntimeSessionFilter) ([]harness.RuntimeSession, string, error) {
-	filter, limit, offset, err := validateRuntimeSessionFilter(filter)
-	if err != nil {
-		return nil, "", err
-	}
-
-	query := strings.Builder{}
-	query.WriteString(runtimeSessionSelectSQL())
-	clauses := []string{"namespace = ?"}
-	args := []any{filter.Namespace}
-	addClause := func(clause string, arg any) {
-		clauses = append(clauses, clause)
-		args = append(args, arg)
-	}
-	if filter.SessionName != "" {
-		addClause("session_name = ?", filter.SessionName)
-	}
-	if filter.ActiveTask != "" {
-		addClause("active_task = ?", filter.ActiveTask)
-	}
-	if filter.AgentName != "" {
-		addClause("agent_name = ?", filter.AgentName)
-	}
-	if filter.Provider != "" {
-		addClause("provider = ?", string(filter.Provider))
-	}
-	if len(filter.States) > 0 {
-		placeholders := make([]string, 0, len(filter.States))
-		for _, state := range filter.States {
-			placeholders = append(placeholders, "?")
-			args = append(args, string(state))
-		}
-		clauses = append(clauses, "state IN ("+strings.Join(placeholders, ",")+")")
-	} else if !filter.IncludeDeleted {
-		addClause("state <> ?", string(harness.RuntimeSessionStateDeleted))
-	}
-	if len(filter.CleanupPolicies) > 0 {
-		placeholders := make([]string, 0, len(filter.CleanupPolicies))
-		for _, policy := range filter.CleanupPolicies {
-			placeholders = append(placeholders, "?")
-			args = append(args, string(policy))
-		}
-		clauses = append(clauses, "cleanup_policy IN ("+strings.Join(placeholders, ",")+")")
-	}
-	query.WriteString(" WHERE ")
-	query.WriteString(strings.Join(clauses, " AND "))
-	query.WriteString(" ORDER BY updated_at DESC, id ASC LIMIT ? OFFSET ?")
-	args = append(args, limit, offset)
-
-	rows, err := s.db.QueryContext(ctx, query.String(), args...)
-	if err != nil {
-		return nil, "", err
-	}
-	defer rows.Close() //nolint:errcheck
-
-	sessions := []harness.RuntimeSession{}
-	for rows.Next() {
-		session, err := scanRuntimeSession(rows)
-		if err != nil {
-			return nil, "", err
-		}
-		sessions = append(sessions, session)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", err
-	}
-	return sessions, nextOffsetCursor(offset, len(sessions), limit), nil
 }
 
 // TransitionRuntimeSession validates and persists an optimistic RuntimeSession state transition.
@@ -212,105 +135,6 @@ func (s *Store) DeleteRuntimeSession(ctx context.Context, namespace string, id h
 		return err
 	}
 	return store.ValidationErrorf("runtime session %s/%s must be %s before physical deletion (current state: %s)", namespace, id, harness.RuntimeSessionStateDeleted, session.State)
-}
-
-// ReclaimRuntimeSessionsForTask atomically reclaims the exact legacy runtime
-// rows authorized by a sealed inventory/adjudication consumer. The full
-// active-task set is compared inside the transaction so a late or changed row
-// fails closed instead of being swept under a name-only match.
-func (s *Store) ReclaimRuntimeSessionsForTask(
-	ctx context.Context,
-	namespace string,
-	activeTask string,
-	expected []harness.RuntimeSession,
-) error {
-	namespace = strings.TrimSpace(namespace)
-	activeTask = strings.TrimSpace(activeTask)
-	if namespace == "" || activeTask == "" {
-		return store.ValidationErrorf("runtime session namespace and active task are required")
-	}
-	expected = append([]harness.RuntimeSession(nil), expected...)
-	sort.Slice(expected, func(i, j int) bool { return expected[i].ID < expected[j].ID })
-	for i := range expected {
-		if expected[i].Owner.Namespace != namespace || expected[i].Owner.ActiveTask != activeTask {
-			return store.ValidationErrorf("expected runtime session %q does not match the reclamation owner", expected[i].ID)
-		}
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.QueryContext(ctx, runtimeSessionSelectSQL()+
-		` WHERE namespace = ? AND active_task = ? ORDER BY id`, namespace, activeTask)
-	if err != nil {
-		return err
-	}
-	current := make([]harness.RuntimeSession, 0, len(expected))
-	for rows.Next() {
-		session, scanErr := scanRuntimeSession(rows)
-		if scanErr != nil {
-			_ = rows.Close()
-			return scanErr
-		}
-		current = append(current, session)
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if !reflect.DeepEqual(current, expected) {
-		return fmt.Errorf("%w: legacy runtime session set changed before reclamation", store.ErrConflict)
-	}
-
-	now := time.Now().UTC()
-	for i := range current {
-		session := current[i]
-		if session.State != harness.RuntimeSessionStateDeleted {
-			if !harness.RuntimeSessionTransitionAllowed(session.State, harness.RuntimeSessionStateDeleting) {
-				return fmt.Errorf("%w: runtime session %s state %s cannot enter deletion",
-					store.ErrConflict, session.ID, session.State)
-			}
-			result, updateErr := tx.ExecContext(ctx,
-				`UPDATE runtime_sessions SET state = ?, active_task = '', updated_at = ?
-				 WHERE namespace = ? AND id = ? AND state = ? AND active_task = ?`,
-				string(harness.RuntimeSessionStateDeleting), now, namespace, string(session.ID),
-				string(session.State), activeTask,
-			)
-			if updateErr != nil {
-				return updateErr
-			}
-			if err := ensureRowsAffected(result); err != nil {
-				return err
-			}
-			result, updateErr = tx.ExecContext(ctx,
-				`UPDATE runtime_sessions SET state = ?, updated_at = ?
-				 WHERE namespace = ? AND id = ? AND state = ?`,
-				string(harness.RuntimeSessionStateDeleted), now, namespace, string(session.ID),
-				string(harness.RuntimeSessionStateDeleting),
-			)
-			if updateErr != nil {
-				return updateErr
-			}
-			if err := ensureRowsAffected(result); err != nil {
-				return err
-			}
-		}
-		result, deleteErr := tx.ExecContext(ctx,
-			`DELETE FROM runtime_sessions WHERE namespace = ? AND id = ? AND state = ?`,
-			namespace, string(session.ID), string(harness.RuntimeSessionStateDeleted),
-		)
-		if deleteErr != nil {
-			return deleteErr
-		}
-		if err := ensureRowsAffected(result); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }
 
 type runtimeSessionQueryable interface {
@@ -421,33 +245,6 @@ func normalizeRuntimeSessionTransition(transition harness.RuntimeSessionTransiti
 		transition.UpdatedAt = transition.UpdatedAt.UTC()
 	}
 	return transition, nil
-}
-
-func validateRuntimeSessionFilter(filter harness.RuntimeSessionFilter) (harness.RuntimeSessionFilter, int, int, error) {
-	filter.Namespace = strings.TrimSpace(filter.Namespace)
-	if filter.Namespace == "" {
-		return harness.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("runtime session namespace is required")
-	}
-	filter.SessionName = strings.TrimSpace(filter.SessionName)
-	filter.ActiveTask = strings.TrimSpace(filter.ActiveTask)
-	filter.AgentName = strings.TrimSpace(filter.AgentName)
-	filter.Provider = harness.ProviderKind(strings.TrimSpace(string(filter.Provider)))
-	for _, state := range filter.States {
-		if !harness.IsKnownRuntimeSessionState(state) {
-			return harness.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("unsupported runtime session state %q", state)
-		}
-	}
-	for _, policy := range filter.CleanupPolicies {
-		if !harness.IsKnownRuntimeCleanupPolicy(policy) {
-			return harness.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("unsupported runtime cleanup policy %q", policy)
-		}
-	}
-	offset, err := parseOffsetCursor(filter.Cursor)
-	if err != nil {
-		return harness.RuntimeSessionFilter{}, 0, 0, store.ValidationErrorf("invalid runtime session cursor: %v", err)
-	}
-	limit := boundedLimit(filter.Limit, defaultRuntimeSessionLimit, maxRuntimeSessionLimit)
-	return filter, limit, offset, nil
 }
 
 func normalizeRuntimeSessionKey(namespace string, id harness.RuntimeSessionID) (string, harness.RuntimeSessionID, error) {

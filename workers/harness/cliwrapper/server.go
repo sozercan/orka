@@ -58,6 +58,7 @@ type Server struct {
 	configuredExactRedactionValues []string
 
 	turnRegistry *turnRegistry
+	ledgerMu     sync.RWMutex
 	ledger       *ledger.Ledger
 
 	healthMu           sync.RWMutex
@@ -182,7 +183,12 @@ func (s *Server) reclaimSettledTurns(ctx context.Context) error {
 // Close releases the durable wrapper admission ledger. The HTTP server must be
 // stopped before calling Close.
 func (s *Server) Close() error {
-	if s == nil || s.ledger == nil {
+	if s == nil {
+		return nil
+	}
+	s.ledgerMu.Lock()
+	defer s.ledgerMu.Unlock()
+	if s.ledger == nil {
 		return nil
 	}
 	err := s.ledger.Close()
@@ -231,6 +237,17 @@ func (s *Server) finishTurn(turn *turnState) {
 	if !s.childCredentialProcessesHealthy() {
 		return
 	}
+	if !s.persistTurnTerminal(turn) {
+		return
+	}
+	turn.close()
+	s.turnRegistry.finishActive()
+	s.scheduleTurnEviction(turn)
+}
+
+func (s *Server) persistTurnTerminal(turn *turnState) bool {
+	s.ledgerMu.RLock()
+	defer s.ledgerMu.RUnlock()
 	if s.ledger != nil {
 		receipt, outcomeUnknown := s.durableTerminalReceipt(turn)
 		var durableOutput *ledger.TurnOutput
@@ -241,7 +258,7 @@ func (s *Server) finishTurn(turn *turnState) {
 					err = errors.New("terminal output payload is missing")
 				}
 				s.setTerminalLedgerError(err)
-				return
+				return false
 			}
 			durableOutput = &ledger.TurnOutput{Ref: localOutputRef, Data: data}
 		}
@@ -253,13 +270,11 @@ func (s *Server) finishTurn(turn *turnState) {
 			// unhealthy readiness response surfaces the failure without leaking
 			// ledger details; an operator can restart into conservative recovery.
 			s.setTerminalLedgerError(err)
-			return
+			return false
 		}
 		s.setTerminalLedgerError(nil)
 	}
-	turn.close()
-	s.turnRegistry.finishActive()
-	s.scheduleTurnEviction(turn)
+	return true
 }
 
 func (s *Server) markDurableTurnAccepted(ctx context.Context, turn *turnState) error {

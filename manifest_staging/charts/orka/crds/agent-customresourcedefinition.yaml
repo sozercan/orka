@@ -1317,18 +1317,6 @@ spec:
                 required:
                 - name
                 type: object
-              rateLimit:
-                description: RateLimit defines rate limiting configuration
-                properties:
-                  requestsPerMinute:
-                    description: RequestsPerMinute limits requests per minute
-                    format: int32
-                    type: integer
-                  tokensPerMinute:
-                    description: TokensPerMinute limits tokens per minute
-                    format: int64
-                    type: integer
-                type: object
               resources:
                 description: Resources defines the resource limits for tasks using
                   this agent
@@ -1490,18 +1478,6 @@ spec:
                     format: int32
                     minimum: 1
                     type: integer
-                  persistence:
-                    default: configmap
-                    description: Persistence defines the storage backend (configmap,
-                      pvc, none)
-                    enum:
-                    - configmap
-                    - pvc
-                    - none
-                    type: string
-                  ttl:
-                    description: TTL defines the session time-to-live (auto-expire)
-                    type: string
                 type: object
               skills:
                 description: Skills lists the default skills for this agent

@@ -1,12 +1,13 @@
 ---
 slug: /ui
+description: "The dashboard built into the controller: what each page shows and how to reach it."
 ---
 
-# Web Dashboard
+# Web dashboard
 
 Orka includes a built-in React web dashboard embedded into the controller binary. No separate frontend deployment is needed.
 
-## Tech Stack
+## Tech stack
 
 | Layer | Technology |
 |-------|-----------|
@@ -141,7 +142,7 @@ make ui-test-coverage  # or: cd ui && bun run test:coverage
 make ui-lint       # or: cd ui && bun run lint
 ```
 
-## Directory Structure
+## Directory structure
 
 ```
 ui/

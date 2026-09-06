@@ -181,27 +181,6 @@ func (s *Store) SetMemoryDisabled(ctx context.Context, namespace, id string, dis
 	return ensureRowsAffected(res)
 }
 
-// MarkMemoriesRecalled records recall statistics for memories injected into a prompt.
-func (s *Store) MarkMemoriesRecalled(ctx context.Context, namespace string, ids []string) error {
-	ids = compactStrings(ids)
-	if namespace == "" || len(ids) == 0 {
-		return nil
-	}
-	placeholders := make([]string, 0, len(ids))
-	args := []any{namespace}
-	for _, id := range ids {
-		placeholders = append(placeholders, "?")
-		args = append(args, id)
-	}
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE memories
-		 SET last_recalled_at = CURRENT_TIMESTAMP, recalled_count = recalled_count + 1
-		 WHERE namespace = ? AND id IN (`+strings.Join(placeholders, ",")+")",
-		args...,
-	)
-	return err
-}
-
 // SearchTranscript searches transcript content and returns compact snippets.
 func (s *Store) SearchTranscript(ctx context.Context, filter store.TranscriptSearchFilter) ([]store.TranscriptSearchResult, error) {
 	if strings.TrimSpace(filter.Namespace) == "" {
@@ -529,6 +508,9 @@ func (s *Store) applyMemoryProposalOnce(ctx context.Context, apply store.MemoryP
 		if proposal.AppliedMemoryID == "" {
 			return nil, fmt.Errorf("applied proposal is missing applied memory id")
 		}
+		if err := authorizeExistingProposalMemory(ctx, apply, proposal.Namespace, proposal.AppliedMemoryID); err != nil {
+			return nil, err
+		}
 		memory, err := scanMemory(tx.QueryRowContext(ctx, selectMemorySQL()+` WHERE namespace = ? AND id = ?`, proposal.Namespace, proposal.AppliedMemoryID))
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("applied proposal references missing memory")
@@ -555,6 +537,9 @@ func (s *Store) applyMemoryProposalOnce(ctx context.Context, apply store.MemoryP
 
 	existing, err := scanMemory(tx.QueryRowContext(ctx, selectMemorySQL()+` WHERE namespace = ? AND source_proposal_id = ?`, apply.Namespace, apply.ID))
 	if err == nil {
+		if err := authorizeExistingProposalMemory(ctx, apply, existing.Namespace, existing.ID); err != nil {
+			return nil, err
+		}
 		now := time.Now()
 		res, err := tx.ExecContext(ctx,
 			`UPDATE memory_proposals
@@ -614,6 +599,9 @@ func (s *Store) applyMemoryProposalOnce(ctx context.Context, apply store.MemoryP
 		if lookupErr != nil {
 			return nil, err
 		}
+		if err := authorizeExistingProposalMemory(ctx, apply, existing.Namespace, existing.ID); err != nil {
+			return nil, err
+		}
 		if err := markMemoryProposalApplied(ctx, tx, apply, existing.ID, true); err != nil {
 			return nil, err
 		}
@@ -631,6 +619,13 @@ func (s *Store) applyMemoryProposalOnce(ctx context.Context, apply store.MemoryP
 	}
 	committed = true
 	return memory, nil
+}
+
+func authorizeExistingProposalMemory(ctx context.Context, apply store.MemoryProposalApply, namespace, id string) error {
+	if apply.AuthorizeExistingMemory == nil {
+		return nil
+	}
+	return apply.AuthorizeExistingMemory(ctx, namespace, id)
 }
 
 func markMemoryProposalApplied(ctx context.Context, tx *sql.Tx, apply store.MemoryProposalApply, memoryID string, allowExistingAppliedID bool) error {

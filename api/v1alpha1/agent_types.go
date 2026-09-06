@@ -55,10 +55,6 @@ type AgentSpec struct {
 	// +optional
 	Session *SessionConfig `json:"session,omitempty"`
 
-	// RateLimit defines rate limiting configuration
-	// +optional
-	RateLimit *RateLimitConfig `json:"rateLimit,omitempty"`
-
 	// Coordination enables agent-to-agent delegation
 	// +optional
 	Coordination *CoordinationConfig `json:"coordination,omitempty"`
@@ -244,32 +240,11 @@ type ToolReference struct {
 
 // SessionConfig defines session behavior defaults
 type SessionConfig struct {
-	// Persistence defines the storage backend (configmap, pvc, none)
-	// +kubebuilder:validation:Enum=configmap;pvc;none
-	// +kubebuilder:default=configmap
-	// +optional
-	Persistence string `json:"persistence,omitempty"`
-
-	// TTL defines the session time-to-live (auto-expire)
-	// +optional
-	TTL *metav1.Duration `json:"ttl,omitempty"`
-
 	// MaxMessages is the maximum messages to load from session
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=50
 	// +optional
 	MaxMessages int32 `json:"maxMessages,omitempty"`
-}
-
-// RateLimitConfig defines rate limiting for an agent
-type RateLimitConfig struct {
-	// RequestsPerMinute limits requests per minute
-	// +optional
-	RequestsPerMinute *int32 `json:"requestsPerMinute,omitempty"`
-
-	// TokensPerMinute limits tokens per minute
-	// +optional
-	TokensPerMinute *int64 `json:"tokensPerMinute,omitempty"`
 }
 
 // CoordinationConfig enables agent-to-agent delegation

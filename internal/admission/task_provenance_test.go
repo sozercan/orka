@@ -30,6 +30,7 @@ const (
 	trustedControllerUser                   = "system:serviceaccount:orka-system:orka-controller-manager"
 	trustedWorkerUser                       = "system:serviceaccount:tenant-a:orka-ai-worker"
 	admissionTestTransactionID              = "txn-1"
+	admissionTestParentTaskUID              = "parent-task-uid"
 	admissionTestWorkspaceSettledAnnotation = "acp.workspace.orka.ai/workspace-settled"
 	admissionWorkspaceUIDKey                = "acp.workspace.orka.ai/execution-workspace-uid"
 	admissionWorkspaceLinkKey               = "acp.workspace.orka.ai/execution-workspace"
@@ -81,6 +82,12 @@ func TestTaskProvenanceValidator_Create(t *testing.T) {
 			user:     untrustedUsername,
 			task:     withTraceAnnotation(newAdmissionTestTask(), "00-"+strings.Repeat("1", 32)+"-"+strings.Repeat("2", 16)+"-01"),
 			contains: labels.AnnotationTraceParent,
+		},
+		{
+			name:     "untrusted create with parent task UID denied",
+			user:     untrustedUsername,
+			task:     withParentTaskUID(newAdmissionTestTask()),
+			contains: labels.AnnotationParentTaskUID,
 		},
 		{
 			name:     "untrusted create with workspace settlement marker denied",
@@ -135,9 +142,15 @@ func TestTaskProvenanceValidator_Create(t *testing.T) {
 			contains: admissionWorkspaceLinkKey,
 		},
 		{
+			name:     "trusted worker with parent task UID denied",
+			user:     trustedWorkerUser,
+			task:     withParentTaskUID(newAdmissionTestTask()),
+			contains: labels.AnnotationParentTaskUID,
+		},
+		{
 			name:    "trusted controller can create with provenance",
 			user:    trustedControllerUser,
-			task:    withTransaction(withRequestedBy(newAdmissionTestTask())),
+			task:    withParentTaskUID(withTransaction(withRequestedBy(newAdmissionTestTask()))),
 			allowed: true,
 		},
 		{
@@ -217,10 +230,24 @@ func TestTaskProvenanceValidator_Update(t *testing.T) {
 			contains: labels.AnnotationTraceParent,
 		},
 		{
+			name:     "untrusted update adding parent task UID denied",
+			user:     untrustedUsername,
+			oldTask:  oldTask,
+			newTask:  withParentTaskUID(oldTask.DeepCopy()),
+			contains: labels.AnnotationParentTaskUID,
+		},
+		{
+			name:     "trusted worker update adding parent task UID denied",
+			user:     trustedWorkerUser,
+			oldTask:  oldTask,
+			newTask:  withParentTaskUID(oldTask.DeepCopy()),
+			contains: labels.AnnotationParentTaskUID,
+		},
+		{
 			name:    "trusted controller can update provenance",
 			user:    trustedControllerUser,
 			oldTask: oldTask,
-			newTask: withTransaction(withRequestedBy(oldTask.DeepCopy())),
+			newTask: withParentTaskUID(withTransaction(withRequestedBy(oldTask.DeepCopy()))),
 			allowed: true,
 		},
 		{
@@ -374,6 +401,14 @@ func withTraceAnnotation(task *corev1alpha1.Task, traceparent string) *corev1alp
 	}
 	task.Annotations[labels.AnnotationTraceParent] = traceparent
 	task.Annotations[labels.AnnotationTraceBaggage] = "tenant=untrusted"
+	return task
+}
+
+func withParentTaskUID(task *corev1alpha1.Task) *corev1alpha1.Task {
+	if task.Annotations == nil {
+		task.Annotations = map[string]string{}
+	}
+	task.Annotations[labels.AnnotationParentTaskUID] = admissionTestParentTaskUID
 	return task
 }
 

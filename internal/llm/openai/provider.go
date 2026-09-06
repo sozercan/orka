@@ -35,15 +35,18 @@ const (
 )
 
 const (
-	eventTypeFunctionCall   = "function_call"
-	providerTypeOpenAI      = "openai"
-	providerTypeAzureOpenAI = "azure-openai"
-	stopReasonCompleted     = "completed"
-	stopReasonFunctionCall  = "function_call"
-	stopReasonIncomplete    = "incomplete"
-	stopReasonRefusal       = "refusal"
-	stopReasonStop          = "stop"
-	stopReasonToolCalls     = "tool_calls"
+	eventTypeFunctionCall           = "function_call"
+	providerTypeOpenAI              = "openai"
+	providerTypeAzureOpenAI         = "azure-openai"
+	eventTypeResponseIncomplete     = "response.incomplete"
+	incompleteReasonMaxOutputTokens = "max_output_tokens"
+	stopReasonCompleted             = "completed"
+	stopReasonFunctionCall          = "function_call"
+	stopReasonIncomplete            = "incomplete"
+	stopReasonLength                = "length"
+	stopReasonRefusal               = "refusal"
+	stopReasonStop                  = "stop"
+	stopReasonToolCalls             = "tool_calls"
 )
 
 func init() {
@@ -384,7 +387,18 @@ func (p *Provider) completeResponses(ctx context.Context, req *llm.CompletionReq
 		}
 	}
 	result.StopReason = normalizeResponsesStopReason(result.StopReason, resp.Output, false)
+	result.StopReason = normalizeResponsesIncompleteStopReason(result.StopReason, resp.IncompleteDetails.Reason)
 	return result, nil
+}
+
+// normalizeResponsesIncompleteStopReason maps output-budget exhaustion to the
+// provider-neutral token-limit reason while preserving other incomplete states.
+func normalizeResponsesIncompleteStopReason(stopReason, incompleteReason string) string {
+	if incompleteReason == incompleteReasonMaxOutputTokens &&
+		(stopReason == stopReasonIncomplete || stopReason == eventTypeResponseIncomplete) {
+		return stopReasonLength
+	}
+	return stopReason
 }
 
 func normalizeResponsesStopReason(
@@ -638,6 +652,45 @@ func (t *responseFuncCallTracker) emit(fc *responseFuncCallState, send streamSen
 	return true
 }
 
+func (t *responseFuncCallTracker) hasUnemittedFunctionCall(output []responses.ResponseOutputItemUnion) bool {
+	seen := make(map[*responseFuncCallState]struct{})
+	pending := func(fc *responseFuncCallState) bool {
+		if fc == nil {
+			return false
+		}
+		if _, ok := seen[fc]; ok {
+			return false
+		}
+		seen[fc] = struct{}{}
+		return !fc.emitted
+	}
+	for _, fc := range t.byItemID {
+		if pending(fc) {
+			return true
+		}
+	}
+	for _, fc := range t.byCallID {
+		if pending(fc) {
+			return true
+		}
+	}
+	for _, fc := range t.byOutputIndex {
+		if pending(fc) {
+			return true
+		}
+	}
+	for i, item := range output {
+		if item.Type != eventTypeFunctionCall {
+			continue
+		}
+		fc := t.get(item.ID, int64(i), true, item.CallID)
+		if !fc.emitted {
+			return true
+		}
+	}
+	return false
+}
+
 func streamResponsesEvents(stream responseStream, providerName string, send streamSender) {
 	tracker := newResponseFuncCallTracker()
 	for stream.Next() {
@@ -666,8 +719,16 @@ func handleResponsesStreamEvent(evt responses.ResponseStreamEventUnion, tracker 
 		return handleResponseOutputItem(evt, tracker, send, true)
 	case "response.completed":
 		return handleResponseCompleted(evt, tracker, providerName, send)
-	case "response.failed", "response.incomplete":
-		send(llm.StreamChunk{Done: true, StopReason: evt.Type})
+	case "response.failed":
+		stopReason := normalizeResponsesIncompleteStopReason(evt.Type, evt.Response.IncompleteDetails.Reason)
+		send(llm.StreamChunk{Done: true, StopReason: stopReason})
+		return false
+	case eventTypeResponseIncomplete:
+		stopReason := normalizeResponsesIncompleteStopReason(evt.Type, evt.Response.IncompleteDetails.Reason)
+		if tracker.hasUnemittedFunctionCall(evt.Response.Output) {
+			stopReason = eventTypeResponseIncomplete
+		}
+		send(llm.StreamChunk{Done: true, StopReason: stopReason})
 		return false
 	case "error":
 		send(llm.StreamChunk{Error: &llm.ProviderError{Provider: "openai", Message: evt.Message}, Done: true})

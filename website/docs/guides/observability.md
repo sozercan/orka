@@ -1,5 +1,6 @@
 ---
 slug: /observability
+description: "OpenTelemetry traces, GenAI metrics, and how to follow one task through them."
 ---
 
 # Observability
@@ -31,6 +32,13 @@ work independently.
 For an existing Kubernetes Deployment, set both the controller flag and the
 collector environment. Setting `OTEL_EXPORTER_OTLP_ENDPOINT` alone does not
 enable telemetry:
+
+:::note[These commands assume a Helm install named `orka`]
+That makes the Deployment `orka-controller`. If you installed with
+`kubectl apply -f .../deploy/orka.yaml` it is `orka-controller-manager` instead. See
+[Troubleshooting](../operations/troubleshooting.md#what-is-my-controller-deployment-called).
+:::
+
 
 ```bash
 kubectl patch deployment orka-controller -n orka-system --type=json -p='[
@@ -244,7 +252,7 @@ service:
 For local Jaeger all-in-one, expose its OTLP gRPC endpoint and set:
 
 ```bash
-kubectl set env deployment/orka-controller \
+kubectl -n orka-system set env deployment/orka-controller \
   OTEL_EXPORTER_OTLP_ENDPOINT=jaeger-collector.observability.svc:4317
 ```
 

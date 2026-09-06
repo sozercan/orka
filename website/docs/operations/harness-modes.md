@@ -1,3 +1,7 @@
+---
+description: "Running harness v1 and harness v2 side by side on one cluster without letting them collide."
+---
+
 # Operating harness v1 and v2 on one cluster
 
 Orka can run harness v1 and harness v2 on one Kubernetes cluster as two
@@ -38,11 +42,52 @@ metadata:
 EOF
 ```
 
-A missing or mismatched label fails startup. The claim must be present when the
-namespace is created; do not adopt an unlabeled namespace or relabel one to move
-it between modes.
+:::warning[The label must exist before the controller starts]
+A missing or mismatched `orka.ai/controller-mode` label fails startup. Set it when you create
+the namespace. Do not adopt an unlabeled namespace, and do not relabel one to move it between
+modes — the two harnesses own different resources in it.
+:::
 
 ## Isolation checklist
+
+The two installs share exactly two things: the Kubernetes API server, and one cluster-scoped CRD
+bundle. Everything else is duplicated.
+
+```mermaid
+flowchart TB
+    subgraph shared["Shared — cluster-scoped, one owner"]
+        CRDs["CRD schema bundle<br/><i>applied once, by a platform or GitOps owner</i>"]
+    end
+
+    subgraph v1["Release orka-v1 — namespace orka-v1-system"]
+        direction TB
+        C1["controller<br/><code>mode=harness-v1</code>"]
+        L1["Lease 03b49a10.orka.ai"]
+        S1[("v1 SQLite / PVC")]
+        D1["wrapper Service + ledger"]
+    end
+
+    subgraph v2["Release orka-v2 — namespace orka-v2-system"]
+        direction TB
+        C2["controller<br/><code>mode=harness-v2</code>"]
+        L2["Lease 03b49a10.orka.ai"]
+        S2[("v2 SQLite / PVC")]
+        R2["ACP runtimes<br/><i>namespace orka-v2-runtimes</i>"]
+    end
+
+    CRDs -.->|schema only| v1
+    CRDs -.->|schema only| v2
+
+    v1 x--x|"NetworkPolicy + namespaced RBAC<br/>must forbid this"| v2
+
+    style shared fill:#f3f0ff,stroke:#7048e8
+    style v1 fill:#fff4e6,stroke:#d9822b
+    style v2 fill:#eaf4ff,stroke:#2b7bd9
+```
+
+The leader-election ID is hardcoded to `03b49a10.orka.ai` in both installs, but each Lease lives in
+its own watched namespace — so the two controllers never contend for the same lock, and never
+coordinate over one Task population.
 
 Use different values for every release-owned resource:
 

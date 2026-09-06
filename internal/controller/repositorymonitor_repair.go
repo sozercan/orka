@@ -23,19 +23,20 @@ import (
 )
 
 const (
-	repositoryMonitorRepairPhaseQueued         = "queued"
-	repositoryMonitorRepairPhaseSucceeded      = "succeeded"
-	repositoryMonitorRepairPhaseFailed         = "failed"
-	repositoryMonitorRepairPRBudgetReason      = "repair_pr_budget_exhausted"
-	repositoryMonitorRepairTaskCreateError     = "repair_task_create_failed"
-	repositoryMonitorCommandIntentFix          = "fix"
-	repositoryMonitorUpdateBranchOperation     = "update_branch"
-	repositoryMonitorUpdateBranchSubmitting    = "submitting"
-	repositoryMonitorUpdateBranchTimeout       = 2 * time.Minute
-	repositoryMonitorUpdateBranchTimeoutReason = "timed out waiting for GitHub to update the PR branch"
-	repositoryMonitorUpdateBranchFailure       = "update_branch_failed"
-	repositoryMonitorFieldBaseSHA              = "baseSHA"
-	repositoryMonitorFieldHeadSHA              = "headSHA"
+	repositoryMonitorRepairPhaseQueued              = "queued"
+	repositoryMonitorRepairPhaseSucceeded           = "succeeded"
+	repositoryMonitorRepairPhaseFailed              = "failed"
+	repositoryMonitorRepairPRBudgetReason           = "repair_pr_budget_exhausted"
+	repositoryMonitorRepairTaskCreateError          = "repair_task_create_failed"
+	repositoryMonitorCommandIntentFix               = "fix"
+	repositoryMonitorUpdateBranchOperation          = "update_branch"
+	repositoryMonitorUpdateBranchSubmitting         = "submitting"
+	repositoryMonitorUpdateBranchTimeout            = 2 * time.Minute
+	repositoryMonitorUpdateBranchTimeoutReason      = "timed out waiting for GitHub to update the PR branch"
+	repositoryMonitorUpdateBranchFailure            = "update_branch_failed"
+	repositoryMonitorFieldBaseSHA                   = "baseSHA"
+	repositoryMonitorFieldHeadSHA                   = "headSHA"
+	repositoryMonitorValidationRetryExhaustedReason = "validation_retry_exhausted"
 )
 
 type repositoryMonitorPendingMutationProjectionError struct {
@@ -53,6 +54,123 @@ func (e *repositoryMonitorPendingMutationProjectionError) Unwrap() error {
 
 func pendingMutationProjectionError(projection string, err error) error {
 	return &repositoryMonitorPendingMutationProjectionError{projection: projection, err: err}
+}
+
+type repositoryMonitorRepairValidationRetryState struct {
+	associated bool
+	exhausted  bool
+}
+
+func repositoryMonitorValidationRetryableAfterRepair(status string) bool {
+	switch strings.TrimSpace(status) {
+	case repositoryMonitorValidationStatusFailed, repositoryMonitorValidationStatusUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *RepositoryMonitorReconciler) syncRepositoryMonitorRepairValidationAttempts(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, record *store.ReviewRecord) (repositoryMonitorRepairValidationRetryState, error) {
+	if r == nil || r.Store == nil || monitor == nil || record == nil ||
+		record.Kind != repositoryMonitorPullRequestKind || record.Number == 0 ||
+		strings.TrimSpace(record.HeadSHA) == "" || strings.TrimSpace(record.ValidationStatus) == "" ||
+		strings.TrimSpace(record.ValidationImage) == "" ||
+		strings.TrimSpace(record.ValidationImage) != strings.TrimSpace(monitor.Spec.Validation.Image) {
+		return repositoryMonitorRepairValidationRetryState{}, nil
+	}
+
+	job, err := r.repositoryMonitorRepairJobForValidation(ctx, monitor, record.Number, record.HeadSHA)
+	if err != nil || job == nil {
+		return repositoryMonitorRepairValidationRetryState{}, err
+	}
+	attempts, err := r.repositoryMonitorRepairValidationAttemptCount(ctx, monitor, job)
+	if err != nil {
+		return repositoryMonitorRepairValidationRetryState{}, err
+	}
+	exhausted := repositoryMonitorValidationRetryableAfterRepair(record.ValidationStatus) &&
+		monitor.Spec.Repair.MaxValidationRetries != nil &&
+		attempts > int(*monitor.Spec.Repair.MaxValidationRetries)
+	desiredError := ""
+	if exhausted {
+		desiredError = repositoryMonitorValidationRetryExhaustedReason
+	} else if job.LastError != repositoryMonitorValidationRetryExhaustedReason {
+		desiredError = job.LastError
+	}
+	if job.ValidationAttempts != attempts || job.LastError != desiredError {
+		job.ValidationAttempts = attempts
+		job.LastError = desiredError
+		if err := r.Store.UpdateRepairJob(ctx, job); err != nil {
+			return repositoryMonitorRepairValidationRetryState{}, err
+		}
+	}
+	return repositoryMonitorRepairValidationRetryState{associated: true, exhausted: exhausted}, nil
+}
+
+func (r *RepositoryMonitorReconciler) repositoryMonitorRepairJobForValidation(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, number int64, headSHA string) (*store.RepairJob, error) {
+	cursor := ""
+	for {
+		jobs, next, err := r.Store.ListRepairJobs(ctx, store.RepairJobFilter{
+			Namespace: monitor.Namespace, MonitorName: monitor.Name, PRNumber: number, Limit: 200, Cursor: cursor,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for i := range jobs {
+			job := &jobs[i]
+			if job.Phase == repositoryMonitorRepairPhaseSucceeded && job.CompletedAt != nil &&
+				strings.TrimSpace(job.PushedSHA) == strings.TrimSpace(headSHA) {
+				return job, nil
+			}
+		}
+		if next == "" {
+			return nil, nil
+		}
+		cursor = next
+	}
+}
+
+func (r *RepositoryMonitorReconciler) repositoryMonitorRepairValidationAttemptCount(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, job *store.RepairJob) (int, error) {
+	if job == nil || job.CompletedAt == nil {
+		return 0, nil
+	}
+	attempts := 0
+	cursor := ""
+	for {
+		records, next, err := r.Store.ListReviewRecords(ctx, store.ReviewRecordFilter{
+			Namespace: monitor.Namespace, MonitorName: monitor.Name, Kind: repositoryMonitorPullRequestKind,
+			Number: job.PRNumber, HeadSHA: job.PushedSHA, Limit: 200, Cursor: cursor,
+		})
+		if err != nil {
+			return 0, err
+		}
+		for i := range records {
+			record := &records[i]
+			if record.CreatedAt.Before(*job.CompletedAt) ||
+				strings.TrimSpace(record.ValidationImage) != strings.TrimSpace(monitor.Spec.Validation.Image) ||
+				strings.TrimSpace(record.ValidationStatus) == "" {
+				continue
+			}
+			attempts++
+		}
+		if next == "" {
+			return attempts, nil
+		}
+		cursor = next
+	}
+}
+
+func (r *RepositoryMonitorReconciler) repositoryMonitorRepairValidationRetryState(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, number int64, headSHA string) (repositoryMonitorRepairValidationRetryState, error) {
+	if r == nil || r.Store == nil || monitor == nil {
+		return repositoryMonitorRepairValidationRetryState{}, nil
+	}
+	job, err := r.repositoryMonitorRepairJobForValidation(ctx, monitor, number, headSHA)
+	if err != nil || job == nil {
+		return repositoryMonitorRepairValidationRetryState{}, err
+	}
+	exhausted := monitor.Spec.Repair.MaxValidationRetries != nil &&
+		job.LastError == repositoryMonitorValidationRetryExhaustedReason &&
+		job.ValidationAttempts > int(*monitor.Spec.Repair.MaxValidationRetries)
+	return repositoryMonitorRepairValidationRetryState{associated: true, exhausted: exhausted}, nil
 }
 
 //nolint:gocyclo // PR command safety gates are intentionally explicit.

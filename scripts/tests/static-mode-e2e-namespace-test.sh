@@ -269,7 +269,15 @@ if [[ ! "${live_tls_line}" =~ ^[0-9]+$ || ! "${live_runtime_line}" =~ ^[0-9]+$ |
   exit 1
 fi
 
-grep -Fq 'agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v0.5.5}"' "${root}/scripts/live-agent-sandbox-e2e.sh"
+grep -Fq 'agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v1.0.0}"' "${root}/scripts/live-agent-sandbox-e2e.sh"
+grep -Fq 'e2e_kubeconfig="${work_dir}/kubeconfig"' "${root}/scripts/live-agent-sandbox-e2e.sh"
+grep -Fq 'export KUBECONFIG="${e2e_kubeconfig}"' "${root}/scripts/live-agent-sandbox-e2e.sh"
+grep -Fq 'run kind export kubeconfig --name "${kind_cluster}" --kubeconfig "${e2e_kubeconfig}"' "${root}/scripts/live-agent-sandbox-e2e.sh"
+grep -Fq 'run kind create cluster --name "${kind_cluster}" --config "${kind_config}" --kubeconfig "${e2e_kubeconfig}"' "${root}/scripts/live-agent-sandbox-e2e.sh"
+if grep -Fq 'kubectl config use-context' "${root}/scripts/live-agent-sandbox-e2e.sh"; then
+  echo 'live agent-sandbox E2E must not mutate the user kubeconfig context' >&2
+  exit 1
+fi
 grep -Fq "jsonpath='{.spec.sandboxTemplateRef.name}'" "${root}/scripts/live-agent-sandbox-e2e.sh"
 grep -Fq 'orka_e2e_bootstrap_admission_tls kubectl "${orka_namespace}"' "${root}/scripts/live-agent-sandbox-e2e.sh"
 grep -Fq 'orka_e2e_deploy_admission "${manager_ref}" kubectl "${orka_namespace}"' "${root}/scripts/live-agent-sandbox-e2e.sh"

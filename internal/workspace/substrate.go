@@ -68,39 +68,6 @@ type SubstrateConfig struct {
 	SessionIdentityClient   substrateSessionIdentityClient
 }
 
-// SubstrateOption configures a SubstrateWorkspaceExecutor.
-type SubstrateOption func(*SubstrateConfig)
-
-func WithSubstrateControlClient(client substrateControlClient) SubstrateOption {
-	return func(c *SubstrateConfig) {
-		c.ControlClient = client
-	}
-}
-
-func WithSubstrateHTTPClient(client *http.Client) SubstrateOption {
-	return func(c *SubstrateConfig) {
-		c.HTTPClient = client
-	}
-}
-
-func WithSubstrateHandoffToken(token string) SubstrateOption {
-	return func(c *SubstrateConfig) {
-		c.HandoffToken = token
-	}
-}
-
-func WithSubstrateBootstrapToken(token string) SubstrateOption {
-	return func(c *SubstrateConfig) {
-		c.BootstrapToken = token
-	}
-}
-
-func WithSubstrateSessionIdentityClient(client substrateSessionIdentityClient) SubstrateOption {
-	return func(c *SubstrateConfig) {
-		c.SessionIdentityClient = client
-	}
-}
-
 func normalizeSubstrateIdentityAudience(audience []string) []string {
 	normalized := make([]string, 0, len(audience))
 	for _, item := range audience {
@@ -115,10 +82,7 @@ func normalizeSubstrateIdentityAudience(audience []string) []string {
 }
 
 // NewSubstrateExecutor returns a WorkspaceExecutor backed by Agent Substrate.
-func NewSubstrateExecutor(cfg SubstrateConfig, opts ...SubstrateOption) (*SubstrateWorkspaceExecutor, error) {
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+func NewSubstrateExecutor(cfg SubstrateConfig) (*SubstrateWorkspaceExecutor, error) {
 	if strings.TrimSpace(cfg.RouterURL) == "" {
 		return nil, NewError("configure substrate", ErrorKindInvalidArgument, "router URL is required", false, nil)
 	}

@@ -95,7 +95,7 @@ func TestCreateSessionRejectsStaleTransitionOnlyDurableResume(t *testing.T) {
 	}
 
 	server := &Server{cfg: cfg}
-	_, _, _, _, _, _, err := server.createSession(
+	_, _, _, _, _, _, _, err := server.createSession(
 		context.Background(), request, time.Now().UTC(), os.Getuid(), os.Getgid(),
 	)
 	if err == nil || !isSessionCreationResumeLost(err) ||
@@ -225,7 +225,7 @@ func TestCreateSessionStagesCurrentGenerationForDurableTransitionRetry(t *testin
 	})
 
 	server := &Server{cfg: cfg}
-	_, _, _, _, _, _, err := server.createSession(
+	_, _, _, _, _, _, _, err := server.createSession(
 		context.Background(), request, time.Now().UTC(), os.Getuid(), os.Getgid(),
 	)
 	if !errors.Is(err, injected) || sessionCreationStage(err) != "workspace materialization" {
@@ -1947,5 +1947,76 @@ func TestPruneTombstonesLockedRetainsEveryUnexpiredReplay(t *testing.T) {
 	}
 	if _, ok := server.tombstones["session-04351"]; !ok {
 		t.Fatal("oldest in-window tombstone was evicted")
+	}
+}
+
+// A create request rebuilt by the controller for the same attempt (fresh
+// expiry, fresh workspace capability) reaches a supervisor that already created
+// the session from an earlier send. The supervisor must answer digest_conflict
+// with the recorded phase and keep the resident session in status so the
+// controller can adopt it.
+func TestCreateSessionRebuiltRequestConflictsWhileSessionStaysResident(t *testing.T) {
+	server, cfg, profile := newTestServer(t, "immediate")
+	create := testCreateSessionRequest(t, cfg, profile)
+	now := time.Now().UTC()
+	state := &sessionState{
+		id: create.RuntimeSessionID,
+		descriptor: harnessv2.RuntimeSessionDescriptor{
+			RuntimeSessionID: create.RuntimeSessionID, RuntimeSessionUID: create.Metadata.Fence.RuntimeSessionUID,
+			Generation: create.Metadata.Fence.RuntimeSessionGeneration, RuntimeInstanceID: cfg.Fence.RuntimeInstanceID,
+			SupervisorBootID: cfg.Fence.SupervisorBootID, RuntimeProfileDigest: cfg.Fence.RuntimeProfileDigest,
+			State: harnessv2.RuntimeSessionStateIdle, CreatedAt: now, LastTransitionAt: now,
+		},
+	}
+	recordSessionOperationLocked(state, create.Metadata, harnessv2.OperationPhaseApplied, "", now)
+	server.mu.Lock()
+	server.sessions[create.RuntimeSessionID] = state
+	server.mu.Unlock()
+
+	rebuilt := create
+	rebuilt.Metadata.ExpiresAt = create.Metadata.ExpiresAt.Add(time.Minute)
+	sealRequest(t, &rebuilt.Metadata.RequestDigest, rebuilt)
+	if rebuilt.Metadata.RequestDigest == create.Metadata.RequestDigest {
+		t.Fatal("rebuilt create request kept the original digest")
+	}
+	response := performMutation(t, server.Handler(), http.MethodPut, "/v2/runtime-sessions/session-1", rebuilt, cfg)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("rebuilt create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var apiError harnessv2.ErrorResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &apiError); err != nil {
+		t.Fatal(err)
+	}
+	if apiError.Code != harnessv2.ErrorCodeDigestConflict || apiError.Classification == nil ||
+		apiError.Classification.Class != harnessv2.RequestClassificationDigestConflict ||
+		apiError.Classification.Phase != harnessv2.OperationPhaseApplied {
+		t.Fatalf("rebuilt create error = %#v, want digest_conflict with the applied phase", apiError)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, harnessv2.StatusPath, nil)
+	statusReq.Header.Set("Authorization", "Bearer "+cfg.ControllerBearerToken)
+	statusNonce, err := harnessv2.NewCapabilityNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusBinding := harnessv2.StatusCapabilityBinding{RuntimeProfileDigest: cfg.Fence.RuntimeProfileDigest}
+	statusCapability, err := harnessv2.SignStatusCapability(cfg.CapabilitySecret, harnessv2.NewStatusCapabilityClaims(statusBinding, statusNonce, time.Now().UTC().Add(time.Minute)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusReq.Header.Set(OperationCapabilityHeader, statusCapability)
+	statusResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(statusResponse, statusReq)
+	if statusResponse.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", statusResponse.Code, statusResponse.Body.String())
+	}
+	var status harnessv2.StatusResponse
+	if err := json.Unmarshal(statusResponse.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Sessions) != 1 || status.Sessions[0].RuntimeSessionID != create.RuntimeSessionID ||
+		status.Sessions[0].Generation != create.Metadata.Fence.RuntimeSessionGeneration ||
+		status.Sessions[0].State != harnessv2.RuntimeSessionStateIdle {
+		t.Fatalf("resident session was not reported admissible after the rejected rebuild: %#v", status.Sessions)
 	}
 }

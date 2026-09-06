@@ -1,4 +1,8 @@
-# Issue-to-PR Automation
+---
+description: "The full orka:* label workflow that takes an issue through to a merged pull request."
+---
+
+# Issue-to-PR automation
 
 RepositoryMonitor can run a durable maintainer-controlled issue-to-PR loop from `orka:*` labels or equivalent API/CLI/UI commands.
 
@@ -35,8 +39,8 @@ orka monitor issue approve-plan orka-main 123
 orka monitor issue implement orka-main 123
 orka monitor issue implementation get orka-main 123
 orka monitor mutations list orka-main --kind issue --number 123
-orka monitor pr review orka-main 456 --target-sha <head-sha>
-orka monitor pr fix orka-main 456 --target-sha <head-sha>
+orka monitor pr review orka-main 456 --target-sha '<head-sha>'
+orka monitor pr fix orka-main 456 --target-sha '<head-sha>'
 orka monitor pr ready readiness orka-main 456
 orka monitor work-actions list orka-main --kind issue --number 123
 ```

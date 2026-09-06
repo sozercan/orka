@@ -144,6 +144,16 @@ func TestACPPromptFailureMessageRedactsCredentialsSplitByControlRunes(t *testing
 	}
 }
 
+func TestStripACPControlRunesReassemblesLineWrappedCredential(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	split := "upstream rejected " + key[:11] + "\n" + key[11:] + " for the model"
+	got := redact.SensitiveText(stripACPControlRunes(split))
+	if strings.Contains(got, key[:11]) || strings.Contains(got, key[11:]) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("sanitized detail = %q, want line-wrapped credential redacted", got)
+	}
+}
+
 func TestACPPromptFailureMessageRedactsCredentialSplitAcrossCodeAndMessage(t *testing.T) {
 	t.Parallel()
 	// Neither field is credential-shaped on its own; the composed

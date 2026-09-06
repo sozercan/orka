@@ -35,6 +35,7 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 		"event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
 		"data: {\"choices\":[{\"delta\":{\"content\":\"discussing event: response.failed and \\\"type\\\":\\\"error\\\" handling\"}}]}\n\ndata: [DONE]\n\n",
 		"data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+		"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
 	}
 	for _, stream := range clean {
 		scanner := &sseTerminalErrorScanner{}
@@ -57,6 +58,59 @@ func TestSSETerminalErrorScannerDetectsInStreamFailures(t *testing.T) {
 	}
 }
 
+func TestSSETerminalErrorScannerCapturesFullErrorDetail(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		stream string
+		want   string
+	}{
+		{
+			name:   "responses failed payload keeps the message after the marker",
+			stream: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"insufficient quota\"}}}\n\n",
+			want:   `{"type":"response.failed","response":{"error":{"message":"insufficient quota"}}}`,
+		},
+		{
+			name:   "error object message is extracted",
+			stream: "data: {\"error\": {\"message\": \"rate limited\", \"type\": \"rate_limit_error\"}}\n\n",
+			want:   "rate limited",
+		},
+		{
+			name:   "anthropic error event uses the following data line",
+			stream: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+			want:   "Overloaded",
+		},
+		{
+			name:   "error event without data falls back to the marker",
+			stream: "event: error\n\n",
+			want:   "event:error",
+		},
+		{
+			name:   "unterminated error line settles on flush",
+			stream: "data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}",
+			want:   "boom",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			scanner := &sseTerminalErrorScanner{}
+			for i := 0; i < len(tc.stream); i++ {
+				if _, err := scanner.Write([]byte{tc.stream[i]}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			scanner.flush()
+			if !scanner.failed {
+				t.Fatalf("scanner did not fail on %q", tc.stream)
+			}
+			if scanner.detail != tc.want {
+				t.Fatalf("detail = %q, want %q", scanner.detail, tc.want)
+			}
+		})
+	}
+}
+
 // testAllocateInferenceSeq mirrors admission-time sequence allocation for
 // fixtures that record outcomes without an HTTP request.
 func testAllocateInferenceSeq(s *providerProxySession) uint64 {
@@ -64,4 +118,32 @@ func testAllocateInferenceSeq(s *providerProxySession) uint64 {
 	defer s.mu.Unlock()
 	s.issuedInference++
 	return s.issuedInference
+}
+
+func TestSanitizeProviderUpstreamDetailReassemblesWrappedCredential(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	got := sanitizeProviderUpstreamDetail("quota error for " + key[:11] + "\n" + key[11:] + " on model")
+	if strings.Contains(got, key[:11]) || strings.Contains(got, key[11:]) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("sanitizeProviderUpstreamDetail() = %q, want line-wrapped credential redacted", got)
+	}
+}
+
+func TestSanitizeProviderUpstreamDetailWithholdsPolicyMatchedCredentials(t *testing.T) {
+	t.Parallel()
+	// Not a real key: a bare AWS access-key ID shape the redactor does not
+	// recognize but the secret policy does.
+	const awsKeyShaped = "AKIA" + "IOSFODNN7EXAMPLE"
+	got := sanitizeProviderUpstreamDetail("invalid credentials for access key " + awsKeyShaped)
+	if strings.Contains(got, awsKeyShaped) {
+		t.Fatalf("sanitizeProviderUpstreamDetail() = %q, want the credential-shaped detail withheld", got)
+	}
+	if got != providerUpstreamDetailWithheld {
+		t.Fatalf("sanitizeProviderUpstreamDetail() = %q, want %q", got, providerUpstreamDetailWithheld)
+	}
+	for _, plain := range []string{"insufficient quota", "model not found: gpt-5.6-sol", "rate limited, retry after 20s"} {
+		if got := sanitizeProviderUpstreamDetail(plain); got != plain {
+			t.Fatalf("sanitizeProviderUpstreamDetail(%q) = %q, want unchanged", plain, got)
+		}
+	}
 }

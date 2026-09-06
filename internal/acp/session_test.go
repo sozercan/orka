@@ -507,3 +507,41 @@ func TestEmitLockedEnforcesBufferedByteBudget(t *testing.T) {
 		t.Fatalf("bufferedBytes after release = %d, want 30", remaining)
 	}
 }
+
+// A notification the child sends before the prompt request is marked
+// written is parked until acceptance and enqueued afterwards; its receipt
+// time must still be the instant it arrived, while the enqueue timestamp
+// reflects when the consumer could first see it.
+func TestRuntimeSessionPreAcceptedEventKeepsReceiptTime(t *testing.T) {
+	session := &RuntimeSession{config: RuntimeSessionConfig{MaxBufferedEvents: 4, MaxBufferedEventBytes: 1 << 20}}
+	active := &activePrompt{events: make(chan PromptEvent, 4)}
+	before := time.Now().UTC()
+	session.emitLocked(active, PromptEvent{Type: PromptEventUpdate, Update: &SessionNotification{SessionID: "s"}, Size: 1})
+	if len(active.preAccepted) != 1 || len(active.events) != 0 {
+		t.Fatalf("pre-acceptance update was not parked: parked=%d enqueued=%d", len(active.preAccepted), len(active.events))
+	}
+	received := active.preAccepted[0].ReceivedAt
+	if received.IsZero() || received.Before(before) {
+		t.Fatalf("parked event receipt time = %v, want stamped at receipt (>= %v)", received, before)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	active.accepted = true
+	session.emitLocked(active, PromptEvent{Type: PromptEventAccepted})
+	queued := append([]PromptEvent(nil), active.preAccepted...)
+	active.preAccepted = nil
+	for _, event := range queued {
+		active.bufferedBytes -= event.Size
+		session.emitLocked(active, event)
+	}
+	accepted, update := <-active.events, <-active.events
+	if accepted.Type != PromptEventAccepted || update.Type != PromptEventUpdate {
+		t.Fatalf("enqueued order = %s, %s", accepted.Type, update.Type)
+	}
+	if !update.ReceivedAt.Equal(received) {
+		t.Fatalf("enqueued receipt time = %v, want the original %v", update.ReceivedAt, received)
+	}
+	if !update.Timestamp.After(received.Add(time.Millisecond)) || update.Timestamp.Before(accepted.Timestamp) {
+		t.Fatalf("enqueue timestamp = %v, want after receipt %v and not before acceptance %v", update.Timestamp, received, accepted.Timestamp)
+	}
+}

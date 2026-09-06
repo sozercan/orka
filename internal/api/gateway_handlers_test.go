@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -194,6 +196,55 @@ func TestGatewayResourceListsUseAPIReader(t *testing.T) {
 		if response.StatusCode != http.StatusOK {
 			t.Fatalf("GET %s status = %d, want 200", target, response.StatusCode)
 		}
+	}
+}
+
+// continueRejectingReader answers every list the way the API server answers
+// an unusable continue token.
+type continueRejectingReader struct {
+	client.Reader
+	err error
+}
+
+func (r continueRejectingReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return r.err
+}
+
+func TestGatewayResourceListsPreserveContinueTokenErrors(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := gatewayv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"expired", apierrors.NewResourceExpired("too old resource version"), http.StatusGone},
+		{"malformed", apierrors.NewBadRequest("invalid continue token"), http.StatusBadRequest},
+		{"other", errors.New("boom"), http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := continueRejectingReader{Reader: fake.NewClientBuilder().WithScheme(scheme).Build(), err: tc.err}
+			h := NewHandlers(HandlersConfig{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), APIReader: reader})
+			app := fiber.New()
+			app.Get("/gatewayclasses", h.ListGatewayClasses)
+			app.Get("/gateways", h.ListGateways)
+			app.Get("/gatewaybindings", h.ListGatewayBindings)
+			for _, target := range []string{
+				"/gatewayclasses?limit=1&continue=stale",
+				"/gateways?namespace=default&limit=1&continue=stale",
+				"/gatewaybindings?namespace=default&limit=1&continue=stale",
+			} {
+				response, err := app.Test(httptest.NewRequest(http.MethodGet, target, nil))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if response.StatusCode != tc.want {
+					t.Fatalf("GET %s status = %d, want %d", target, response.StatusCode, tc.want)
+				}
+			}
+		})
 	}
 }
 

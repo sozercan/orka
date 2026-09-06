@@ -1,4 +1,8 @@
-# Outbound Access Policies
+---
+description: "Giving Tools a reusable, namespaced way to reach an external API without handing agents the credential."
+---
+
+# Outbound access policies
 
 `OutboundAccessPolicy` gives HTTP and MCP-over-HTTP Tools one reusable, namespaced access adapter. The Tool and policy must be in the same namespace.
 
@@ -59,7 +63,16 @@ spec:
       name: agentgateway
 ```
 
-Orka dials the gateway Service but preserves the original target authority, path, query, method, body, explicit `Authorization`, `Txn-Token`, MCP protocol headers, idempotency key, timeout, and cancellation. The final downstream must not receive the transaction token; configure that stripping and resource-token exchange in the gateway integration. The allowlisted gateway is also the enforcement boundary that binds each authority to an operator-configured upstream; it must not behave as an unrestricted DNS forward proxy. Orka revalidates public Tool authorities at execution time as defense in depth.
+Orka dials the gateway Service but preserves the original target authority, path, query, method, body, explicit `Authorization`, `Txn-Token`, MCP protocol headers, idempotency key, timeout, and cancellation. Orka revalidates public Tool authorities at execution time as defense in depth.
+
+:::danger[Two things the gateway must do that Orka cannot do for you]
+- **Strip the transaction token.** Orka forwards `Txn-Token` to the gateway; the final
+  downstream must never see it. Configure stripping and resource-token exchange in the
+  gateway integration.
+- **Bind each authority to a configured upstream.** The allowlisted gateway is the
+  enforcement boundary. If it behaves as an unrestricted DNS forward proxy, the allowlist
+  means nothing.
+:::
 
 Same-namespace Services are automatic. Cross-namespace Services require exact `namespace/name:port` entries:
 

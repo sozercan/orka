@@ -8,17 +8,38 @@ package api
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 )
+
+type providerReadTrackingClient struct {
+	client.Client
+	providerReads int
+	secretReads   int
+}
+
+func (c *providerReadTrackingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	switch obj.(type) {
+	case *corev1alpha1.Provider:
+		c.providerReads++
+	case *corev1.Secret:
+		c.secretReads++
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
 
 // helpers
 
@@ -132,6 +153,96 @@ func TestProviderResolver_ResolveAPIKey(t *testing.T) {
 	})
 }
 
+func TestProviderResolverMasksMissingAndDisallowedExplicitNames(t *testing.T) {
+	// A denied reference gets the same error whether or not the Provider
+	// exists, and no credential is read either way.
+	denied := errors.New("provider reference denied")
+	provider := makeProvider("hidden", "default", corev1alpha1.ProviderTypeOpenAI, "hidden-secret", "gpt-4o")
+	secret := makeSecret("hidden-secret", "default", "api-key", "test-key")
+
+	for _, tc := range []struct {
+		name    string
+		objects []runtime.Object
+	}{
+		{name: "existing provider", objects: []runtime.Object{provider, secret}},
+		{name: "missing provider"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(tc.objects...).Build()
+			tracked := &providerReadTrackingClient{Client: base}
+			resolver := NewProviderResolver(tracked, DefaultChatConfig())
+
+			_, _, err := resolver.Resolve(context.Background(), ResolveOpts{
+				ModelStr:  "hidden/gpt-4o",
+				Namespace: "default",
+				AuthorizeProviderReference: func(ProviderResolutionInfo) error {
+					return denied
+				},
+			})
+			require.ErrorIs(t, err, denied)
+			require.Zero(t, tracked.secretReads)
+		})
+	}
+}
+
+func TestProviderResolverAuthorizesReferenceWithProviderType(t *testing.T) {
+	// A grant by provider type ("openai") must admit a Provider named
+	// differently ("prod") once its type is known, exactly as the Providers
+	// list does; a Provider of another type and a missing name are both
+	// denied with the same error.
+	denied := errors.New("provider reference denied")
+	byType := func(info ProviderResolutionInfo) error {
+		if info.Type == string(corev1alpha1.ProviderTypeOpenAI) {
+			return nil
+		}
+		return denied
+	}
+	prod := makeProvider("prod", "default", corev1alpha1.ProviderTypeOpenAI, "prod-secret", "gpt-4o")
+	prodSecret := makeSecret("prod-secret", "default", "api-key", "test-key")
+	other := makeProvider("other", "default", corev1alpha1.ProviderTypeAnthropic, "other-secret", "claude-sonnet-4-20250514")
+	otherSecret := makeSecret("other-secret", "default", "api-key", "test-key")
+	base := fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(prod, prodSecret, other, otherSecret).Build()
+	resolver := NewProviderResolver(base, DefaultChatConfig())
+
+	_, _, info, err := resolver.ResolveWithInfo(context.Background(), ResolveOpts{
+		ProviderName:               "prod",
+		Namespace:                  "default",
+		AuthorizeProviderReference: byType,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "prod", info.Name)
+	require.Equal(t, string(corev1alpha1.ProviderTypeOpenAI), info.Type)
+
+	for _, name := range []string{"other", "missing"} {
+		_, _, err := resolver.Resolve(context.Background(), ResolveOpts{
+			ProviderName:               name,
+			Namespace:                  "default",
+			AuthorizeProviderReference: byType,
+		})
+		require.ErrorIs(t, err, denied, name)
+	}
+}
+
+func TestProviderResolverAuthorizesUseBeforeReadingCredential(t *testing.T) {
+	denied := errors.New("provider use denied")
+	provider := makeProvider("hidden", "default", corev1alpha1.ProviderTypeOpenAI, "hidden-secret", "gpt-4o")
+	secret := makeSecret("hidden-secret", "default", "api-key", "test-key")
+	base := fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(provider, secret).Build()
+	tracked := &providerReadTrackingClient{Client: base}
+	resolver := NewProviderResolver(tracked, DefaultChatConfig())
+
+	_, _, err := resolver.Resolve(context.Background(), ResolveOpts{
+		ModelStr:  "hidden/gpt-4o",
+		Namespace: "default",
+		AuthorizeProviderUse: func(ProviderResolutionInfo, string) error {
+			return denied
+		},
+	})
+	require.ErrorIs(t, err, denied)
+	require.Equal(t, 1, tracked.providerReads)
+	require.Zero(t, tracked.secretReads)
+}
+
 func TestProviderResolver_Resolve(t *testing.T) {
 	const (
 		ns                 = "default"
@@ -160,9 +271,10 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			objects: []runtime.Object{openaiProvider, openaiSecret},
 			config:  DefaultChatConfig(),
 			opts: ResolveOpts{
-				ProviderName: openaiProviderName,
-				Model:        "gpt-4o",
-				Namespace:    ns,
+				ProviderName:            openaiProviderName,
+				Model:                   "gpt-4o",
+				Namespace:               ns,
+				RequireExplicitProvider: true,
 			},
 			wantModel: "gpt-4o",
 			wantPType: openaiProviderName,
@@ -183,8 +295,9 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			objects: []runtime.Object{anthropicProvider, anthropicSecret},
 			config:  DefaultChatConfig(),
 			opts: ResolveOpts{
-				ModelStr:  "anthropic/claude-sonnet-4-20250514",
-				Namespace: ns,
+				ModelStr:                "anthropic/claude-sonnet-4-20250514",
+				Namespace:               ns,
+				RequireExplicitProvider: true,
 			},
 			wantModel: "claude-sonnet-4-20250514",
 			wantPType: "anthropic",
@@ -236,8 +349,9 @@ func TestProviderResolver_Resolve(t *testing.T) {
 			},
 			config: DefaultChatConfig(),
 			opts: ResolveOpts{
-				AgentRef:  "my-agent",
-				Namespace: ns,
+				AgentRef:                "my-agent",
+				Namespace:               ns,
+				RequireExplicitProvider: true,
 			},
 			wantModel: "gpt-4o",
 			wantPType: openaiProviderName,
@@ -343,7 +457,7 @@ func TestProviderResolver_Resolve(t *testing.T) {
 				ProviderName: "anthropic",
 				Namespace:    ns,
 			},
-			wantErr: "agent \"bound-agent\" is bound to provider \"openai\"",
+			wantErr: "agent \"bound-agent\" is bound to a different provider",
 		},
 		{
 			name:    "no provider configured falls back to the sole ready Provider",
@@ -520,4 +634,84 @@ func readyProvider(provider *corev1alpha1.Provider) *corev1alpha1.Provider {
 	ready := provider.DeepCopy()
 	ready.Status.Ready = true
 	return ready
+}
+
+func TestProviderResolverRequireExplicitProviderHasUniformFallbackError(t *testing.T) {
+	t.Parallel()
+	const want = "no provider selected and no default Provider is configured; pass an explicit provider"
+
+	provider := makeProvider("hidden", "default", corev1alpha1.ProviderTypeOpenAI, "hidden-secret", "gpt-4o")
+	for name, tc := range map[string]struct {
+		config  ChatConfig
+		objects []runtime.Object
+	}{
+		"no Providers": {
+			config: DefaultChatConfig(),
+		},
+		"one ready Provider": {
+			config:  DefaultChatConfig(),
+			objects: []runtime.Object{readyProvider(provider)},
+		},
+		"two ready Providers": {
+			config:  DefaultChatConfig(),
+			objects: []runtime.Object{readyProvider(provider), readyProvider(makeProvider("other", "default", corev1alpha1.ProviderTypeAnthropic, "other-secret", "claude"))},
+		},
+		"default-named Provider": {
+			config:  DefaultChatConfig(),
+			objects: []runtime.Object{makeProvider("default", "default", corev1alpha1.ProviderTypeOpenAI, "default-secret", "gpt-4o")},
+		},
+		"configured Provider": {
+			config: func() ChatConfig {
+				config := DefaultChatConfig()
+				config.Provider = "hidden"
+				return config
+			}(),
+			objects: []runtime.Object{provider},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resolver := NewProviderResolver(fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(tc.objects...).Build(), tc.config)
+			_, _, err := resolver.Resolve(context.Background(), ResolveOpts{Namespace: "default", RequireExplicitProvider: true})
+			require.EqualError(t, err, want)
+		})
+	}
+}
+
+func TestRequestRequiresExplicitProviderHonorsAuthorizationMode(t *testing.T) {
+	tests := []struct {
+		name         string
+		mode         string
+		contextToken bool
+		want         bool
+	}{
+		{name: "off allows implicit provider", mode: ContextTokenAuthorizationModeOff, contextToken: true},
+		{name: "audit allows implicit provider", mode: ContextTokenAuthorizationModeAudit, contextToken: true},
+		{name: "enforce requires explicit provider", mode: ContextTokenAuthorizationModeEnforce, contextToken: true, want: true},
+		{name: "enforce does not affect other authentication", mode: ContextTokenAuthorizationModeEnforce},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authorization, err := NewContextTokenAuthorizationConfig(ContextTokenAuthorizationConfigOptions{Mode: tt.mode})
+			require.NoError(t, err)
+
+			var got bool
+			app := fiber.New()
+			app.Get("/", func(c fiber.Ctx) error {
+				if tt.contextToken {
+					c.Locals(UserInfoContextKey, &UserInfo{
+						AuthType:     AuthTypeContextToken,
+						ContextToken: &ContextToken{},
+					})
+				}
+				got = requestRequiresExplicitProvider(c, authorization)
+				return c.SendStatus(http.StatusNoContent)
+			})
+
+			resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/", nil))
+			require.NoError(t, err)
+			require.Equal(t, http.StatusNoContent, resp.StatusCode)
+			require.Equal(t, tt.want, got)
+		})
+	}
 }

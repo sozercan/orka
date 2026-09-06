@@ -1,21 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-  BUILT_IN_AGENT_RUNTIME_OPTIONS,
   OPENCODE_REVIEWED_RUNTIME_DEFAULTS,
   builtInAgentRuntimeLabel,
   isOpenCodeModelID,
 } from "./agent-runtime";
 
 describe("built-in agent runtime display", () => {
-  it("provides all selectable ACP runtime options", () => {
-    expect(BUILT_IN_AGENT_RUNTIME_OPTIONS).toEqual([
-      { value: "claude", label: "Claude ACP" },
-      { value: "codex", label: "OpenAI Codex ACP" },
-      { value: "copilot", label: "GitHub Copilot ACP" },
-      { value: "opencode", label: "OpenCode ACP" },
-    ]);
-  });
-
   it("preserves existing compact labels and brands OpenCode", () => {
     expect(builtInAgentRuntimeLabel("claude")).toBe("claude ACP");
     expect(builtInAgentRuntimeLabel("codex")).toBe("codex ACP");

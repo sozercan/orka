@@ -15,7 +15,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 # shellcheck source=scripts/lib/e2e-admission-tls.sh
 . "${script_dir}/lib/e2e-admission-tls.sh"
 
-agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v0.5.5}"
+agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v1.0.0}"
 kind_cluster="${KIND_CLUSTER:-orka-live-agent-sandbox-e2e}"
 orka_namespace="${ORKA_NAMESPACE:-orka-system}"
 orka_controller_deployment="${ORKA_CONTROLLER_DEPLOYMENT:-orka-controller-manager}"
@@ -66,6 +66,8 @@ router_namespace=""
 created_kind_cluster="0"
 agent_sandbox_module_cache=""
 work_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/live-agent-sandbox-e2e.XXXXXX")"
+e2e_kubeconfig="${work_dir}/kubeconfig"
+export KUBECONFIG="${e2e_kubeconfig}"
 kind_config="${ORKA_AGENT_SANDBOX_KIND_CONFIG:-${work_dir}/kind-config.yaml}"
 fixture_dockerfile="${work_dir}/Dockerfile.sandbox-fixture"
 api_pf_log="${work_dir}/api-port-forward.log"
@@ -74,8 +76,8 @@ smoke_go_dir="${repo_root}/.tmp-live-agent-sandbox-smoke-${e2e_run_id}"
 manager_kustomization="${repo_root}/config/manager/kustomization.yaml"
 manager_kustomization_backup="${work_dir}/manager-kustomization.yaml.bak"
 
-if [[ "${agent_sandbox_version}" != "v0.5.5" ]]; then
-  die "this e2e is pinned to agent-sandbox v0.5.5 to match go.mod"
+if [[ "${agent_sandbox_version}" != "v1.0.0" ]]; then
+  die "this e2e is pinned to agent-sandbox v1.0.0 to match go.mod"
 fi
 
 cleanup_one_port_forward() {
@@ -324,6 +326,7 @@ YAML
 setup_kind_cluster() {
   if kind_cluster_exists; then
     log "Kind cluster ${kind_cluster} already exists; reusing it"
+    run kind export kubeconfig --name "${kind_cluster}" --kubeconfig "${e2e_kubeconfig}"
     return
   fi
 
@@ -333,7 +336,7 @@ setup_kind_cluster() {
   [[ -f "${kind_config}" ]] || die "Kind config not found: ${kind_config}"
 
   log "Creating Kind cluster ${kind_cluster}"
-  run kind create cluster --name "${kind_cluster}" --config "${kind_config}"
+  run kind create cluster --name "${kind_cluster}" --config "${kind_config}" --kubeconfig "${e2e_kubeconfig}"
   created_kind_cluster="1"
 }
 
@@ -1118,7 +1121,7 @@ func execContains(ctx context.Context, executor *workspace.AgentSandboxExecutor,
 }
 
 func verifyWarmPoolRef(ctx context.Context, helper *sandbox.K8sHelper, namespace, claimName, warmPool string) {
-	// agent-sandbox v0.5 K8sHelper uses the extensions v1beta1 client, where
+	// agent-sandbox v1 K8sHelper uses the extensions v1beta1 client, where
 	// SandboxClaimSpec requires warmPoolRef. This compile-checks that Orka's
 	// adapter creates the v1beta1 claim shape expected by the upgraded SDK.
 	claim, err := helper.ExtensionsClient.SandboxClaims(namespace).Get(ctx, claimName, metav1.GetOptions{})
@@ -3403,7 +3406,6 @@ main() {
   trap 'status=$?; on_exit "${status}"; exit "${status}"' EXIT
 
   setup_kind_cluster
-  run kubectl config use-context "kind-${kind_cluster}"
   log "Installing current Orka CRDs into the test cluster"
   run make install
   log "Creating the Vekil namespace required by the production ingress policy"

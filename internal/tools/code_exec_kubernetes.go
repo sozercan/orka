@@ -124,9 +124,10 @@ func (s *kubernetesCodeExecStoredResultCleanupState) pruneLocked(now time.Time) 
 }
 
 type kubernetesCodeExecClients struct {
-	client     crclient.Client
-	kubeClient kubernetes.Interface
-	namespace  string
+	client           crclient.Client
+	kubeClient       kubernetes.Interface
+	namespace        string
+	authorizePodLogs func(context.Context, string, string) error
 }
 
 type kubernetesCodeExecResources struct {
@@ -275,6 +276,7 @@ func (e *KubernetesJobCodeExecutor) kubernetesClients(ctx context.Context) (kube
 	if tc := GetToolContext(ctx); tc != nil {
 		clients.client = tc.Client
 		clients.kubeClient = tc.KubeClient
+		clients.authorizePodLogs = tc.AuthorizePodLogs
 		if strings.TrimSpace(tc.Namespace) != "" {
 			clients.namespace = tc.Namespace
 		}
@@ -507,6 +509,16 @@ func (e *KubernetesJobCodeExecutor) createResources(ctx context.Context, c crcli
 	if resources == nil || resources.job == nil || resources.secret == nil || resources.serviceAccount == nil {
 		return created, fmt.Errorf("required Kubernetes resources are not configured")
 	}
+	if tc := GetToolContext(ctx); tc != nil && tc.AuthorizeCodeExecResources != nil {
+		objects := make([]crclient.Object, 0, 4)
+		objects = append(objects, resources.secret, resources.serviceAccount, resources.job)
+		if resources.networkPolicy != nil {
+			objects = append(objects, resources.networkPolicy)
+		}
+		if err := tc.AuthorizeCodeExecResources(ctx, objects); err != nil {
+			return created, fmt.Errorf("resource authorization: %w", err)
+		}
+	}
 
 	if wasCreated, err := createKubernetesCodeExecObject(ctx, c, resources.secret); err != nil {
 		return created, fmt.Errorf("secret: %w", err)
@@ -655,7 +667,8 @@ func (e *KubernetesJobCodeExecutor) loadStoredResult(ctx context.Context, c crcl
 
 	stored := &corev1.ConfigMap{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, stored); err != nil {
-		if apierrors.IsNotFound(err) {
+		// Cache access is optional; a caller may still authorize a new Job.
+		if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
 			return CodeExecResult{}, false, nil
 		}
 		return CodeExecResult{}, false, err
@@ -1427,6 +1440,11 @@ func (e *KubernetesJobCodeExecutor) readJobLogs(ctx context.Context, clients kub
 	if err != nil || !ok {
 		return kubernetesCodeExecLogOutput{}, err
 	}
+	if clients.authorizePodLogs != nil {
+		if err := clients.authorizePodLogs(ctx, clients.namespace, pod.Name); err != nil {
+			return kubernetesCodeExecLogOutput{}, err
+		}
+	}
 
 	streamer := e.logStreamer
 	if streamer == nil {
@@ -1525,9 +1543,15 @@ func (e *KubernetesJobCodeExecutor) cleanupResources(c crclient.Client, resource
 	defer cancel()
 
 	deleteKubernetesCodeExecJob(cleanupCtx, c, resources.job)
-	deleteKubernetesCodeExecObject(cleanupCtx, c, resources.secret)
-	deleteKubernetesCodeExecObject(cleanupCtx, c, resources.serviceAccount)
-	deleteKubernetesCodeExecObject(cleanupCtx, c, resources.networkPolicy)
+	if resources.secret != nil {
+		deleteKubernetesCodeExecObject(cleanupCtx, c, resources.secret)
+	}
+	if resources.serviceAccount != nil {
+		deleteKubernetesCodeExecObject(cleanupCtx, c, resources.serviceAccount)
+	}
+	if resources.networkPolicy != nil {
+		deleteKubernetesCodeExecObject(cleanupCtx, c, resources.networkPolicy)
+	}
 }
 
 func deleteKubernetesCodeExecJob(ctx context.Context, c crclient.Client, job *batchv1.Job) {

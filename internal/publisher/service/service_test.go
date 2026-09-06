@@ -1262,3 +1262,10 @@ func TestPublicationReclaimIsCapabilityProtectedAndIdempotent(t *testing.T) {
 		t.Fatalf("reclaim without operation capability status = %d, body = %s", response.StatusCode, data)
 	}
 }
+
+// PRReconcilerFactoryFunc adapts a function to PRReconcilerFactory for tests.
+type PRReconcilerFactoryFunc func(context.Context, string) (publisher.PullRequestReconciler, error)
+
+func (f PRReconcilerFactoryFunc) New(ctx context.Context, credentialPath string) (publisher.PullRequestReconciler, error) {
+	return f(ctx, credentialPath)
+}

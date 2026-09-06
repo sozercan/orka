@@ -206,6 +206,7 @@ type agentExecutionSnapshotSecretRef struct {
 type verifiedAgentExecution struct {
 	binding          *corev1alpha1.AgentExecutionBinding
 	snapshot         *store.AgentExecutionSnapshot
+	promptAttempt    *store.PromptAttempt
 	body             agentExecutionSnapshotBody
 	plan             ACPRuntimePlan
 	frozenTask       *corev1alpha1.Task
@@ -636,7 +637,7 @@ func validateAgentExecutionSnapshot(
 		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, errors.New("frozen runtime image is not digest pinned")
 	}
 	poolIdentityDigest, err := acpDomainDigest("runtime-pool-identity", map[string]string{
-		"profileDigest": body.ProfileDigest, "runtimeImage": body.RuntimeImage,
+		acpRuntimePoolIdentityProfileDigestKey: body.ProfileDigest, acpRuntimePoolIdentityRuntimeImageKey: body.RuntimeImage,
 	})
 	if err != nil {
 		return ACPRuntimePlan{}, harnessv2.AgentSessionConfiguration{}, harnessv2.MCPPolicyConfiguration{}, err

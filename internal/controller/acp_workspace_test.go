@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/artifactcap"
@@ -102,6 +103,7 @@ func TestPrepareRuntimeWorkspaceRetriesTransientPublisherFailuresUnderOneLease(t
 	dispatcher := &ACPDispatcher{
 		Store: controlStore, Publisher: publisherClient,
 		ArtifactCapabilitySecret: []byte(strings.Repeat("1", artifactcap.MinSecretBytes)),
+		ArtifactReservations:     acceptingArtifactReservations{},
 	}
 	task := &corev1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "workspace-retry", UID: types.UID(taskUID)},
@@ -115,7 +117,8 @@ func TestPrepareRuntimeWorkspaceRetriesTransientPublisherFailuresUnderOneLease(t
 		Status: corev1alpha1.TaskStatus{Execution: &corev1alpha1.TaskExecutionStatus{PromptID: promptID}},
 	}
 
-	prepared, err := dispatcher.prepareRuntimeWorkspace(context.Background(), task, fence, &acpTaskSession{Reused: true})
+	plannedAt := time.Date(2020, time.September, 2, 7, 0, 0, 0, time.UTC)
+	prepared, err := dispatcher.prepareRuntimeWorkspace(context.Background(), task, fence, &acpTaskSession{}, plannedAt, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +163,19 @@ func TestPrepareRuntimeWorkspaceRetriesTransientPublisherFailuresUnderOneLease(t
 		if effect.State != store.ExternalEffectSucceeded || effect.Attempts != 1 {
 			t.Fatalf("%s external effect = state %s attempts %d, want Succeeded with one lease", label, effect.State, effect.Attempts)
 		}
+		if check.kind == "workspace.prepare" && !prepared.createIssuedAt.Equal(effect.UpdatedAt) {
+			t.Fatalf("RuntimeSession create issued at = %s, want durable prepare completion %s", prepared.createIssuedAt, effect.UpdatedAt)
+		}
+	}
+	replayed, err := dispatcher.prepareRuntimeWorkspace(context.Background(), task, fence, &acpTaskSession{}, plannedAt, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.authorization == nil || !reflect.DeepEqual(prepared.authorization, replayed.authorization) {
+		t.Fatalf("workspace authorization changed across one RuntimeSession creation replay")
+	}
+	if !prepared.createIssuedAt.Equal(replayed.createIssuedAt) {
+		t.Fatalf("RuntimeSession create timestamp changed across replay: %s != %s", prepared.createIssuedAt, replayed.createIssuedAt)
 	}
 }
 

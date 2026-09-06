@@ -26,7 +26,7 @@ const (
 // CreateSessionControl attaches an immutable SessionUID and fenced control
 // metadata to an existing transcript session.
 func (s *Store) CreateSessionControl(ctx context.Context, control *store.SessionControl, fence store.ControllerEpochFence) (*store.SessionControl, error) {
-	normalized, fence, err := normalizeSessionControlForCreate(control, fence)
+	normalized, fence, err := store.NormalizeSessionControlForCreate(control, fence)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +42,7 @@ func (s *Store) CreateSessionControl(ctx context.Context, control *store.Session
 		if sameSessionControlCreation(existing, normalized) {
 			return &existing, nil
 		}
-		return nil, controlConflict("session control %s/%s was reused with a different UID or request digest", normalized.Namespace, normalized.SessionName)
+		return nil, store.ConflictErrorf("session control %s/%s was reused with a different UID or request digest", normalized.Namespace, normalized.SessionName)
 	} else if !errors.Is(getErr, store.ErrNotFound) {
 		return nil, getErr
 	}
@@ -78,7 +78,7 @@ func (s *Store) CreateSessionControl(ctx context.Context, control *store.Session
 		if getErr == nil && sameSessionControlCreation(existing, normalized) {
 			return &existing, nil
 		}
-		return nil, controlConflict("session control %s/%s already exists with a different immutable UID or request digest", normalized.Namespace, normalized.SessionName)
+		return nil, store.ConflictErrorf("session control %s/%s already exists with a different immutable UID or request digest", normalized.Namespace, normalized.SessionName)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -120,7 +120,7 @@ func (s *Store) AcquireSessionMutationLease(ctx context.Context, request store.A
 			return nil, err
 		}
 	}
-	fence, err := normalizeEpochFence(request.Fence)
+	fence, err := store.NormalizeEpochFence(request.Fence)
 	if err != nil {
 		return nil, err
 	}
@@ -131,8 +131,8 @@ func (s *Store) AcquireSessionMutationLease(ctx context.Context, request store.A
 	if err := store.ValidateCanonicalDigest("session lease request digest", request.RequestDigest); err != nil {
 		return nil, err
 	}
-	request.AcquiredAt = normalizeControlTime(request.AcquiredAt)
-	request.ExpiresAt = normalizeOptionalControlTime(request.ExpiresAt)
+	request.AcquiredAt = store.NormalizeControlTime(request.AcquiredAt)
+	request.ExpiresAt = store.NormalizeOptionalControlTime(request.ExpiresAt)
 	if request.ExpiresAt != nil && !request.ExpiresAt.After(request.AcquiredAt) {
 		return nil, store.ValidationErrorf("session lease expiry must be after acquisition")
 	}
@@ -150,23 +150,23 @@ func (s *Store) AcquireSessionMutationLease(ctx context.Context, request store.A
 		return nil, err
 	}
 	if control.SessionUID != request.SessionUID {
-		return nil, controlConflict("session %s/%s UID does not match immutable control record", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s UID does not match immutable control record", request.Namespace, request.SessionName)
 	}
 	if control.Lease != nil && control.Lease.TaskUID == request.TaskUID && control.Lease.Attempt == request.Attempt &&
 		control.Lease.PromptID == request.PromptID {
 		if control.Lease.RequestDigest == request.RequestDigest {
 			return &control, nil
 		}
-		return nil, controlConflict("session lease identity was reused with a different request digest")
+		return nil, store.ConflictErrorf("session lease identity was reused with a different request digest")
 	}
 	if control.Version != request.ExpectedVersion || control.LeaseGeneration != request.ExpectedLeaseGeneration {
-		return nil, controlConflict("session %s/%s is version %d lease generation %d, expected version %d generation %d", request.Namespace, request.SessionName, control.Version, control.LeaseGeneration, request.ExpectedVersion, request.ExpectedLeaseGeneration)
+		return nil, store.ConflictErrorf("session %s/%s is version %d lease generation %d, expected version %d generation %d", request.Namespace, request.SessionName, control.Version, control.LeaseGeneration, request.ExpectedVersion, request.ExpectedLeaseGeneration)
 	}
 	if control.Availability != store.SessionAvailable {
-		return nil, controlConflict("session %s/%s is reconciliation-blocked: %s", request.Namespace, request.SessionName, control.BlockedReason)
+		return nil, store.ConflictErrorf("session %s/%s is reconciliation-blocked: %s", request.Namespace, request.SessionName, control.BlockedReason)
 	}
 	if control.Lease != nil {
-		return nil, controlConflict("session %s/%s is already leased by task %s", request.Namespace, request.SessionName, control.Lease.TaskUID)
+		return nil, store.ConflictErrorf("session %s/%s is already leased by task %s", request.Namespace, request.SessionName, control.Lease.TaskUID)
 	}
 
 	legacyResult, err := tx.ExecContext(ctx,
@@ -178,7 +178,7 @@ func (s *Store) AcquireSessionMutationLease(ctx context.Context, request store.A
 		return nil, err
 	}
 	if err := rowsAffectedExactlyOne(legacyResult, "session active-task lease"); err != nil {
-		return nil, controlConflict("legacy session lock prevented mutation lease acquisition")
+		return nil, store.ConflictErrorf("legacy session lock prevented mutation lease acquisition")
 	}
 	newGeneration := control.LeaseGeneration + 1
 	result, err := tx.ExecContext(ctx,
@@ -236,11 +236,11 @@ func (s *Store) CommitSessionRuntimeGeneration(ctx context.Context, request stor
 	if request.Key.SessionUID != request.SessionUID || request.ExpectedSessionVersion < 1 || request.Generation < 1 {
 		return nil, store.ValidationErrorf("Session RuntimeSession generation commit fence is invalid")
 	}
-	fence, err := normalizeEpochFence(request.Fence)
+	fence, err := store.NormalizeEpochFence(request.Fence)
 	if err != nil {
 		return nil, err
 	}
-	committedAt := normalizeControlTime(request.CommittedAt)
+	committedAt := store.NormalizeControlTime(request.CommittedAt)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -256,16 +256,16 @@ func (s *Store) CommitSessionRuntimeGeneration(ctx context.Context, request stor
 	}
 	if control.SessionUID != request.SessionUID || control.Availability != store.SessionAvailable ||
 		!sessionLeaseMatches(control.Lease, request.Key) {
-		return nil, controlConflict("session %s/%s no longer matches the active RuntimeSession generation commit fence", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s no longer matches the active RuntimeSession generation commit fence", request.Namespace, request.SessionName)
 	}
 	if control.RuntimeSessionGeneration > request.Generation {
-		return nil, controlConflict("session %s/%s RuntimeSession generation is %d, not %d", request.Namespace, request.SessionName, control.RuntimeSessionGeneration, request.Generation)
+		return nil, store.ConflictErrorf("session %s/%s RuntimeSession generation is %d, not %d", request.Namespace, request.SessionName, control.RuntimeSessionGeneration, request.Generation)
 	}
 	if control.RuntimeSessionGeneration == request.Generation {
 		return &control, nil
 	}
 	if control.Version != request.ExpectedSessionVersion {
-		return nil, controlConflict("session %s/%s is version %d, expected %d", request.Namespace, request.SessionName, control.Version, request.ExpectedSessionVersion)
+		return nil, store.ConflictErrorf("session %s/%s is version %d, expected %d", request.Namespace, request.SessionName, control.Version, request.ExpectedSessionVersion)
 	}
 	result, err := tx.ExecContext(ctx,
 		`UPDATE session_controls
@@ -334,12 +334,12 @@ func (s *Store) ReleaseSessionMutationLease(ctx context.Context, request store.R
 	if request.OperationDigest != expectedDigest {
 		return nil, store.ValidationErrorf("session lease release operation digest does not match its Lease request digest")
 	}
-	fence, err := normalizeEpochFence(request.Fence)
+	fence, err := store.NormalizeEpochFence(request.Fence)
 	if err != nil {
 		return nil, err
 	}
 	request.Fence = fence
-	request.ReleasedAt = normalizeControlTime(request.ReleasedAt)
+	request.ReleasedAt = store.NormalizeControlTime(request.ReleasedAt)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -354,16 +354,16 @@ func (s *Store) ReleaseSessionMutationLease(ctx context.Context, request store.R
 		return nil, err
 	}
 	if control.SessionUID != request.SessionUID {
-		return nil, controlConflict("session %s/%s UID does not match immutable control record", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s UID does not match immutable control record", request.Namespace, request.SessionName)
 	}
 	if control.LastOperationID == request.OperationID {
 		if control.LastOperationDigest != request.OperationDigest || control.Lease != nil {
-			return nil, controlConflict("session lease release operation %q was already applied with different target values", request.OperationID)
+			return nil, store.ConflictErrorf("session lease release operation %q was already applied with different target values", request.OperationID)
 		}
 		return &control, nil
 	}
 	if control.Version != request.ExpectedSessionVersion || !sessionLeaseMatches(control.Lease, request.Key) || control.Lease.RequestDigest != request.LeaseRequestDigest {
-		return nil, controlConflict("session %s/%s no longer matches the pre-prompt lease release fence", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s no longer matches the pre-prompt lease release fence", request.Namespace, request.SessionName)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE sessions SET active_task = '', updated_at = ? WHERE namespace = ? AND name = ? AND active_task = ?`,
@@ -422,7 +422,7 @@ func (s *Store) ReconcileSessionControl(ctx context.Context, request store.Recon
 			return nil, err
 		}
 	}
-	fence, err := normalizeEpochFence(request.Fence)
+	fence, err := store.NormalizeEpochFence(request.Fence)
 	if err != nil {
 		return nil, err
 	}
@@ -437,13 +437,13 @@ func (s *Store) ReconcileSessionControl(ctx context.Context, request store.Recon
 	request.VerifiedBaseline.RepositoryID = strings.TrimSpace(request.VerifiedBaseline.RepositoryID)
 	request.VerifiedBaseline.Ref = strings.TrimSpace(request.VerifiedBaseline.Ref)
 	request.VerifiedBaseline.SHA = strings.TrimSpace(request.VerifiedBaseline.SHA)
-	if err := validateVerifiedBaseline(request.VerifiedBaseline); err != nil {
+	if err := store.ValidateVerifiedBaseline(request.VerifiedBaseline); err != nil {
 		return nil, err
 	}
 	if err := store.ValidateCanonicalDigest("session reconciliation operation digest", request.OperationDigest); err != nil {
 		return nil, err
 	}
-	request.ReconciledAt = normalizeControlTime(request.ReconciledAt)
+	request.ReconciledAt = store.NormalizeControlTime(request.ReconciledAt)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -459,19 +459,19 @@ func (s *Store) ReconcileSessionControl(ctx context.Context, request store.Recon
 	}
 	if control.LastOperationID == request.OperationID {
 		if control.LastOperationDigest != request.OperationDigest {
-			return nil, controlConflict("session reconciliation operation %q was reused with a different digest", request.OperationID)
+			return nil, store.ConflictErrorf("session reconciliation operation %q was reused with a different digest", request.OperationID)
 		}
 		if control.Availability == store.SessionAvailable && control.Lease == nil &&
 			control.VerifiedBaseline != nil && reflect.DeepEqual(*control.VerifiedBaseline, request.VerifiedBaseline) {
 			return &control, nil
 		}
-		return nil, controlConflict("session reconciliation operation %q was already applied with different target values", request.OperationID)
+		return nil, store.ConflictErrorf("session reconciliation operation %q was already applied with different target values", request.OperationID)
 	}
 	if control.SessionUID != request.SessionUID || control.Version != request.ExpectedVersion ||
 		control.LeaseGeneration != request.ExpectedLeaseGeneration || control.Lease != nil ||
 		control.Availability != store.SessionReconciliationBlocked ||
 		control.RelatedPublicationID != request.ExpectedRelatedPublicationID {
-		return nil, controlConflict("session %s/%s no longer matches the blocked reconciliation fence", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s no longer matches the blocked reconciliation fence", request.Namespace, request.SessionName)
 	}
 	claim, err := getBranchClaim(ctx, tx, request.BranchClaimID)
 	if err != nil {
@@ -482,7 +482,7 @@ func (s *Store) ReconcileSessionControl(ctx context.Context, request store.Recon
 		claim.Availability != store.BranchClaimReconciliationBlocked ||
 		claim.RelatedPublicationID != request.ExpectedRelatedPublicationID ||
 		claim.RepositoryID != request.VerifiedBaseline.RepositoryID || claim.Ref != request.VerifiedBaseline.Ref {
-		return nil, controlConflict("branch claim %q no longer matches the blocked reconciliation fence", claim.ID)
+		return nil, store.ConflictErrorf("branch claim %q no longer matches the blocked reconciliation fence", claim.ID)
 	}
 	branchResult, err := tx.ExecContext(ctx,
 		`UPDATE branch_claims
@@ -563,7 +563,7 @@ func (s *Store) CreateSessionTurn(ctx context.Context, request store.CreateSessi
 		if sameSessionTurnCreation(existing, normalized) {
 			return &existing, nil
 		}
-		return nil, controlConflict("session turn %q was reused with different prompt input or request digest", normalized.ID)
+		return nil, store.ConflictErrorf("session turn %q was reused with different prompt input or request digest", normalized.ID)
 	} else if !errors.Is(getErr, store.ErrNotFound) {
 		return nil, getErr
 	}
@@ -572,7 +572,7 @@ func (s *Store) CreateSessionTurn(ctx context.Context, request store.CreateSessi
 		return nil, err
 	}
 	if control.Version != request.ExpectedSessionVersion || !sessionLeaseMatches(control.Lease, normalized.Key) {
-		return nil, controlConflict("session turn %q does not match the active session lease/version", normalized.ID)
+		return nil, store.ConflictErrorf("session turn %q does not match the active session lease/version", normalized.ID)
 	}
 	attempt, err := getPromptAttempt(ctx, tx, normalized.PromptAttemptID)
 	if err != nil {
@@ -581,7 +581,7 @@ func (s *Store) CreateSessionTurn(ctx context.Context, request store.CreateSessi
 	if attempt.Key.TaskUID != normalized.Key.TaskUID || attempt.Key.Attempt != normalized.Key.Attempt ||
 		attempt.Key.PromptID != normalized.Key.PromptID || attempt.SessionUID != normalized.Key.SessionUID ||
 		attempt.SessionLeaseGeneration != normalized.Key.LeaseGeneration {
-		return nil, controlConflict("session turn prompt attempt does not match the fenced session turn identity")
+		return nil, store.ConflictErrorf("session turn prompt attempt does not match the fenced session turn identity")
 	}
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO session_turns(
@@ -597,7 +597,7 @@ func (s *Store) CreateSessionTurn(ctx context.Context, request store.CreateSessi
 	)
 	if err != nil {
 		if isSQLiteConstraintError(err) {
-			return nil, controlConflict("session turn %q was created concurrently", normalized.ID)
+			return nil, store.ConflictErrorf("session turn %q was created concurrently", normalized.ID)
 		}
 		return nil, err
 	}
@@ -634,7 +634,7 @@ func (s *Store) FinalizeSessionTurn(ctx context.Context, request store.FinalizeS
 	if err != nil {
 		return nil, err
 	}
-	fence, err := normalizeEpochFence(request.Fence)
+	fence, err := store.NormalizeEpochFence(request.Fence)
 	if err != nil {
 		return nil, err
 	}
@@ -670,11 +670,11 @@ func (s *Store) FinalizeSessionTurn(ctx context.Context, request store.FinalizeS
 	if request.VerifiedBaseline != nil {
 		copyBaseline := *request.VerifiedBaseline
 		request.VerifiedBaseline = &copyBaseline
-		if err := validateVerifiedBaseline(copyBaseline); err != nil {
+		if err := store.ValidateVerifiedBaseline(copyBaseline); err != nil {
 			return nil, err
 		}
 	}
-	request.FinalizedAt = normalizeControlTime(request.FinalizedAt)
+	request.FinalizedAt = store.NormalizeControlTime(request.FinalizedAt)
 	projectionScheduleExplicit := !request.Projection.AvailableAt.IsZero()
 	projection, _, err := normalizeOutboxProjectionForCreate(request.Projection, request.Fence, request.FinalizedAt)
 	if err != nil {
@@ -701,17 +701,17 @@ func (s *Store) FinalizeSessionTurn(ctx context.Context, request store.FinalizeS
 			turn.TerminalContent == request.TerminalContent && turn.PublicationID == request.PublicationID {
 			return &turn, nil
 		}
-		return nil, controlConflict("session turn %q was finalized with different terminal data or digest", turn.ID)
+		return nil, store.ConflictErrorf("session turn %q was finalized with different terminal data or digest", turn.ID)
 	}
 	if turn.Version != request.ExpectedTurnVersion {
-		return nil, controlConflict("session turn %q is version %d, expected %d", turn.ID, turn.Version, request.ExpectedTurnVersion)
+		return nil, store.ConflictErrorf("session turn %q is version %d, expected %d", turn.ID, turn.Version, request.ExpectedTurnVersion)
 	}
 	control, err := getSessionControlByUID(ctx, tx, request.Key.SessionUID)
 	if err != nil {
 		return nil, err
 	}
 	if control.Version != request.ExpectedSessionVersion || !sessionLeaseMatches(control.Lease, request.Key) {
-		return nil, controlConflict("session turn %q finalization is fenced by a different session version or lease", turn.ID)
+		return nil, store.ConflictErrorf("session turn %q finalization is fenced by a different session version or lease", turn.ID)
 	}
 	attempt, err := getPromptAttempt(ctx, tx, turn.PromptAttemptID)
 	if err != nil {
@@ -737,14 +737,14 @@ func (s *Store) FinalizeSessionTurn(ctx context.Context, request store.FinalizeS
 		publication = &value
 		if value.TaskUID != request.Key.TaskUID || value.Attempt != request.Key.Attempt || value.PromptID != request.Key.PromptID ||
 			(value.SessionUID != "" && value.SessionUID != request.Key.SessionUID) || !store.IsTerminalPublicationState(value.State) {
-			return nil, controlConflict("publication %q does not match the terminal session turn identity/state", value.ID)
+			return nil, store.ConflictErrorf("publication %q does not match the terminal session turn identity/state", value.ID)
 		}
 		expectedDelivery, mapErr := promptDeliveryStateForPublication(value.State)
 		if mapErr != nil {
 			return nil, mapErr
 		}
 		if attempt.DeliveryState != expectedDelivery {
-			return nil, controlConflict("prompt attempt delivery state %s does not match publication state %s", attempt.DeliveryState, value.State)
+			return nil, store.ConflictErrorf("prompt attempt delivery state %s does not match publication state %s", attempt.DeliveryState, value.State)
 		}
 		receiptValue := publicationReceipt(value)
 		receipt = &receiptValue
@@ -754,7 +754,7 @@ func (s *Store) FinalizeSessionTurn(ctx context.Context, request store.FinalizeS
 		}
 		if derivedBaseline != nil {
 			if verifiedBaseline != nil && !reflect.DeepEqual(*verifiedBaseline, *derivedBaseline) {
-				return nil, controlConflict("requested verified baseline does not match independent publication receipt")
+				return nil, store.ConflictErrorf("requested verified baseline does not match independent publication receipt")
 			}
 			verifiedBaseline = derivedBaseline
 		}
@@ -899,7 +899,7 @@ func (s *Store) ResumeSessionTurnFinalization(ctx context.Context, request store
 	if err := store.ValidateCanonicalDigest("session turn finalization digest", request.FinalizationDigest); err != nil {
 		return nil, err
 	}
-	fence, err := normalizeEpochFence(request.Fence)
+	fence, err := store.NormalizeEpochFence(request.Fence)
 	if err != nil {
 		return nil, err
 	}
@@ -917,77 +917,9 @@ func (s *Store) ResumeSessionTurnFinalization(ctx context.Context, request store
 	}
 	if turn.State != store.SessionTurnFinalized || turn.Key != request.Key ||
 		turn.PromptAttemptID != request.PromptAttemptID || turn.FinalizationDigest != request.FinalizationDigest {
-		return nil, controlConflict("session turn %q does not match the persisted finalization recovery identity", turnID)
+		return nil, store.ConflictErrorf("session turn %q does not match the persisted finalization recovery identity", turnID)
 	}
 	return &turn, nil
-}
-
-func normalizeSessionControlForCreate(control *store.SessionControl, fence store.ControllerEpochFence) (store.SessionControl, store.ControllerEpochFence, error) {
-	if control == nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("session control is required")
-	}
-	normalized := *control
-	normalized.Namespace = strings.TrimSpace(normalized.Namespace)
-	normalized.SessionName = strings.TrimSpace(normalized.SessionName)
-	normalized.SessionUID = strings.TrimSpace(normalized.SessionUID)
-	for field, value := range map[string]string{
-		"session namespace": normalized.Namespace, "session name": normalized.SessionName,
-		"session UID": normalized.SessionUID,
-	} {
-		if err := store.ValidateControlIdentifier(field, value); err != nil {
-			return store.SessionControl{}, store.ControllerEpochFence{}, err
-		}
-	}
-	if err := store.ValidateCanonicalDigest("session control request digest", normalized.RequestDigest); err != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.Availability == "" {
-		normalized.Availability = store.SessionAvailable
-	}
-	if normalized.Availability != store.SessionAvailable && normalized.Availability != store.SessionReconciliationBlocked {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("unsupported session availability %q", normalized.Availability)
-	}
-	if normalized.Lease != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("new session control must not contain an active lease")
-	}
-	if normalized.LeaseGeneration < 0 {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("session lease generation must not be negative")
-	}
-	normalized.BlockedReason = strings.TrimSpace(normalized.BlockedReason)
-	if normalized.Availability == store.SessionAvailable && (normalized.BlockedReason != "" || normalized.RelatedPromptAttemptID != "" || normalized.RelatedPublicationID != "") {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("available session control must not contain reconciliation block metadata")
-	}
-	if normalized.Availability == store.SessionReconciliationBlocked && normalized.BlockedReason == "" {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("reconciliation-blocked session requires a reason")
-	}
-	if err := store.ValidateControlReason("session blocked reason", normalized.BlockedReason); err != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.VerifiedBaseline != nil {
-		copyBaseline := *normalized.VerifiedBaseline
-		normalized.VerifiedBaseline = &copyBaseline
-		if err := validateVerifiedBaseline(copyBaseline); err != nil {
-			return store.SessionControl{}, store.ControllerEpochFence{}, err
-		}
-	}
-	fence, err := normalizeEpochFence(fence)
-	if err != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.Version != 0 && normalized.Version != 1 {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("new session control version must be zero or one")
-	}
-	now := normalizeControlTime(normalized.CreatedAt)
-	normalized.CreatedAt = now
-	if normalized.UpdatedAt.IsZero() {
-		normalized.UpdatedAt = now
-	} else {
-		normalized.UpdatedAt = normalized.UpdatedAt.UTC()
-	}
-	normalized.ControllerEpochName = fence.Name
-	normalized.ControllerEpoch = fence.Epoch
-	normalized.Version = 1
-	return normalized, fence, nil
 }
 
 func normalizeSessionTurnForCreate(turn store.SessionTurn, fence store.ControllerEpochFence) (store.SessionTurn, store.ControllerEpochFence, error) {
@@ -1028,14 +960,14 @@ func normalizeSessionTurnForCreate(turn store.SessionTurn, fence store.Controlle
 		turn.FinalizationDigest != "" || turn.PublicationID != "" || turn.PublicationReceipt != nil || turn.FinalizedAt != nil {
 		return store.SessionTurn{}, store.ControllerEpochFence{}, store.ValidationErrorf("new session turn must be open and must not contain finalization data")
 	}
-	fence, err = normalizeEpochFence(fence)
+	fence, err = store.NormalizeEpochFence(fence)
 	if err != nil {
 		return store.SessionTurn{}, store.ControllerEpochFence{}, err
 	}
 	if turn.Version != 0 && turn.Version != 1 {
 		return store.SessionTurn{}, store.ControllerEpochFence{}, store.ValidationErrorf("new session turn version must be zero or one")
 	}
-	now := normalizeControlTime(turn.CreatedAt)
+	now := store.NormalizeControlTime(turn.CreatedAt)
 	turn.CreatedAt = now
 	if turn.UpdatedAt.IsZero() {
 		turn.UpdatedAt = now
@@ -1046,16 +978,6 @@ func normalizeSessionTurnForCreate(turn store.SessionTurn, fence store.Controlle
 	turn.ControllerEpoch = fence.Epoch
 	turn.Version = 1
 	return turn, fence, nil
-}
-
-func validateVerifiedBaseline(baseline store.VerifiedBranchBaseline) error {
-	if err := store.ValidateControlIdentifier("verified repository ID", strings.TrimSpace(baseline.RepositoryID)); err != nil {
-		return err
-	}
-	if err := store.ValidateFullBranchRef(strings.TrimSpace(baseline.Ref)); err != nil {
-		return err
-	}
-	return store.ValidateGitObjectID("verified branch SHA", baseline.SHA)
 }
 
 func baselineColumns(baseline *store.VerifiedBranchBaseline) (string, string, string) {
@@ -1084,13 +1006,13 @@ func validatePromptAttemptForFinalization(attempt store.PromptAttempt, request s
 	if attempt.Key.TaskUID != request.Key.TaskUID || attempt.Key.Attempt != request.Key.Attempt ||
 		attempt.Key.PromptID != request.Key.PromptID || attempt.SessionUID != request.Key.SessionUID ||
 		attempt.SessionLeaseGeneration != request.Key.LeaseGeneration {
-		return controlConflict("prompt attempt %q does not match the fenced session turn identity", attempt.ID)
+		return store.ConflictErrorf("prompt attempt %q does not match the fenced session turn identity", attempt.ID)
 	}
 	if !store.IsTerminalPromptExecutionState(attempt.ExecutionState) {
-		return controlConflict("prompt attempt %q execution is not terminal: %s", attempt.ID, attempt.ExecutionState)
+		return store.ConflictErrorf("prompt attempt %q execution is not terminal: %s", attempt.ID, attempt.ExecutionState)
 	}
 	if !store.IsTerminalPromptDeliveryState(attempt.DeliveryState) {
-		return controlConflict("prompt attempt %q delivery is not terminal: %s", attempt.ID, attempt.DeliveryState)
+		return store.ConflictErrorf("prompt attempt %q delivery is not terminal: %s", attempt.ID, attempt.DeliveryState)
 	}
 	if request.TerminalKind == store.SessionTurnAssistantResult && attempt.ExecutionState != store.PromptExecutionSucceeded {
 		return store.ValidationErrorf("assistant-result finalization requires succeeded prompt execution, got %s", attempt.ExecutionState)
@@ -1101,7 +1023,7 @@ func validatePromptAttemptForFinalization(attempt store.PromptAttempt, request s
 			store.PromptDeliveryReadOnlyWorkspaceModified, store.PromptDeliveryCredentialBlocked, store.PromptDeliveryConflict:
 			return nil
 		default:
-			return controlConflict("prompt attempt delivery state %s requires a matching publication receipt", attempt.DeliveryState)
+			return store.ConflictErrorf("prompt attempt delivery state %s requires a matching publication receipt", attempt.DeliveryState)
 		}
 	}
 	return nil
@@ -1155,7 +1077,7 @@ func finalizeBranchClaimTx(ctx context.Context, tx *sql.Tx, publication store.Pu
 	if claim.Generation != publication.BranchClaimGeneration || claim.RepositoryID != publication.TargetRepositoryID ||
 		claim.Ref != publication.TargetRef || !claim.LastVerified.Equal(publication.Baseline) ||
 		claim.Availability != store.BranchClaimAvailable {
-		return controlConflict("branch claim %q no longer matches publication finalization baseline/generation", claim.ID)
+		return store.ConflictErrorf("branch claim %q no longer matches publication finalization baseline/generation", claim.ID)
 	}
 	newRemote := claim.LastVerified
 	claimAvailability := store.BranchClaimAvailable

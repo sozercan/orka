@@ -43,14 +43,6 @@ func TestRepositoryMonitorStoreCRUD(t *testing.T) {
 	if got.Generation != 2 || got.Branch != "develop" {
 		t.Fatalf("monitor = %#v, want updated generation and branch", got)
 	}
-
-	list, next, err := s.ListRepositoryMonitors(ctx, "demo", 10, "")
-	if err != nil {
-		t.Fatalf("ListRepositoryMonitors() error = %v", err)
-	}
-	if next != "" || len(list) != 1 {
-		t.Fatalf("list len=%d next=%q, want one item and no cursor", len(list), next)
-	}
 }
 
 //nolint:gocyclo // This store smoke test intentionally covers related monitor tables together.
@@ -102,13 +94,18 @@ func TestMonitorStoreRunsItemsReviewsRepairsAndEvents(t *testing.T) {
 	}
 
 	if err := s.CreateReviewRecord(ctx, &store.ReviewRecord{
-		ID:               "review-1",
-		MonitorNamespace: "demo",
-		MonitorName:      "orka",
-		Kind:             "pull_request",
-		Number:           42,
-		HeadSHA:          "abc123",
-		Verdict:          "needs_changes",
+		ID:                      "review-1",
+		MonitorNamespace:        "demo",
+		MonitorName:             "orka",
+		Kind:                    "pull_request",
+		Number:                  42,
+		HeadSHA:                 "abc123",
+		Verdict:                 "needs_changes",
+		ValidationTask:          "review-1-validation",
+		ValidationImage:         "ghcr.io/example/validation:1",
+		ValidationCommandDigest: "sha256:1bb497e3e13a1105cf24e3359fa3ef75de08b66ff8a2839cd7f9ea97824d9eb3",
+		ValidationStatus:        "failed",
+		ValidationEvidence:      "package example failed",
 	}); err != nil {
 		t.Fatalf("CreateReviewRecord() error = %v", err)
 	}
@@ -116,7 +113,7 @@ func TestMonitorStoreRunsItemsReviewsRepairsAndEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListReviewRecords() error = %v", err)
 	}
-	if len(reviews) != 1 || reviews[0].ID != "review-1" {
+	if len(reviews) != 1 || reviews[0].ID != "review-1" || reviews[0].ValidationTask != "review-1-validation" || reviews[0].ValidationImage != "ghcr.io/example/validation:1" || reviews[0].ValidationCommandDigest != "sha256:1bb497e3e13a1105cf24e3359fa3ef75de08b66ff8a2839cd7f9ea97824d9eb3" || reviews[0].ValidationStatus != "failed" || reviews[0].ValidationEvidence != "package example failed" {
 		t.Fatalf("reviews = %#v, want review-1", reviews)
 	}
 
@@ -207,6 +204,13 @@ func TestMonitorStoreRunsItemsReviewsRepairsAndEvents(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].ID != "event-1" {
 		t.Fatalf("events = %#v, want event-1", events)
+	}
+	events, _, err = s.ListMonitorEvents(ctx, store.MonitorEventFilter{Namespace: "demo", ID: "missing-event"})
+	if err != nil {
+		t.Fatalf("ListMonitorEvents(ID) error = %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events filtered by missing ID = %#v, want none", events)
 	}
 }
 
@@ -592,12 +596,9 @@ func TestMonitorWorkflowStoresActionsJobsAndMutations(t *testing.T) {
 	if err := s.CreateWorkAction(ctx, action); err != nil {
 		t.Fatalf("CreateWorkAction() error = %v", err)
 	}
-	leased, err := s.LeaseNextWorkAction(ctx, store.WorkActionFilter{Namespace: "demo", MonitorName: "orka", DesiredAction: "implement"}, "controller-1", time.Minute)
+	leased, err := s.GetWorkAction(ctx, "demo", "wa-1")
 	if err != nil {
-		t.Fatalf("LeaseNextWorkAction() error = %v", err)
-	}
-	if leased.ID != "wa-1" || leased.Status != "leased" || leased.LeaseOwner != "controller-1" || leased.Attempt != 1 || leased.LeaseExpiresAt == nil {
-		t.Fatalf("leased action = %#v, want leased wa-1 with owner/attempt/expiry", leased)
+		t.Fatalf("GetWorkAction() error = %v", err)
 	}
 	leased.Status = "running"
 	leased.TaskName = "task-1"

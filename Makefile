@@ -19,15 +19,9 @@ ACP_RUNTIME_PROVIDERS = codex claude copilot opencode
 ACP_RUNTIME_IMGS = $(ACP_CODEX_RUNTIME_IMG) $(ACP_CLAUDE_RUNTIME_IMG) $(ACP_COPILOT_RUNTIME_IMG) $(ACP_OPENCODE_RUNTIME_IMG)
 RUN_CONTROLLER_MODE ?= harness-v2
 RUN_WATCH_NAMESPACE ?= orka-system
+RUN_STORE_PATH ?= /data/orka.db
 RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE ?=
 RUN_EXECUTION_MODE_CONTROLLER_USERNAMES ?= $(shell "$(KUBECTL)" auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null)
-
-# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
-ifeq (,$(shell go env GOBIN))
-GOBIN=$(shell go env GOPATH)/bin
-else
-GOBIN=$(shell go env GOBIN)
-endif
 
 # CONTAINER_TOOL defines the container tool to be used for building images.
 # Be aware that the target commands are only tested with Docker which is
@@ -250,8 +244,7 @@ demo-cluster-up-all: ## ONE substrate-flavored kind cluster that runs the local 
 	ORKA_DEMO_CLUSTER=$${KIND_CLUSTER:-orka-agent-substrate-e2e} hack/demos/cluster/install-agent-sandbox.sh
 
 .PHONY: demo-cluster-up-all-down
-demo-cluster-up-all-down: ## Tear down the unified demo cluster
-	kind delete cluster --name $${KIND_CLUSTER:-orka-agent-substrate-e2e}
+demo-cluster-up-all-down: demo-substrate-down ## Tear down the unified demo cluster (alias of demo-substrate-down)
 
 .PHONY: demo-images
 demo-images: ## Build + kind-load demo-only sandbox runtime image
@@ -309,14 +302,12 @@ docs-cli-check: build-cli ## Check generated CLI command reference docs are up t
 build-cli: ## Build orka CLI binary.
 	go build -ldflags "-X main.version=$(shell git describe --tags --always --dirty 2>/dev/null || echo dev)" -o bin/orka ./cmd/cli/
 
-.PHONY: build-all
-build-all: build build-cli ## Build all binaries.
-
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
 	POD_NAMESPACE="$(RUN_WATCH_NAMESPACE)" go run ./cmd --leader-elect=true \
 		--controller-mode="$(RUN_CONTROLLER_MODE)" \
 		--watch-namespace="$(RUN_WATCH_NAMESPACE)" \
+		--store-path="$(RUN_STORE_PATH)" \
 		--agent-execution-snapshot-key-file="$(RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE)" \
 		--enforce-namespace-isolation=true \
 		--execution-mode-controller-usernames="$(RUN_EXECUTION_MODE_CONTROLLER_USERNAMES)"
@@ -517,6 +508,7 @@ deploy: verify-acp-runtime-images verify-static-mode-crds manifests kustomize ##
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	"$(KUBECTL)" delete validatingwebhookconfiguration orka-admission --ignore-not-found=true
 	"$(KUSTOMIZE)" build config/acp-production | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Dependencies

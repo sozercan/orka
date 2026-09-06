@@ -10,7 +10,7 @@ repo_root="$(cd "${demo_dir}/../.." && pwd)"
 . "${demo_lib_dir}/style.sh"
 
 : "${ORKA_NAMESPACE:=orka-system}"
-: "${DEMO_NAMESPACE:=demo-magic}"
+: "${DEMO_NAMESPACE:=orka-system}"
 : "${ORKA_TOKEN_NAMESPACE:=default}"
 : "${ORKA_API_BASE:=http://127.0.0.1:8080}"
 : "${ORKA_API_SERVICE_NAME:=orka-api}"

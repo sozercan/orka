@@ -23,6 +23,7 @@ import (
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/contexttoken"
 	"github.com/orka-agents/orka/internal/labels"
+	"github.com/orka-agents/orka/internal/store"
 	orkatracing "github.com/orka-agents/orka/internal/tracing"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -103,8 +104,10 @@ type DelegateTaskArgs struct {
 
 // DelegateTaskResult represents the delegation result
 type DelegateTaskResult struct {
-	TaskName string `json:"taskName"`
-	Status   string `json:"status"`
+	TaskName      string `json:"taskName"`
+	TaskUID       string `json:"taskUID,omitempty"`
+	ParentTaskUID string `json:"parentTaskUID,omitempty"`
+	Status        string `json:"status"`
 }
 
 // NewDelegateTaskTool creates a new delegate task tool
@@ -612,6 +615,19 @@ func (t *DelegateTaskTool) buildDelegatedTask(ctx context.Context, dc *delegatio
 	}
 
 	inheritTaskProvenance(childTask, dc.parentTask)
+	if toolCtx := GetToolContext(ctx); toolCtx != nil && toolCtx.Brokered {
+		if dc.parentTask.UID == "" {
+			return nil, fmt.Errorf("brokered delegation requires an immutable parent Task UID")
+		}
+		childTask.Annotations[labels.AnnotationParentTaskUID] = string(dc.parentTask.UID)
+		if toolCtx.ExternalEffects != nil || strings.TrimSpace(toolCtx.SessionID) != "" || strings.TrimSpace(toolCtx.OperationID) != "" {
+			effectID, err := brokeredDelegationEffectID(toolCtx)
+			if err != nil {
+				return nil, err
+			}
+			childTask.Annotations[labels.AnnotationDelegationEffectID] = effectID
+		}
+	}
 
 	// Set owner reference only for same-namespace children. Kubernetes treats
 	// cross-namespace owner references for namespaced objects as invalid and may
@@ -921,8 +937,10 @@ func (t *DelegateTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	}
 
 	result := DelegateTaskResult{
-		TaskName: childTask.Name,
-		Status:   GitHubPullRequestStatusCreated,
+		TaskName:      childTask.Name,
+		TaskUID:       string(childTask.UID),
+		ParentTaskUID: string(dc.parentTask.UID),
+		Status:        GitHubPullRequestStatusCreated,
 	}
 
 	output, err := json.Marshal(result)
@@ -931,6 +949,23 @@ func (t *DelegateTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	}
 
 	return string(output), nil
+}
+
+func brokeredDelegationEffectID(toolCtx *ToolContext) (string, error) {
+	if toolCtx == nil || !toolCtx.Brokered {
+		return "", nil
+	}
+	identity := store.ExternalEffectIdentity{
+		Kind:        "acp-mcp-tool",
+		Namespace:   strings.TrimSpace(toolCtx.Namespace),
+		AggregateID: strings.TrimSpace(toolCtx.SessionID),
+		OperationID: strings.TrimSpace(toolCtx.OperationID),
+	}
+	id, err := identity.CanonicalID()
+	if err != nil {
+		return "", fmt.Errorf("bind brokered delegation to its durable effect: %w", err)
+	}
+	return id, nil
 }
 
 func markChildTransactionTokenPending(childTask *corev1alpha1.Task) {

@@ -8,9 +8,13 @@ import { cn } from '@/lib/utils'
 
 interface StatsCardsProps {
   tasks?: Task[]
+  /** True when the bounded task walk stopped with more pages available. */
+  tasksTruncated?: boolean
   /** Set when the tasks list failed with 403; the task cards show this instead of "0". */
   tasksForbiddenMessage?: string
   sessionCount?: number
+  /** True when the bounded session walk stopped with more pages available. */
+  sessionsTruncated?: boolean
   /** Set when the sessions list failed with 403; the card shows this instead of "0". */
   sessionsForbiddenMessage?: string
   agentCount?: number
@@ -77,8 +81,10 @@ function taskWindow(tasks: Task[]): { min: number; max: number } | null {
 
 export function StatsCards({
   tasks,
+  tasksTruncated,
   tasksForbiddenMessage,
   sessionCount,
+  sessionsTruncated,
   sessionsForbiddenMessage,
   agentCount,
   agentsForbiddenMessage,
@@ -121,7 +127,7 @@ export function StatsCards({
   // when there are no failures, rather than echoing the total trend).
   const window = taskWindow(allTasks)
   const stats = [
-    { label: 'Total Tasks', value: total, icon: ListTodo, color: 'text-foreground', spark: 'text-primary', series: cumulativeSeries(allTasks, window) },
+    { label: tasksTruncated ? 'Tasks loaded' : 'Total Tasks', value: total, icon: ListTodo, color: 'text-foreground', spark: 'text-primary', series: cumulativeSeries(allTasks, window) },
     { label: 'Running', value: running, icon: Play, color: phaseStyle('Running').textClass, spark: phaseStyle('Running').textClass, series: cumulativeSeries(runningTasks, window) },
     {
       label: 'Succeeded',
@@ -129,7 +135,9 @@ export function StatsCards({
       icon: CheckCircle,
       color: phaseStyle('Succeeded').textClass,
       spark: phaseStyle('Succeeded').textClass,
-      sub: successRate !== null ? `${successRate}% success rate` : undefined,
+      sub: successRate !== null
+        ? (tasksTruncated ? `${successRate}% of loaded finished tasks` : `${successRate}% success rate`)
+        : undefined,
       series: cumulativeSeries(succeededTasks, window),
     },
     { label: 'Failed', value: failed, icon: XCircle, color: phaseStyle('Failed').textClass, spark: phaseStyle('Failed').textClass, series: cumulativeSeries(failedTasks, window) },
@@ -162,7 +170,7 @@ export function StatsCards({
       ))}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-          <CardTitle className="text-sm font-medium">Sessions</CardTitle>
+          <CardTitle className="text-sm font-medium">{sessionsTruncated ? 'Sessions loaded' : 'Sessions'}</CardTitle>
           <MessageSquare className="h-4 w-4 text-muted-foreground" />
         </CardHeader>
         <CardContent>

@@ -57,7 +57,7 @@ var _ = Describe("Orka CLI substrate pool binary workflow", Ordered, func() {
 		DeferCleanup(deleteK8sResource, "substrateactorpool", poolName)
 
 		By("creating a minimal SubstrateActorPool with a templateRef and desired counts")
-		poolManifest := writeTempManifest(tmpDir, "pool.yaml", substratePoolManifest(poolName, "e2e-cli-template", 1, 1, false))
+		poolManifest := writeTempManifest(tmpDir, "pool.yaml", substratePoolManifest(poolName, "e2e-cli-template", 1, false))
 		expectOrkaSuccess(runOrka(home, "substrate", "pool", "create", "-f", poolManifest), token)
 
 		By("getting the substrate actor pool as JSON")
@@ -68,7 +68,6 @@ var _ = Describe("Orka CLI substrate pool binary workflow", Ordered, func() {
 		Expect(nestedStringFromMap(pool, "metadata", "namespace")).To(Equal(namespace))
 		Expect(nestedStringFromMap(pool, "spec", "templateRef", "name")).To(Equal("e2e-cli-template"))
 		Expect(nestedNumberFromMap(pool, "spec", "targetActors")).To(BeNumerically("==", 1))
-		Expect(nestedNumberFromMap(pool, "spec", "targetWorkers")).To(BeNumerically("==", 1))
 
 		By("listing substrate actor pools as JSON")
 		list := runOrka(home, "substrate", "pool", "list", "-o", "json")
@@ -76,7 +75,7 @@ var _ = Describe("Orka CLI substrate pool binary workflow", Ordered, func() {
 		expectListContainsName(expectJSONOutput(list.Stdout), poolName)
 
 		By("updating an observable substrate actor pool spec field")
-		updatedManifest := writeTempManifest(tmpDir, "pool-updated.yaml", substratePoolManifest(poolName, "e2e-cli-template", 2, 1, true))
+		updatedManifest := writeTempManifest(tmpDir, "pool-updated.yaml", substratePoolManifest(poolName, "e2e-cli-template", 2, true))
 		expectOrkaSuccess(runOrka(home, "substrate", "pool", "update", poolName, "-f", updatedManifest), token)
 		updated := expectJSONObject(runSuccessfulOrka(home, []string{token}, "substrate", "pool", "get", poolName, "-o", "json").Stdout)
 		Expect(nestedNumberFromMap(updated, "spec", "targetActors")).To(BeNumerically("==", 2))
@@ -93,8 +92,8 @@ var _ = Describe("Orka CLI substrate pool binary workflow", Ordered, func() {
 })
 
 // substratePoolManifest is minimal for the current SubstrateActorPoolSpec: templateRef is required;
-// targetActors/targetWorkers/precreateActors provide observable spec fields for create/update assertions.
-func substratePoolManifest(name, templateName string, targetActors, targetWorkers int32, precreateActors bool) string {
+// targetActors/precreateActors provide observable spec fields for create/update assertions.
+func substratePoolManifest(name, templateName string, targetActors int32, precreateActors bool) string {
 	return fmt.Sprintf(`
 apiVersion: core.orka.ai/v1alpha1
 kind: SubstrateActorPool
@@ -104,7 +103,6 @@ spec:
   templateRef:
     name: %s
   targetActors: %d
-  targetWorkers: %d
   precreateActors: %t
-`, name, templateName, targetActors, targetWorkers, precreateActors)
+`, name, templateName, targetActors, precreateActors)
 }

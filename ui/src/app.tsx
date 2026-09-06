@@ -3,6 +3,7 @@ import { RouterProvider, createRouter } from '@tanstack/react-router'
 import { routeTree } from './routeTree.gen'
 import { useAuthStore } from './stores/auth'
 import { useChatStore } from './stores/chat'
+import { useUIStore } from './stores/ui'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -25,6 +26,18 @@ useAuthStore.subscribe((state) => {
     lastToken = state.token
     queryClient.clear()
     useChatStore.getState().resetForIdentityChange()
+  }
+})
+
+// Namespace changes can happen from the global header while Chat is not
+// mounted. Keep the chat store synchronized here so switching namespaces
+// always resets the old transcript and aborts its in-flight turn.
+let lastNamespace = useUIStore.getState().namespace
+useChatStore.getState().selectNamespace(lastNamespace)
+useUIStore.subscribe((state) => {
+  if (state.namespace !== lastNamespace) {
+    lastNamespace = state.namespace
+    useChatStore.getState().selectNamespace(state.namespace)
   }
 })
 

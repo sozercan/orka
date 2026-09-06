@@ -39,7 +39,7 @@ func (s *Store) ReserveExternalEffect(ctx context.Context, request store.Reserve
 	}
 	defer s.releaseControllerEpochMutation(snapshot)
 	request.Fence = fence
-	request.CreatedAt = normalizeControlTime(request.CreatedAt)
+	request.CreatedAt = store.NormalizeControlTime(request.CreatedAt)
 
 	key := client.ObjectKey{Namespace: request.Identity.Namespace, Name: objectName(externalEffectNamePrefix, id)}
 	object := &corev1alpha1.ExternalEffect{}
@@ -115,7 +115,7 @@ func (s *Store) GetExternalEffectByIdentity(ctx context.Context, identity store.
 	}
 	if object.Spec.ID != id || object.Spec.Kind != identity.Kind || object.Spec.IdentityNamespace != identity.Namespace ||
 		object.Spec.AggregateID != identity.AggregateID || object.Spec.OperationID != identity.OperationID {
-		return nil, controlConflict("external effect %q does not match its deterministic identity", id)
+		return nil, store.ConflictErrorf("external effect %q does not match its deterministic identity", id)
 	}
 	result := externalEffectFromObject(object)
 	return &result, nil
@@ -144,16 +144,16 @@ func (s *Store) TransitionExternalEffect(ctx context.Context, transition store.E
 	}
 	effect := externalEffectFromObject(object)
 	if effect.RequestDigest != transition.RequestDigest {
-		return nil, controlConflict("external effect %q request digest does not match reserved identity", effect.ID)
+		return nil, store.ConflictErrorf("external effect %q request digest does not match reserved identity", effect.ID)
 	}
 	if effect.State == transition.NewState && effect.ResponseDigest == transition.ResponseDigest && bytes.Equal(effect.Response, transition.Response) && effect.LeaseOwner == transition.LeaseOwner && sameOptionalTime(effect.LeaseExpiresAt, transition.LeaseExpiresAt) {
 		return &effect, nil
 	}
 	if effect.Version != transition.ExpectedVersion || effect.State != transition.ExpectedState || effect.LeaseOwner != transition.ExpectedLeaseOwner {
-		return nil, controlConflict("external effect %q no longer matches expected version, state, or lease owner", effect.ID)
+		return nil, store.ConflictErrorf("external effect %q no longer matches expected version, state, or lease owner", effect.ID)
 	}
 	if transition.ExpectedState == store.ExternalEffectInFlight && transition.NewState == store.ExternalEffectInFlight && effect.LeaseOwner != transition.LeaseOwner && effect.LeaseExpiresAt != nil && effect.LeaseExpiresAt.After(transition.UpdatedAt) {
-		return nil, controlConflict("external effect %q is still leased by %q", effect.ID, effect.LeaseOwner)
+		return nil, store.ConflictErrorf("external effect %q is still leased by %q", effect.ID, effect.LeaseOwner)
 	}
 
 	updated := object.DeepCopy()
@@ -175,7 +175,7 @@ func (s *Store) TransitionExternalEffect(ctx context.Context, transition store.E
 
 func (s *Store) completeExternalEffectCreation(ctx context.Context, object *corev1alpha1.ExternalEffect, request store.ReserveExternalEffectRequest, id string, fence store.ControllerEpochFence, snapshot epochSnapshot) (*store.ExternalEffect, error) {
 	if !sameExternalEffectSpec(object, request, id) {
-		return nil, controlConflict("external effect %q was reused with a different identity or request digest", id)
+		return nil, store.ConflictErrorf("external effect %q was reused with a different identity or request digest", id)
 	}
 	if object.Status.Version > 0 {
 		existing := externalEffectFromObject(object)
@@ -212,7 +212,7 @@ func (s *Store) findExternalEffectByID(ctx context.Context, id string) (*corev1a
 			continue
 		}
 		if match != nil {
-			return nil, controlConflict("multiple external effects exist for canonical ID %q", id)
+			return nil, store.ConflictErrorf("multiple external effects exist for canonical ID %q", id)
 		}
 		match = list.Items[i].DeepCopy()
 	}
@@ -226,10 +226,10 @@ func validateExternalEffectTransition(transition *store.ExternalEffectTransition
 	if transition.ExpectedVersion < 1 {
 		return store.ValidationErrorf("external effect expected version must be at least 1")
 	}
-	if !isKnownExternalEffectState(transition.ExpectedState) || !isKnownExternalEffectState(transition.NewState) {
+	if !store.IsKnownExternalEffectState(transition.ExpectedState) || !store.IsKnownExternalEffectState(transition.NewState) {
 		return store.ValidationErrorf("unsupported external effect transition %q -> %q", transition.ExpectedState, transition.NewState)
 	}
-	if !validExternalEffectTransition(transition.ExpectedState, transition.NewState) {
+	if !store.ValidExternalEffectTransition(transition.ExpectedState, transition.NewState) {
 		return store.ValidationErrorf("external effect transition %s -> %s is not allowed", transition.ExpectedState, transition.NewState)
 	}
 	if err := store.ValidateCanonicalDigest("external effect request digest", transition.RequestDigest); err != nil {
@@ -237,8 +237,8 @@ func validateExternalEffectTransition(transition *store.ExternalEffectTransition
 	}
 	transition.ExpectedLeaseOwner = strings.TrimSpace(transition.ExpectedLeaseOwner)
 	transition.LeaseOwner = strings.TrimSpace(transition.LeaseOwner)
-	transition.LeaseExpiresAt = normalizeOptionalControlTime(transition.LeaseExpiresAt)
-	transition.UpdatedAt = normalizeControlTime(transition.UpdatedAt)
+	transition.LeaseExpiresAt = store.NormalizeOptionalControlTime(transition.LeaseExpiresAt)
+	transition.UpdatedAt = store.NormalizeControlTime(transition.UpdatedAt)
 	if transition.ExpectedState == store.ExternalEffectInFlight {
 		if err := store.ValidateControlIdentifier("expected external effect lease owner", transition.ExpectedLeaseOwner); err != nil {
 			return err
@@ -267,7 +267,7 @@ func validateExternalEffectTransition(transition *store.ExternalEffectTransition
 			if err := store.ValidateCanonicalDigest("external effect response digest", transition.ResponseDigest); err != nil {
 				return err
 			}
-			if canonicalBytesDigest(transition.Response) != transition.ResponseDigest {
+			if store.CanonicalBytesDigest(transition.Response) != transition.ResponseDigest {
 				return store.ValidationErrorf("external effect response digest does not match response bytes")
 			}
 		} else if transition.ResponseDigest != "" {
@@ -325,24 +325,4 @@ func metaTimePtr(value *time.Time) *metav1.Time {
 	}
 	result := metav1.NewTime(value.UTC())
 	return &result
-}
-
-func isKnownExternalEffectState(state store.ExternalEffectState) bool {
-	switch state {
-	case store.ExternalEffectPending, store.ExternalEffectInFlight, store.ExternalEffectSucceeded, store.ExternalEffectFailed, store.ExternalEffectOutcomeUnknown:
-		return true
-	default:
-		return false
-	}
-}
-
-func validExternalEffectTransition(from, to store.ExternalEffectState) bool {
-	switch from {
-	case store.ExternalEffectPending:
-		return to == store.ExternalEffectInFlight || to == store.ExternalEffectSucceeded || to == store.ExternalEffectFailed || to == store.ExternalEffectOutcomeUnknown
-	case store.ExternalEffectInFlight:
-		return to == store.ExternalEffectInFlight || to == store.ExternalEffectSucceeded || to == store.ExternalEffectFailed || to == store.ExternalEffectOutcomeUnknown
-	default:
-		return false
-	}
 }

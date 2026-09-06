@@ -60,14 +60,6 @@ describe('index.css design tokens', () => {
     expect(tokenValue(themeBody, '--font-mono')).toMatch(/JetBrains Mono/)
   })
 
-  it('defines an elevation ramp (canvas / surface / elevated) in both themes', () => {
-    for (const body of [themeBody, darkBody]) {
-      expect(tokenValue(body, '--color-canvas')).toBeTruthy()
-      expect(tokenValue(body, '--color-surface')).toBeTruthy()
-      expect(tokenValue(body, '--color-elevated')).toBeTruthy()
-    }
-  })
-
   it('defines the four phase status tokens in both themes', () => {
     for (const body of [themeBody, darkBody]) {
       for (const phase of ['pending', 'running', 'succeeded', 'failed']) {

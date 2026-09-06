@@ -33,10 +33,10 @@ Neither Git Secret is delivered to the ACP process tree.
 ```bash
 # Update spec.providerRef.name in agents.yaml to match your Provider CRD.
 # Replace the placeholder values in secret.yaml before applying it.
-kubectl apply -f examples/github-cicd/secret.yaml
+kubectl -n orka-system apply -f examples/github-cicd/secret.yaml
 
-kubectl apply -k examples/github-cicd
-kubectl apply -f examples/github-cicd/task.yaml
+kubectl -n orka-system apply -k examples/github-cicd
+kubectl -n orka-system apply -f examples/github-cicd/task.yaml
 ```
 
 Before running the Task, edit `task.yaml` and replace:

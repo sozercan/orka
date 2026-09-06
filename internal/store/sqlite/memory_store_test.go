@@ -57,17 +57,6 @@ func TestMemoryStore(t *testing.T) {
 		t.Fatalf("ListMemories = %+v, want created memory", listed)
 	}
 
-	if err := s.MarkMemoriesRecalled(ctx, "ns-mem", []string{memory.ID}); err != nil {
-		t.Fatalf("MarkMemoriesRecalled: %v", err)
-	}
-	got, err = s.GetMemory(ctx, "ns-mem", memory.ID)
-	if err != nil {
-		t.Fatalf("GetMemory after recall: %v", err)
-	}
-	if got.RecalledCount != 1 || got.LastRecalledAt == nil {
-		t.Fatalf("recall stats not updated: %+v", got)
-	}
-
 	if err := s.SetMemoryDisabled(ctx, "ns-mem", memory.ID, true); err != nil {
 		t.Fatalf("SetMemoryDisabled: %v", err)
 	}

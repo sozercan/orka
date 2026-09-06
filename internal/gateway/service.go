@@ -264,21 +264,6 @@ func (s *Service) runDeliveryLoop(ctx context.Context, logger logr.Logger) {
 	}
 }
 
-// ProcessOnce performs one bounded core iteration and one delivery attempt for tests.
-func (s *Service) ProcessOnce(ctx context.Context) error {
-	if s == nil || !s.Config.Enabled || s.Client == nil || s.EventStore == nil || s.DeliveryStore == nil {
-		return nil
-	}
-	var errs []error
-	if err := s.processCoreOnce(ctx); err != nil {
-		errs = append(errs, err)
-	}
-	if err := s.processDeliveryBatch(ctx); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
-}
-
 func (s *Service) processDeliveryBatch(ctx context.Context) error {
 	batchSize := max(s.Config.BatchSize, 1)
 	errs := make(chan error, batchSize)

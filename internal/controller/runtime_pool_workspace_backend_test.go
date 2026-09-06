@@ -271,7 +271,6 @@ func runtimePoolWorkspaceTestMaterialization(
 
 	pod := runtimePoolWorkspaceReadyPod(pool, template, "sandbox-pod", "sandbox-pod-uid", ip)
 	pod.Labels = cloneStringMap(sandbox.Spec.PodTemplate.ObjectMeta.Labels)
-	delete(pod.Labels, sandboxextv1beta1.SandboxIDLabel)
 	pod.Labels[sandboxcontrollers.SandboxNameHashLabel] = sandboxcontrollers.NameHash(sandbox.Name)
 	if err := controllerutil.SetControllerReference(sandbox, &pod, r.Scheme); err != nil {
 		t.Fatalf("Set runtime Pod Sandbox owner reference: %v", err)
@@ -334,6 +333,43 @@ func assertWorkspaceRuntimePoolBootstrapEnvironment(
 	baseEnvironment := append([]corev1.EnvVar(nil), env...)
 	baseEnvironment = append(baseEnvironment, corev1.EnvVar{Name: "ORKA_ACP_PROVIDER_TOKEN_FILE", Value: runtimePoolProviderTokenPath})
 	assertRuntimePoolEnvironment(t, r, pool, baseEnvironment)
+}
+
+func TestHistoricalRuntimePoolImageRecoveryRejectsOwnedSandboxTemplateWithoutControllerProvenance(t *testing.T) {
+	scheme := runtimePoolWorkspaceTestScheme(t)
+	pool := runtimePoolWorkspaceTestObject()
+	r := runtimePoolTestReconciler(t, scheme, nil, pool)
+	cfg, err := r.runtimePoolConfigForDrain(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := map[string]string{runtimePoolKeyLabel: cfg.labels[runtimePoolKeyLabel]}
+	deployed := r.runtimePoolPodTemplate(pool, cfg, selector, "legacy-auth", "legacy-provider")
+	deployed = runtimePoolWorkspaceBootstrapTemplate(deployed, "legacy-nonce", "legacy-public-key")
+	if err := r.createRuntimePoolSandboxTemplate(context.Background(), pool, cfg, deployed); err != nil {
+		t.Fatal(err)
+	}
+
+	authorized, err := r.historicalRuntimePoolImageAuthorized(context.Background(), pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorized {
+		t.Fatal("caller-constructible SandboxTemplate authorized the historical workspace image")
+	}
+	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+		Type:               acpRuntimePoolImageProvenanceCondition,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: pool.Generation,
+		Reason:             acpRuntimePoolImageProvenanceReason,
+	})
+	authorized, err = r.historicalRuntimePoolImageAuthorized(context.Background(), pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authorized {
+		t.Fatal("controller-written provenance did not authorize the historical workspace image")
+	}
 }
 
 func TestWorkspaceRuntimePoolMaterializesProviderWorkload(t *testing.T) {
@@ -959,13 +995,17 @@ func TestWorkspaceRuntimePoolServesThroughSandboxPod(t *testing.T) {
 	runtimePoolReconcile(t, r, pool)
 	template, _, _ := runtimePoolWorkspaceTestChildren(t, r, pool)
 	pod := runtimePoolWorkspaceTestMaterialization(t, r, pool, template, "10.0.0.71")
+	_, _, claim := runtimePoolWorkspaceTestChildren(t, r, pool)
 	pod.Annotations[sandboxv1beta1.SandboxPropagatedLabelsAnnotation] = "provider-bookkeeping"
 	pod.Annotations[sandboxv1beta1.SandboxPropagatedAnnotationsAnnotation] = "provider-bookkeeping"
 	if err := r.Update(context.Background(), &pod); err != nil {
 		t.Fatalf("add provider-managed Pod annotations: %v", err)
 	}
-	if _, ok := pod.Labels[sandboxextv1beta1.SandboxIDLabel]; ok {
-		t.Fatal("test provider unexpectedly propagated its reserved SandboxClaim UID label onto the Pod")
+	if claim == nil {
+		t.Fatal("materialized SandboxClaim is missing")
+	}
+	if pod.Labels[sandboxextv1beta1.SandboxIDLabel] != string(claim.UID) {
+		t.Fatalf("materialized Pod claim UID label = %q, want %q", pod.Labels[sandboxextv1beta1.SandboxIDLabel], claim.UID)
 	}
 	if pod.Spec.DeprecatedServiceAccount != runtimePoolDefaultServiceAccountName {
 		t.Fatalf("materialized Pod serviceAccount alias = %q, want Kubernetes default %q", pod.Spec.DeprecatedServiceAccount, runtimePoolDefaultServiceAccountName)

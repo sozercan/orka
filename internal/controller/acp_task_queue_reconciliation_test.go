@@ -241,6 +241,55 @@ func (f *acpQueuePlanningFailureFixture) queueValidTask(t *testing.T, ctx contex
 	return queued, attempt
 }
 
+func TestQueueACPRuntimeTaskFailsClosedWhenApprovedImageIsRemoved(t *testing.T) {
+	fixture := newACPQueuePlanningFailureFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	queued, attempt := fixture.queueValidTask(t, ctx)
+
+	var pools corev1alpha1.RuntimePoolList
+	if err := fixture.kubeClient.List(ctx, &pools); err != nil {
+		t.Fatal(err)
+	}
+	if len(pools.Items) != 1 {
+		t.Fatalf("RuntimePools before image removal = %d, want 1", len(pools.Items))
+	}
+	if err := fixture.kubeClient.Delete(ctx, &pools.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+	fixture.reconciler.ACPRuntimeImages.Codex = ""
+
+	if _, err := fixture.reconciler.queueACPRuntimeTask(ctx, queued.DeepCopy(), fixture.agent.DeepCopy()); err != nil {
+		t.Fatalf("queue after approved image removal: %v", err)
+	}
+
+	current := &corev1alpha1.Task{}
+	if err := fixture.kubeClient.Get(ctx, client.ObjectKeyFromObject(queued), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != corev1alpha1.TaskPhaseFailed || current.Status.Execution == nil ||
+		current.Status.Execution.State != corev1alpha1.TaskExecutionStateFailed ||
+		current.Status.Execution.Reason != corev1alpha1.TaskExecutionReason("InvalidRuntimeProfile") ||
+		!strings.Contains(current.Status.Execution.Message, "configured digest-pinned image") {
+		t.Fatalf("Task status after approved image removal = %#v, want terminal InvalidRuntimeProfile", current.Status)
+	}
+	persisted, err := fixture.controlStore.GetPromptAttempt(ctx, attempt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ExecutionState != store.PromptExecutionFailed || persisted.TerminalReason != "InvalidRuntimeProfile" ||
+		!strings.Contains(persisted.OutcomeMarker, "configured digest-pinned image") {
+		t.Fatalf("PromptAttempt after approved image removal = %#v, want terminal InvalidRuntimeProfile", persisted)
+	}
+	pools = corev1alpha1.RuntimePoolList{}
+	if err := fixture.kubeClient.List(ctx, &pools); err != nil {
+		t.Fatal(err)
+	}
+	if len(pools.Items) != 0 {
+		t.Fatalf("removed-image RuntimePool was recreated: %#v", pools.Items)
+	}
+}
+
 func TestFailACPPlanningTaskIsIdempotentBeforeDurableAttempt(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1alpha1.AddToScheme(scheme); err != nil {

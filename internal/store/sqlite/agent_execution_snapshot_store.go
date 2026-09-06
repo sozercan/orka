@@ -203,28 +203,6 @@ func (s *Store) GetAgentExecutionSnapshot(ctx context.Context, key store.AgentEx
 	}, nil
 }
 
-// ListAgentExecutionSnapshotKeys implements store.AgentExecutionSnapshotStore.
-func (s *Store) ListAgentExecutionSnapshotKeys(ctx context.Context, taskUID string) ([]store.AgentExecutionSnapshotKey, error) {
-	if strings.TrimSpace(taskUID) == "" {
-		return nil, store.ValidationErrorf("snapshot task UID is required")
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT digest FROM agent_execution_snapshots
-		WHERE task_uid = ? ORDER BY created_at ASC, digest ASC`, taskUID)
-	if err != nil {
-		return nil, fmt.Errorf("list agent execution snapshots: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var keys []store.AgentExecutionSnapshotKey
-	for rows.Next() {
-		var digest string
-		if err := rows.Scan(&digest); err != nil {
-			return nil, fmt.Errorf("scan agent execution snapshot: %w", err)
-		}
-		keys = append(keys, store.AgentExecutionSnapshotKey{TaskUID: taskUID, Digest: digest})
-	}
-	return keys, rows.Err()
-}
-
 // ListAgentExecutionSnapshotMetadataBefore implements
 // store.AgentExecutionSnapshotLifecycleStore. The cutoff is strict so a
 // retention pass can use one stable timestamp without collecting records

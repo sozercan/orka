@@ -7,6 +7,7 @@ MIT License - see LICENSE file for details.
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -221,6 +222,10 @@ func (a taskAccess) verifyCurrentGatewayTaskIdentity(
 }
 
 func (a taskAccess) gatewayTaskIdentity(c fiber.Ctx, task *corev1alpha1.Task) (gatewayruntime.TaskOwnerIdentity, bool, error) {
+	return gatewayTaskIdentity(c.Context(), a.h.gatewayEventStore, task)
+}
+
+func gatewayTaskIdentity(ctx context.Context, events store.GatewayEventStore, task *corev1alpha1.Task) (gatewayruntime.TaskOwnerIdentity, bool, error) {
 	if task == nil {
 		return gatewayruntime.TaskOwnerIdentity{}, false, nil
 	}
@@ -232,10 +237,10 @@ func (a taskAccess) gatewayTaskIdentity(c fiber.Ctx, task *corev1alpha1.Task) (g
 	}
 	identity, gatewayOwned := gatewayruntime.TaskOwner(task)
 
-	if a.h.gatewayEventStore != nil {
+	if events != nil {
 		var durable *gatewayruntime.TaskOwnerIdentity
 		if task.UID != "" {
-			event, err := a.h.gatewayEventStore.GetGatewayEventForTask(c.Context(), task.Namespace, task.Name, string(task.UID))
+			event, err := events.GetGatewayEventForTask(ctx, task.Namespace, task.Name, string(task.UID))
 			if err == nil {
 				durable = &gatewayruntime.TaskOwnerIdentity{
 					GatewayNamespace: event.Namespace, NamespaceUID: event.NamespaceUID,
@@ -246,7 +251,7 @@ func (a taskAccess) gatewayTaskIdentity(c fiber.Ctx, task *corev1alpha1.Task) (g
 			}
 		}
 		if durable == nil && eventID != "" {
-			event, err := a.h.gatewayEventStore.GetGatewayEvent(c.Context(), task.Namespace, eventID)
+			event, err := events.GetGatewayEvent(ctx, task.Namespace, eventID)
 			if err == nil && event.TaskName == task.Name && (event.TaskUID == "" || event.TaskUID == string(task.UID)) {
 				durable = &gatewayruntime.TaskOwnerIdentity{
 					GatewayNamespace: event.Namespace, NamespaceUID: event.NamespaceUID,

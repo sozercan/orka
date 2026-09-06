@@ -44,7 +44,7 @@ export function apiErrorMessage(body: string): string {
   return text
 }
 
-export function isApiErrorStatus(error: unknown, status: number): error is ApiError {
+function isApiErrorStatus(error: unknown, status: number): error is ApiError {
   return error instanceof ApiError && error.status === status
 }
 
@@ -88,7 +88,17 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     return undefined as T
   }
 
-  return response.json()
+  const text = await response.text()
+  if (!text) {
+    return undefined as T
+  }
+
+  const contentType = response.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase()
+  if (contentType === 'application/json' || contentType?.endsWith('+json')) {
+    return JSON.parse(text) as T
+  }
+
+  return text as T
 }
 
 export const api = {

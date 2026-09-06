@@ -32,6 +32,7 @@ import (
 	"github.com/orka-agents/orka/internal/metrics"
 	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/tools"
 	"github.com/orka-agents/orka/internal/workerenv"
 )
 
@@ -58,6 +59,8 @@ const (
 
 	repositoryMonitorReasonReviewerCredentialsInvalid = "ReviewerCredentialsInvalid"
 	repositoryMonitorReasonGitSecretInvalid           = "GitSecretInvalid"
+	repositoryMonitorReasonLegacyValidationCommands   = "LegacyValidationCommandsUnsupported"
+	repositoryMonitorReasonValidationImageInvalid     = "InvalidValidationImage"
 )
 
 // RepositoryMonitorReconciler reconciles RepositoryMonitor resources.
@@ -190,6 +193,16 @@ func (r *RepositoryMonitorReconciler) validateRepositoryMonitorSpec(ctx context.
 	}
 	if err := validateRepositoryMonitorSupportedTargets(monitor.Spec); err != nil {
 		updateErr := r.updateRepositoryMonitorNotReadyCondition(ctx, monitor, repositoryMonitorPhaseError, "UnsupportedTarget", repositoryScanConditionMessage(err.Error(), "unsupported repository monitor target"))
+		return "", "", true, 0, updateErr
+	}
+	if strings.TrimSpace(monitor.Spec.Validation.Mode) != "" || len(monitor.Spec.Validation.Commands) > 0 {
+		message := "spec.validation.mode and spec.validation.commands are no longer supported; replace them with a digest-pinned spec.validation.image"
+		updateErr := r.updateRepositoryMonitorNotReadyCondition(ctx, monitor, repositoryMonitorPhaseError, repositoryMonitorReasonLegacyValidationCommands, message)
+		return "", "", true, 0, updateErr
+	}
+	if image := monitor.Spec.Validation.Image; image != "" && !tools.ValidRepositoryValidationImage(image) {
+		message := "spec.validation.image must be a valid digest-pinned OCI image reference with sha256"
+		updateErr := r.updateRepositoryMonitorNotReadyCondition(ctx, monitor, repositoryMonitorPhaseError, repositoryMonitorReasonValidationImageInvalid, message)
 		return "", "", true, 0, updateErr
 	}
 	if repositoryMonitorPullRequestsEnabled(monitor.Spec) && (monitor.Spec.Agents.Reviewer == nil || strings.TrimSpace(monitor.Spec.Agents.Reviewer.Name) == "") {
@@ -467,7 +480,7 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorRuns(ctx context
 		logger.Error(err, "failed to ingest completed repository monitor issue task")
 		return ctrl.Result{}, err
 	}
-	ingestedReviews, err := r.ingestCompletedRepositoryMonitorReviewTasks(ctx, monitor)
+	ingestedReviews, pendingReviews, err := r.ingestCompletedRepositoryMonitorReviewTasks(ctx, monitor)
 	if err != nil {
 		logger.Error(err, "failed to ingest completed repository monitor review task")
 		return ctrl.Result{}, err
@@ -494,19 +507,26 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorRuns(ctx context
 		}
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
-	if runningRunRequeueAfter = minimumRepositoryMonitorRequeueAfter(runningRunRequeueAfter); runningRunRequeueAfter > 0 {
+	if runningRunRequeueAfter = minimumRepositoryMonitorRequeueAfter(runningRunRequeueAfter); pendingReviews &&
+		(runningRunRequeueAfter == 0 || repositoryMonitorValidationRetry < runningRunRequeueAfter) {
+		runningRunRequeueAfter = repositoryMonitorValidationRetry
+	}
+	if runningRunRequeueAfter > 0 {
 		return ctrl.Result{RequeueAfter: runningRunRequeueAfter}, nil
 	}
 
 	var queuedRun *store.MonitorRun
-	var requeueAfter time.Duration
+	requeueAfter := time.Duration(0)
+	if pendingReviews {
+		requeueAfter = repositoryMonitorValidationRetry
+	}
 	if state.suspended {
 		err := r.updateRepositoryMonitorNotReadyCondition(ctx, monitor, repositoryMonitorPhaseSuspended, "Suspended", "Repository monitor scheduled runs are suspended")
-		return ctrl.Result{}, err
+		return ctrl.Result{RequeueAfter: requeueAfter}, err
 	}
 	if state.scheduleErr != nil {
 		err := r.updateRepositoryMonitorNotReadyCondition(ctx, monitor, repositoryMonitorPhaseError, "InvalidSchedule", repositoryScanConditionMessage(state.scheduleErr.Error(), "invalid monitor schedule"))
-		return ctrl.Result{}, err
+		return ctrl.Result{RequeueAfter: requeueAfter}, err
 	}
 	if state.schedule != nil {
 		run, next, err := r.enqueueScheduledRunIfDue(ctx, monitor, state.schedule)
@@ -515,7 +535,9 @@ func (r *RepositoryMonitorReconciler) reconcileRepositoryMonitorRuns(ctx context
 			return ctrl.Result{}, err
 		}
 		queuedRun = run
-		requeueAfter = next
+		if next > 0 && (requeueAfter == 0 || next < requeueAfter) {
+			requeueAfter = next
+		}
 	}
 
 	if queuedCommands || ingestedRepairs || ingestedIssueActions || ingestedReviews || publishedReviews {

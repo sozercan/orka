@@ -251,14 +251,7 @@ func TestClientContextCancellationSendsCancelRequest(t *testing.T) {
 	}
 }
 
-func TestDecodeSessionUpdateAndStopReasons(t *testing.T) {
-	update, err := DecodeSessionUpdate(json.RawMessage(`{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if update.Type != "agent_message_chunk" || len(update.Raw) == 0 {
-		t.Fatalf("unexpected update: %#v", update)
-	}
+func TestStopReasons(t *testing.T) {
 	if err := StopReason("new_reason").Validate(); err == nil {
 		t.Fatal("unknown stop reason unexpectedly accepted")
 	}

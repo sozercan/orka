@@ -7,6 +7,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { useRetryGatewayDelivery } from '@/hooks/use-gateways'
 import type { GatewayBinding, GatewayDelivery, GatewayEvent } from '@/schemas/gateway'
 import { isGatewayResourceReady } from './gateway-readiness'
+import { timeAgo } from '@/lib/time'
 
 export function GatewayStatusBadge({ state }: { state?: string }) {
   const destructive = state === 'Rejected' || state === 'DeadLettered' || state === 'Expired' || state === 'Failed' || state === 'NotReady'
@@ -35,10 +36,10 @@ export function GatewayBindingsTable({ bindings, loading }: { bindings: GatewayB
               <TableCell><span className="font-medium">{binding.spec.gatewayRef.name}</span> <span className="text-muted-foreground">→</span> {binding.spec.agentRef.name}</TableCell>
               <TableCell className="max-w-72 truncate font-mono text-xs">{binding.spec.match.accountId}/{binding.spec.match.contextId}{binding.spec.match.threadId ? `/${binding.spec.match.threadId}` : ''}</TableCell>
               <TableCell>{binding.spec.session?.mode || 'context'}</TableCell>
-              <TableCell className="text-xs text-muted-foreground">{formatAge(latestActivity(
+              <TableCell className="text-xs text-muted-foreground">{timeAgo(latestActivity(
                 binding.status?.lastInboundActivity,
                 binding.status?.lastOutboundActivity,
-              ))}</TableCell>
+              ), { empty: 'Never' })}</TableCell>
               <TableCell><GatewayStatusBadge state={isGatewayResourceReady(binding) ? 'Ready' : 'NotReady'} /></TableCell>
             </TableRow>
           ))}
@@ -71,7 +72,7 @@ export function GatewayEventsTable({ events, loading }: { events: GatewayEvent[]
                 ) : '—'}
               </TableCell>
               <TableCell>{event.taskName ? <Link to="/tasks/$taskId" params={{ taskId: event.taskName }} className="font-mono text-xs hover:underline">{event.taskName}</Link> : '—'}</TableCell>
-              <TableCell className="text-xs text-muted-foreground">{formatAge(event.receivedAt)}</TableCell>
+              <TableCell className="text-xs text-muted-foreground">{timeAgo(event.receivedAt, { empty: 'Never' })}</TableCell>
             </TableRow>
           ))}
         </TableBody>
@@ -94,7 +95,7 @@ export function GatewayDeliveriesTable({ deliveries, loading }: { deliveries: Ga
               <TableCell>{delivery.kind}</TableCell>
               <TableCell><div className="font-mono text-xs">{delivery.eventId}</div>{delivery.taskName && <div className="mt-1 text-xs text-muted-foreground">{delivery.taskName}</div>}</TableCell>
               <TableCell className="font-mono text-xs tabular-nums">{delivery.attemptCount}/{delivery.maxAttempts}</TableCell>
-              <TableCell className="text-xs text-muted-foreground">{formatAge(delivery.updatedAt)}</TableCell>
+              <TableCell className="text-xs text-muted-foreground">{timeAgo(delivery.updatedAt, { empty: 'Never' })}</TableCell>
               <TableCell>{['DeadLettered', 'Failed'].includes(delivery.state) && <Button size="icon" variant="ghost" aria-label={`Retry ${delivery.id}`} disabled={retry.isPending} onClick={() => retry.mutate(delivery.id)}><RotateCcw className="h-4 w-4" /></Button>}</TableCell>
             </TableRow>
           ))}
@@ -114,15 +115,6 @@ function LoadingRows({ columns }: { columns: number }) {
 
 function EmptyRow({ columns, text }: { columns: number; text: string }) {
   return <TableRow><TableCell colSpan={columns} className="py-12 text-center text-sm text-muted-foreground">{text}</TableCell></TableRow>
-}
-
-function formatAge(timestamp?: string) {
-  if (!timestamp) return 'Never'
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000))
-  if (seconds < 60) return `${seconds}s ago`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  return `${Math.floor(seconds / 86400)}d ago`
 }
 
 function latestActivity(inbound?: string, outbound?: string) {

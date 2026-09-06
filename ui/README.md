@@ -1,73 +1,102 @@
-# React + TypeScript + Vite
+# Orka web dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The React and TypeScript dashboard ships inside the Orka controller binary. It uses Vite,
+TanStack Router/Query, and Tailwind. `make build` compiles this directory and embeds the
+output into the Go binary, which serves it at `/` alongside the API at `/api/*`.
 
-Currently, two official plugins are available:
+For what the dashboard *does* — the page list, the API it talks to, the auth model — see
+[Web dashboard](../website/docs/guides/ui.md). This README is about working in this
+directory.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## Run it
 
-## React Compiler
+You need [Bun](https://bun.sh) 1.2+.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+bun install
+bun run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+That starts Vite on `:5173` and proxies `/api/*` to `http://localhost:8080`, so run a
+controller there in another terminal. Replace `/path/outside-the-repository` with a
+private, writable directory for the persistent database and snapshot key:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+# from the repository root
+kubectl create namespace orka-system
+kubectl label namespace orka-system orka.ai/controller-mode=harness-v2
+openssl rand 32 > /path/outside-the-repository/orka-snapshot-key
+chmod 600 /path/outside-the-repository/orka-snapshot-key
+make run RUN_STORE_PATH=/path/outside-the-repository/orka.db \
+  RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE=/path/outside-the-repository/orka-snapshot-key
 ```
+
+If the namespace already exists, verify that its mode label is `harness-v2`; do not
+overwrite a different mode. `make run` watches `orka-system` by default and refuses to
+start without that namespace claim.
+
+`RUN_STORE_PATH` passes `--store-path` to the controller. Set it for local development
+because the default `/data/orka.db` is usually not writable on a development host.
+
+The key is not optional. A `harness-v2` controller — the default — refuses to start
+without `--agent-execution-snapshot-key-file`, and `make run` passes whatever
+`RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE` holds, empty included. Generate it once and reuse
+it; see [Development](../website/docs/development/development.md#build-commands).
+
+The dev server hot-reloads; you do not need to rebuild the Go binary while working on the
+UI.
+
+## The commands
+
+| Command | What it does |
+| --- | --- |
+| `bun run dev` | Vite dev server on `:5173`, proxying the API to `:8080` |
+| `bun run build` | Type-checks with `tsc -b`, then builds into `dist/` |
+| `bun run lint` | ESLint |
+| `bun run test` | Vitest, one pass |
+| `bun run test:watch` | Vitest in watch mode |
+| `bun run test:coverage` | Vitest with the coverage report and thresholds |
+
+The repository root has `make ui-install`, `make ui-dev`, `make ui-build`, `make ui-lint`,
+`make ui-test`, and `make ui-test-coverage` wrapping these. `make ui-build` additionally
+copies `dist/` to `internal/uiembed/dist/`, which is what `//go:embed` picks up.
+
+> [!IMPORTANT]
+> `bun run test` and `bun run lint` do not catch every type error. `bun run build` runs
+> `tsc -b` against the real compiler options and will fail on things Vitest happily runs.
+> Run it before you call a UI change done.
+
+Coverage thresholds are configured in `vite.config.ts` but are **not** enforced in CI. See
+[Testing](../website/docs/development/testing.md#frontend-tests) for what that means in practice.
+
+## Layout
+
+```
+src/
+  routes/       # Pages. File-based routing — the file path is the URL.
+  components/   # Feature components, grouped by area (tasks/, agents/, security/, …)
+  components/ui # shadcn/ui primitives. Generated; edit sparingly.
+  hooks/        # TanStack Query hooks over /api/v1, one per resource
+  schemas/      # Zod schemas for every API response. Parse at the boundary, trust after.
+  stores/       # Zustand stores for client-only state (auth, chat drafts, UI prefs)
+  lib/          # API client, list pagination, time formatting, and other helpers
+  test/         # Vitest setup, MSW handlers, and shared fixtures
+```
+
+Tests live next to what they test: `use-tasks.ts` and `use-tasks.test.tsx` in the same
+directory. API calls in tests are intercepted by [MSW](https://mswjs.io) handlers in
+`src/test/mocks/`, so no test needs a running controller.
+
+> [!CAUTION]
+> Do not edit `src/routeTree.gen.ts`. It is generated by the TanStack Router plugin from
+> the files in `src/routes/`. Add a route by adding a file; the tree regenerates on the next
+> dev server start or build.
+
+## Adding a page
+
+1. Create the route file under `src/routes/` — `src/routes/widgets/index.tsx` becomes
+   `/widgets`, and `src/routes/widgets/$widgetId.tsx` becomes `/widgets/:widgetId`.
+2. Add a Zod schema in `src/schemas/` for whatever the API returns, and a query hook in
+   `src/hooks/` that parses through it.
+3. Add the nav entry in `src/components/layout/`.
+4. Add MSW handlers in `src/test/mocks/` and a test beside the route file.

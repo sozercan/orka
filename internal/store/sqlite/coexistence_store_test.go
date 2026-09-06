@@ -182,10 +182,6 @@ func TestAgentExecutionSnapshotRoundTripEncryptedAtRest(t *testing.T) {
 		t.Fatal("digest/body mismatch must be rejected")
 	}
 
-	keys, err := s.ListAgentExecutionSnapshotKeys(ctx, "task-uid-1")
-	if err != nil || len(keys) != 1 || keys[0].Digest != snapshot.Digest {
-		t.Fatalf("list snapshot keys = %v, %v", keys, err)
-	}
 	if err := s.DeleteAgentExecutionSnapshots(ctx, "task-uid-1"); err != nil {
 		t.Fatalf("delete snapshots: %v", err)
 	}
@@ -514,13 +510,6 @@ func TestSessionLineageProjectionIsIdempotentAndRejectsDivergence(t *testing.T) 
 	if _, err := s.ProjectSessionLineage(ctx, changedConfig); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("expected ErrConflict for changed configuration, got %v", err)
 	}
-
-	if err := s.DeleteSessionLineage(ctx, "ns", "chat"); err != nil {
-		t.Fatalf("delete lineage: %v", err)
-	}
-	if _, err := s.GetSessionLineage(ctx, "ns", "chat"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound after delete, got %v", err)
-	}
 }
 
 func testHarnessV1Attempt() *store.HarnessV1Attempt {
@@ -620,11 +609,6 @@ func TestHarnessV1AttemptLifecycleAndCAS(t *testing.T) {
 		t.Fatalf("Submitting->Accepted = %+v, %v", current, err)
 	}
 
-	active, err := s.ListActiveHarnessV1Attempts(ctx)
-	if err != nil || len(active) != 1 {
-		t.Fatalf("active attempts = %v, %v", active, err)
-	}
-
 	// OutcomeUnknown requires a terminal reason.
 	if _, err := s.TransitionHarnessV1Attempt(ctx, harnessV1Transition(key, fence, current.Version, store.HarnessV1AttemptAccepted, store.HarnessV1AttemptOutcomeUnknown, "unknown-no-reason")); err == nil {
 		t.Fatal("OutcomeUnknown without a reason must be rejected")
@@ -641,11 +625,6 @@ func TestHarnessV1AttemptLifecycleAndCAS(t *testing.T) {
 	// Terminal states admit no further transitions.
 	if _, err := s.TransitionHarnessV1Attempt(ctx, harnessV1Transition(key, fence, current.Version, store.HarnessV1AttemptOutcomeUnknown, store.HarnessV1AttemptSucceeded, "resurrect")); err == nil {
 		t.Fatal("OutcomeUnknown is terminal and must not transition")
-	}
-
-	active, err = s.ListActiveHarnessV1Attempts(ctx)
-	if err != nil || len(active) != 0 {
-		t.Fatalf("active attempts after terminal = %v, %v", active, err)
 	}
 
 	attempts, err := s.ListHarnessV1AttemptsByTask(ctx, "ns", "task-uid-1")

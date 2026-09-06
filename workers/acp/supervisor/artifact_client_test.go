@@ -83,7 +83,7 @@ func TestArtifactClientUploadAndDownload(t *testing.T) {
 		}
 		return authorization, nil
 	})
-	client, err := NewArtifactClient(server.URL, server.Client(), provider)
+	client, err := newDefaultArtifactClient(server.URL, server.Client(), provider)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestArtifactClientRejectsDisconnectMismatchRedirectAndRedacts(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(test.handler)
 			defer server.Close()
-			client, err := NewArtifactClient(server.URL, server.Client(), provider)
+			client, err := newDefaultArtifactClient(server.URL, server.Client(), provider)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -171,7 +171,7 @@ func TestArtifactClientRejectsDisconnectMismatchRedirectAndRedacts(t *testing.T)
 		http.Redirect(writer, request, target.URL, http.StatusTemporaryRedirect)
 	}))
 	defer redirect.Close()
-	client, err := NewArtifactClient(redirect.URL, redirect.Client(), provider)
+	client, err := newDefaultArtifactClient(redirect.URL, redirect.Client(), provider)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestRemoteWorkspaceMaterializerAndUploader(t *testing.T) {
 		}
 		return artifactcap.Authorization{Capability: "token", RequestDigest: artifactcap.DigestBytes([]byte("binding"))}, nil
 	})
-	client, err := NewArtifactClient(server.URL, server.Client(), provider)
+	client, err := newDefaultArtifactClient(server.URL, server.Client(), provider)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +386,7 @@ func materializerForArchive(t *testing.T, archive []byte) (WorkspaceMaterializer
 	provider := ArtifactAuthorizationProviderFunc(func(context.Context, ArtifactAuthorizationRequest) (artifactcap.Authorization, error) {
 		return artifactcap.Authorization{Capability: "token", RequestDigest: artifactcap.DigestBytes([]byte("binding"))}, nil
 	})
-	client, err := NewArtifactClient(server.URL, server.Client(), provider)
+	client, err := newDefaultArtifactClient(server.URL, server.Client(), provider)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,4 +462,13 @@ func mustObjectPath(t *testing.T, digest string) string {
 		t.Fatal(err)
 	}
 	return value
+}
+
+// newDefaultArtifactClient builds an ArtifactClient with the production
+// transfer limits env.go applies when constructing the supervisor.
+func newDefaultArtifactClient(baseURL string, client *http.Client, authorization ArtifactAuthorizationProvider) (*ArtifactClient, error) {
+	return newArtifactClient(baseURL, client, authorization, artifactClientLimits{
+		MaxDownloadBytes: defaultWorkspaceArtifactDownloadBytes,
+		MaxUploadBytes:   defaultWorkspaceDeltaUploadBytes,
+	})
 }

@@ -35,7 +35,7 @@ func NewLoggingMiddleware() fiber.Handler {
 
 		// Log the request
 		duration := time.Since(start)
-		status := c.Response().StatusCode()
+		status := effectiveStatusCode(c, err)
 
 		log.Info("request completed",
 			"requestId", reqID,
@@ -60,7 +60,7 @@ func NewMetricsMiddleware() fiber.Handler {
 
 		// Record metrics
 		duration := time.Since(start)
-		status := c.Response().StatusCode()
+		status := effectiveStatusCode(c, err)
 		method := c.Method()
 		path := c.Route().Path
 
@@ -100,14 +100,7 @@ func NewTracingMiddleware() fiber.Handler {
 			span.SetAttributes(attribute.String("http.route", route))
 		}
 
-		status := c.Response().StatusCode()
-		if err != nil && status < fiber.StatusBadRequest {
-			if fiberErr, ok := errors.AsType[*fiber.Error](err); ok {
-				status = fiberErr.Code
-			} else {
-				status = fiber.StatusInternalServerError
-			}
-		}
+		status := effectiveStatusCode(c, err)
 		span.SetAttributes(attribute.Int("http.status_code", status))
 		if status >= 400 {
 			span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", status))
@@ -115,6 +108,28 @@ func NewTracingMiddleware() fiber.Handler {
 
 		return err
 	}
+}
+
+// effectiveStatusCode resolves the status a client will actually receive.
+// Handler errors are mapped by the app error handler only after middleware
+// unwinds, so the response still carries the default 200 here. A 404 on a
+// non-API path is served as the SPA index page with 200 by that same error
+// handler, so it is reported as a success rather than a failure.
+func effectiveStatusCode(c fiber.Ctx, err error) int {
+	status := c.Response().StatusCode()
+	if err != nil && status < fiber.StatusBadRequest {
+		if fiberErr, ok := errors.AsType[*fiber.Error](err); ok {
+			status = fiberErr.Code
+		} else {
+			status = fiber.StatusInternalServerError
+		}
+	}
+	if status == fiber.StatusNotFound && spaFallbackEligible(c.Path()) {
+		if _, ok := spaIndexHTML(); ok {
+			status = fiber.StatusOK
+		}
+	}
+	return status
 }
 
 type fiberHeaderCarrier struct {

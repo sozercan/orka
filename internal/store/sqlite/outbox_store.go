@@ -81,7 +81,7 @@ func (s *Store) ClaimOutboxProjectionRecords(ctx context.Context, request store.
 }
 
 func (s *Store) claimOutboxProjections(ctx context.Context, request store.ClaimOutboxProjectionsRequest, requireSQLiteEpoch bool) ([]store.OutboxProjection, error) {
-	fence, err := normalizeEpochFence(request.Fence)
+	fence, err := store.NormalizeEpochFence(request.Fence)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func (s *Store) claimOutboxProjections(ctx context.Context, request store.ClaimO
 	if request.LeaseDuration <= 0 || request.LeaseDuration > 24*time.Hour {
 		return nil, store.ValidationErrorf("outbox lease duration must be greater than zero and no more than 24 hours")
 	}
-	request.Now = normalizeControlTime(request.Now)
+	request.Now = store.NormalizeControlTime(request.Now)
 	limit := request.Limit
 	if limit <= 0 {
 		limit = defaultOutboxClaimLimit
@@ -203,7 +203,7 @@ func (s *Store) completeOutboxProjection(ctx context.Context, request store.Comp
 	if err := store.ValidateControlIdentifier("outbox lease owner", request.LeaseOwner); err != nil {
 		return nil, err
 	}
-	fence, err := normalizeEpochFence(request.Fence)
+	fence, err := store.NormalizeEpochFence(request.Fence)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +218,7 @@ func (s *Store) completeOutboxProjection(ctx context.Context, request store.Comp
 	if err := store.ValidateCanonicalDigest("outbox completion operation digest", request.OperationDigest); err != nil {
 		return nil, err
 	}
-	request.UpdatedAt = normalizeControlTime(request.UpdatedAt)
+	request.UpdatedAt = store.NormalizeControlTime(request.UpdatedAt)
 	request.LastError = strings.TrimSpace(request.LastError)
 	if err := store.ValidateControlReason("outbox last error", request.LastError); err != nil {
 		return nil, err
@@ -270,15 +270,15 @@ func (s *Store) completeOutboxProjection(ctx context.Context, request store.Comp
 	}
 	if projection.LastOperationID == request.OperationID {
 		if projection.LastOperationDigest != request.OperationDigest {
-			return nil, controlConflict("outbox completion operation %q was reused with a different digest", request.OperationID)
+			return nil, store.ConflictErrorf("outbox completion operation %q was reused with a different digest", request.OperationID)
 		}
 		if outboxCompletionMatches(projection, request) {
 			return &projection, nil
 		}
-		return nil, controlConflict("outbox completion operation %q was already applied with different target values", request.OperationID)
+		return nil, store.ConflictErrorf("outbox completion operation %q was already applied with different target values", request.OperationID)
 	}
 	if projection.Version != request.ExpectedVersion || projection.State != store.OutboxProjectionDelivering || projection.LeaseOwner != request.LeaseOwner {
-		return nil, controlConflict("outbox projection %q no longer matches expected version or lease owner", projection.ID)
+		return nil, store.ConflictErrorf("outbox projection %q no longer matches expected version or lease owner", projection.ID)
 	}
 
 	availableAt := projection.AvailableAt
@@ -347,10 +347,10 @@ func normalizeOutboxProjectionForCreate(projection store.OutboxProjection, fence
 	if err := store.ValidateCanonicalDigest("outbox payload digest", projection.PayloadDigest); err != nil {
 		return store.OutboxProjection{}, store.ControllerEpochFence{}, err
 	}
-	if canonicalBytesDigest(projection.Payload) != projection.PayloadDigest {
+	if store.CanonicalBytesDigest(projection.Payload) != projection.PayloadDigest {
 		return store.OutboxProjection{}, store.ControllerEpochFence{}, store.ValidationErrorf("outbox payload digest does not match payload bytes")
 	}
-	fence, err := normalizeEpochFence(fence)
+	fence, err := store.NormalizeEpochFence(fence)
 	if err != nil {
 		return store.OutboxProjection{}, store.ControllerEpochFence{}, err
 	}
@@ -369,7 +369,7 @@ func normalizeOutboxProjectionForCreate(projection store.OutboxProjection, fence
 		return store.OutboxProjection{}, store.ControllerEpochFence{}, store.ValidationErrorf("new outbox projection must not include delivery state")
 	}
 	if defaultTime.IsZero() {
-		defaultTime = normalizeControlTime(projection.CreatedAt)
+		defaultTime = store.NormalizeControlTime(projection.CreatedAt)
 	} else {
 		defaultTime = defaultTime.UTC()
 	}
@@ -415,7 +415,7 @@ func enqueueOutboxProjectionTx(ctx context.Context, tx *sql.Tx, projection store
 	if getErr == nil && sameOutboxProjectionCreation(existing, projection, compareSchedule) {
 		return existing, nil
 	}
-	return store.OutboxProjection{}, controlConflict("outbox projection %q was reused with different payload or metadata", projection.ID)
+	return store.OutboxProjection{}, store.ConflictErrorf("outbox projection %q was reused with different payload or metadata", projection.ID)
 }
 
 func sameOutboxProjectionCreation(a, b store.OutboxProjection, compareSchedule bool) bool {

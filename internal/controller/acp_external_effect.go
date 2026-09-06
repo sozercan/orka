@@ -23,8 +23,6 @@ import (
 // committed under a valid lease.
 const externalEffectLeaseSettlementMargin = time.Minute
 
-const acpExternalEffectLease = maxACPExternalEffectCallDuration + externalEffectLeaseSettlementMargin
-
 // maxACPExternalEffectCallDuration bounds one in-flight brokered custom-Tool
 // call so its outcome can always be committed while the ledger lease is still
 // valid. Without this bound, a call that outlives the lease plus the

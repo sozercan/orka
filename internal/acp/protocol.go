@@ -214,25 +214,6 @@ type SessionNotification struct {
 	Meta      Meta            `json:"_meta,omitempty"`
 }
 
-type SessionUpdate struct {
-	Type    string          `json:"sessionUpdate"`
-	Content json.RawMessage `json:"content,omitempty"`
-	Raw     json.RawMessage `json:"-"`
-}
-
-func DecodeSessionUpdate(raw json.RawMessage) (SessionUpdate, error) {
-	var update SessionUpdate
-	if err := json.Unmarshal(raw, &update); err != nil {
-		return SessionUpdate{}, fmt.Errorf("decode ACP session update: %w", err)
-	}
-	update.Type = strings.TrimSpace(update.Type)
-	if update.Type == "" {
-		return SessionUpdate{}, fmt.Errorf("ACP session update type is required")
-	}
-	update.Raw = append(json.RawMessage(nil), raw...)
-	return update, nil
-}
-
 type PermissionOption struct {
 	OptionID string `json:"optionId"`
 	Name     string `json:"name"`

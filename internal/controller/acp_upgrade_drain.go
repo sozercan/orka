@@ -797,11 +797,20 @@ func (c *ACPUpgradeDrainCoordinator) observeAndDrainRuntimeInstance(
 	if err != nil {
 		return err
 	}
-	observed, err := validateRuntimePoolProbe(pool, cfg, pod, probe, c.now())
+	probeGeneration := probe.Status.Fence.RuntimePoolGeneration
+	if probeGeneration == 0 || probeGeneration > uint64(pool.Generation) {
+		return fmt.Errorf("validate authenticated supervisor probe: runtime status generation %d is not an admitted generation of current RuntimePool generation %d", probeGeneration, pool.Generation)
+	}
+	validationPool := pool
+	if probeGeneration != uint64(pool.Generation) {
+		validationPool = pool.DeepCopy()
+		validationPool.Generation = int64(probeGeneration)
+	}
+	observed, err := validateRuntimePoolProbe(validationPool, cfg, pod, probe, c.now())
 	if err != nil {
 		return fmt.Errorf("validate authenticated supervisor probe: %w", err)
 	}
-	if observed.RuntimeInstanceID != active.RuntimeInstanceID || observed.BootID != active.BootID {
+	if !runtimePoolRolloutActiveInstanceMatches(active, observed) {
 		return fmt.Errorf("authenticated supervisor identity changed during planned drain")
 	}
 	addSupervisorPressure(snapshot, probe.Status)
@@ -1215,45 +1224,6 @@ func decodeACPUpgradeDrainMarker(raw string) (ACPUpgradeDrainMarker, bool, error
 		return marker, true, fmt.Errorf("unsupported ACP upgrade drain marker state %q", marker.State)
 	}
 	return marker, true, nil
-}
-
-// ReadACPUpgradeDrainMarker returns the marker atomically ordered on the
-// authoritative controller-epoch Lease.
-func ReadACPUpgradeDrainMarker(
-	ctx context.Context,
-	reader client.Reader,
-	namespace, epochName string,
-) (ACPUpgradeDrainMarker, error) {
-	lease, err := readACPUpgradeDrainControllerEpochLease(ctx, reader, namespace, epochName)
-	if err != nil {
-		return ACPUpgradeDrainMarker{}, err
-	}
-	marker, present, err := decodeACPUpgradeDrainMarker(lease.Annotations[acpUpgradeDrainMarkerAnnotation])
-	if err != nil {
-		return ACPUpgradeDrainMarker{}, err
-	}
-	if !present {
-		return ACPUpgradeDrainMarker{}, store.ErrNotFound
-	}
-	return marker, nil
-}
-
-// ACPUpgradeDrainCompletedForEpoch is the only planned-takeover predicate. A
-// timeout or merely persisted intent intentionally returns false.
-func ACPUpgradeDrainCompletedForEpoch(
-	ctx context.Context,
-	reader client.Reader,
-	namespace, epochName string,
-	epoch int64,
-) (bool, error) {
-	marker, err := ReadACPUpgradeDrainMarker(ctx, reader, namespace, epochName)
-	if errors.Is(err, store.ErrNotFound) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return marker.ControllerEpoch == epoch && marker.State == ACPUpgradeDrainMarkerCompleted, nil
 }
 
 func (c *ACPUpgradeDrainCoordinator) requireCurrentEpoch(ctx context.Context, fence store.ControllerEpochFence) error {

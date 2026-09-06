@@ -1363,9 +1363,6 @@ type ClientError struct {
 	duplicateTurn           bool
 	completedDuplicateTurn  bool
 	capacityExceeded        bool
-	unsupportedVersion      bool
-	remoteRejected          bool
-	turnNotFound            bool
 	protocolViolation       bool
 	contextCanceled         bool
 	deadlineExceeded        bool
@@ -1382,11 +1379,8 @@ func (e ClientError) Is(target error) bool {
 func (e ClientError) IsDuplicateTurn() bool          { return e.duplicateTurn }
 func (e ClientError) IsCompletedDuplicateTurn() bool { return e.completedDuplicateTurn }
 
-func (e ClientError) IsCapacityExceeded() bool   { return e.capacityExceeded }
-func (e ClientError) IsUnsupportedVersion() bool { return e.unsupportedVersion }
-func (e ClientError) IsRemoteRejected() bool     { return e.remoteRejected }
-func (e ClientError) IsTurnNotFound() bool       { return e.turnNotFound }
-func (e ClientError) IsProtocolViolation() bool  { return e.protocolViolation }
+func (e ClientError) IsCapacityExceeded() bool  { return e.capacityExceeded }
+func (e ClientError) IsProtocolViolation() bool { return e.protocolViolation }
 
 func (e ClientError) Error() string {
 	if e.sanitizedDisplaySet {
@@ -1455,9 +1449,6 @@ func classifyClientError(clientErr ClientError, message string) ClientError {
 	clientErr.completedDuplicateTurn = clientErr.StatusCode == http.StatusConflict && duplicateMessage == "turn already completed"
 	clientErr.capacityExceeded = clientErr.StatusCode == http.StatusConflict &&
 		duplicateMessage == "maximum concurrent turns reached"
-	clientErr.unsupportedVersion = strings.Contains(lower, "unsupported version") || strings.Contains(lower, "unsupported protocol version")
-	clientErr.remoteRejected = strings.Contains(lower, "harness did not accept")
-	clientErr.turnNotFound = strings.Contains(lower, "turn not found")
 	clientErr.protocolViolation = strings.Contains(lower, "harness frame identity does not match") ||
 		strings.Contains(lower, "harness frame structural field") || strings.Contains(lower, "harness frame brokered tool content") ||
 		strings.Contains(lower, "harness health structural field") || strings.Contains(lower, "harness capabilities structural field") ||
@@ -1473,4 +1464,19 @@ func withClientErrorCause(clientErr ClientError, causes []error) ClientError {
 	clientErr.contextCanceled = errors.Is(causes[0], context.Canceled)
 	clientErr.deadlineExceeded = errors.Is(causes[0], context.DeadlineExceeded)
 	return clientErr
+}
+
+// validateAcceptedTurn checks that the harness echoed back the turn identity
+// the client asked it to start.
+func validateAcceptedTurn(request StartTurnRequest, accepted StartTurnResponse) error {
+	if accepted.RuntimeSessionID != request.RuntimeSessionID {
+		return fmt.Errorf("harness accepted runtime session %q, want %q", accepted.RuntimeSessionID, request.RuntimeSessionID)
+	}
+	if accepted.TurnID != request.TurnID {
+		return fmt.Errorf("harness accepted turn %q, want %q", accepted.TurnID, request.TurnID)
+	}
+	if accepted.CorrelationID != "" && accepted.CorrelationID != request.CorrelationID {
+		return fmt.Errorf("harness accepted correlation id %q, want %q", accepted.CorrelationID, request.CorrelationID)
+	}
+	return nil
 }

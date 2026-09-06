@@ -12,10 +12,7 @@ type SubstrateActorPoolExecutor struct {
 }
 
 // NewSubstrateActorPoolExecutor returns the control-only adapter used by the actor pool controller.
-func NewSubstrateActorPoolExecutor(cfg SubstrateConfig, opts ...SubstrateOption) (*SubstrateActorPoolExecutor, error) {
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+func NewSubstrateActorPoolExecutor(cfg SubstrateConfig) (*SubstrateActorPoolExecutor, error) {
 	if cfg.ControlClient == nil {
 		client, err := newGRPCSubstrateControlClient(cfg)
 		if err != nil {

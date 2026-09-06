@@ -24,6 +24,8 @@ import (
 
 const monitorTestRepoURL = "https://github.com/orka-agents/orka"
 
+const monitorTestValidationImage = "ghcr.io/example/validation@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func setupRepositoryMonitorHandlers(t *testing.T, ctxTokenConfig ContextTokenConfig, mode string, objects ...crclient.Object) (*fiber.App, *Handlers) {
 	t.Helper()
 
@@ -231,6 +233,86 @@ func TestCreateRepositoryMonitor_DerivesRepositoryIdentityFromURL(t *testing.T) 
 	require.Equal(t, "orka", created.Spec.Repository)
 }
 
+func TestRepositoryMonitorHandlersRejectMutableValidationImage(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		setup  bool
+	}{
+		{
+			name: "create", method: http.MethodPost, path: "/monitors/repositories",
+			body: fmt.Sprintf(`{"name":"repo-monitor","namespace":"demo","spec":{"repoURL":%q,"validation":{"image":"golang:1.25"},"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL),
+		},
+		{
+			name: "update", method: http.MethodPut, path: "/monitors/repositories/repo-monitor?namespace=demo", setup: true,
+			body: fmt.Sprintf(`{"spec":{"repoURL":%q,"validation":{"image":"golang:1.25"},"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			app, _ := setupRepositoryMonitorHandlers(t, ContextTokenConfig{}, ContextTokenAuthorizationModeOff)
+			if tt.setup {
+				createRepositoryMonitorForHandlerTest(t, app, "repo-monitor", "demo")
+			}
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			require.Contains(t, readRespBody(t, resp), "spec.validation.image must be digest-pinned")
+		})
+	}
+
+	app, _ := setupRepositoryMonitorHandlers(t, ContextTokenConfig{}, ContextTokenAuthorizationModeOff)
+	body := fmt.Sprintf(`{"name":"repo-monitor","namespace":"demo","spec":{"repoURL":%q,"validation":{"image":%q},"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL, monitorTestValidationImage)
+	req := httptest.NewRequest(http.MethodPost, "/monitors/repositories", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, readRespBody(t, resp))
+}
+
+func TestRepositoryMonitorHandlersRejectLegacyValidationCommands(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		setup  bool
+	}{
+		{
+			name: "create", method: http.MethodPost, path: "/monitors/repositories",
+			body: fmt.Sprintf(`{"name":"repo-monitor","namespace":"demo","spec":{"repoURL":%q,"validation":{"mode":"full","commands":["go test ./..."]},"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL),
+		},
+		{
+			name: "create with mode only", method: http.MethodPost, path: "/monitors/repositories",
+			body: fmt.Sprintf(`{"name":"repo-monitor","namespace":"demo","spec":{"repoURL":%q,"validation":{"mode":"full"},"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL),
+		},
+		{
+			name: "update", method: http.MethodPut, path: "/monitors/repositories/repo-monitor?namespace=demo", setup: true,
+			body: fmt.Sprintf(`{"spec":{"repoURL":%q,"validation":{"mode":"full","commands":["go test ./..."]},"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL),
+		},
+		{
+			name: "update with mode only", method: http.MethodPut, path: "/monitors/repositories/repo-monitor?namespace=demo", setup: true,
+			body: fmt.Sprintf(`{"spec":{"repoURL":%q,"validation":{"mode":"full"},"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			app, _ := setupRepositoryMonitorHandlers(t, ContextTokenConfig{}, ContextTokenAuthorizationModeOff)
+			if tt.setup {
+				createRepositoryMonitorForHandlerTest(t, app, "repo-monitor", "demo")
+			}
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			require.Contains(t, readRespBody(t, resp), "spec.validation.mode and spec.validation.commands are no longer supported")
+		})
+	}
+}
+
 func TestCreateRepositoryMonitor_RejectsUnsupportedTargets(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -330,7 +412,7 @@ func TestCreateRepositoryMonitor_AcceptsSafePublishConfig(t *testing.T) {
 				"event":"COMMENT",
 				"postPassed":true,
 				"sameHeadPolicy":"skip",
-				"inline":{"enabled":true,"minPriority":"P2","maxComments":10,"onlyChangedLines":true}
+				"inline":{"enabled":true,"minPriority":"P2","maxComments":10}
 			}},
 			"agents":{"reviewer":{"name":"reviewer"}}
 		}

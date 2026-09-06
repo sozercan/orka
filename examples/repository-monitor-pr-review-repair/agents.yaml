@@ -2,7 +2,6 @@ apiVersion: core.orka.ai/v1alpha1
 kind: Agent
 metadata:
   name: pr-reviewer
-  namespace: default
 spec:
   model:
     name: claude-sonnet-4.6
@@ -22,7 +21,6 @@ apiVersion: core.orka.ai/v1alpha1
 kind: Agent
 metadata:
   name: pr-repairer
-  namespace: default
 spec:
   model:
     name: gpt-5.4

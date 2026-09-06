@@ -165,11 +165,6 @@ spec:
                     description: RequireGlobalMergeGate requires the controller-wide
                       merge gate.
                     type: boolean
-                  requireMaintainerOptIn:
-                    default: true
-                    description: RequireMaintainerOptIn requires explicit maintainer
-                      opt-in.
-                    type: boolean
                 type: object
               branch:
                 default: main
@@ -298,13 +293,6 @@ spec:
                 description: Policy contains authorization and safety policy for monitor
                   operations.
                 properties:
-                  advisoryLabels:
-                    description: AdvisoryLabels controls advisory label synchronization.
-                    properties:
-                      enabled:
-                        description: Enabled enables advisory label sync.
-                        type: boolean
-                    type: object
                   allowedRepositoryPermissions:
                     description: AllowedRepositoryPermissions lists GitHub permissions
                       allowed to issue write commands.
@@ -316,17 +304,6 @@ spec:
                       type: string
                     type: array
                     x-kubernetes-list-type: set
-                  optInLabels:
-                    description: OptInLabels names labels that opt a PR into repair
-                      or automerge.
-                    properties:
-                      autofix:
-                        description: Autofix opts a PR into autofix.
-                        type: string
-                      automerge:
-                        description: Automerge opts a PR into automerge.
-                        type: string
-                    type: object
                   pauseLabels:
                     description: PauseLabels block further automation while present.
                     items:
@@ -417,22 +394,12 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
-                  maxReviewFixRetries:
-                    description: MaxReviewFixRetries bounds review-fix loop retries.
-                    format: int32
-                    minimum: 0
-                    type: integer
                   maxValidationRetries:
                     description: MaxValidationRetries bounds validation retries for
                       one repair job.
                     format: int32
                     minimum: 0
                     type: integer
-                  requireMaintainerOptIn:
-                    default: true
-                    description: RequireMaintainerOptIn requires an explicit maintainer
-                      command or label.
-                    type: boolean
                 type: object
               repoURL:
                 description: RepoURL is the repository URL to monitor.
@@ -500,10 +467,6 @@ spec:
                             - P2
                             - P3
                             type: string
-                          onlyChangedLines:
-                            description: OnlyChangedLines restricts inline comments
-                              to RIGHT-side changed lines. V1 treats this as true.
-                            type: boolean
                         type: object
                       mode:
                         default: summary_only
@@ -699,18 +662,30 @@ spec:
                     type: object
                 type: object
               validation:
-                description: Validation configures deterministic validation commands
-                  for repair.
+                description: Validation configures isolated validation for pull request
+                  reviews.
                 properties:
                   commands:
-                    description: Commands are validation commands repair jobs must
-                      run.
+                    description: |-
+                      Commands is retained only so upgraded clusters can detect and reject legacy
+                      validation policies instead of silently treating them as disabled.
+                      Deprecated: configure a digest-pinned image and let the reviewer select one command.
                     items:
                       type: string
                     type: array
+                  image:
+                    description: |-
+                      Image is the digest-pinned repository-specific container image used for validation.
+                      The reviewer chooses the validation command from the checked-out code.
+                      The image must contain /bin/sh and every tool the repository expects the
+                      reviewer to run.
+                    maxLength: 2048
+                    pattern: ^[^\s@]+@sha256:[a-f0-9]{64}$
+                    type: string
                   mode:
-                    default: changed
-                    description: Mode selects validation scope.
+                    description: |-
+                      Mode is retained only so upgraded clusters preserve the legacy field.
+                      Deprecated: validation scope is selected by the reviewer from repository evidence.
                     enum:
                     - "off"
                     - changed

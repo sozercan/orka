@@ -133,6 +133,25 @@ describe('ChatPage', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Providers unavailable: boom')
   })
 
+  it('preselects the sole ready provider when the server has no default provider', async () => {
+    chatConfig.current = { model: '', provider: '', enabled: true }
+    providerList.current = {
+      data: { items: [{ name: 'openai-proxy', type: 'openai', ready: true, defaultModel: 'gpt-5' }], metadata: {} },
+      error: undefined,
+    }
+    render(<ChatPage />)
+    await waitFor(() => expect(useChatStore.getState().provider).toBe('openai-proxy'))
+    expect(useChatStore.getState().model).toBe('gpt-5')
+  })
+
+  it('leaves the picker empty and blocks sending when several providers exist and there is no server default', async () => {
+    chatConfig.current = { model: '', provider: '', enabled: true }
+    render(<ChatPage />)
+    expect(useChatStore.getState().provider).toBe('')
+    expect(screen.queryByRole('option', { name: /Server default/ })).not.toBeInTheDocument()
+    expect(await screen.findByText('Choose a provider before sending.')).toBeInTheDocument()
+  })
+
   it('disables the model override when neither a provider nor a server default provider exists', async () => {
     chatConfig.current = { model: '', provider: '', enabled: true }
     render(<ChatPage />)

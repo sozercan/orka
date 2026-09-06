@@ -1,14 +1,23 @@
 import { renderHook, waitFor, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { http, HttpResponse } from 'msw'
 import type { ReactNode } from 'react'
+import { server } from '@/test/mocks/server'
 
 vi.mock('zustand/middleware', () => ({
   persist: (fn: unknown) => fn,
 }))
 
 import { useUIStore } from '@/stores/ui'
-import { useSessionList, useSession, useDeleteSession, retryUnlessClientError } from './use-sessions'
+import { useAuthStore } from '@/stores/auth'
+import {
+  useSessionListAll,
+  useSession,
+  useDeleteSession,
+  retryUnlessClientError,
+} from './use-sessions'
 import { ApiError } from '@/lib/api-client'
+import { maxListWalkPages } from '@/lib/list-api'
 
 function createWrapper() {
   const queryClient = new QueryClient({
@@ -20,14 +29,27 @@ function createWrapper() {
 }
 
 beforeEach(() => {
+  useAuthStore.setState({ token: 'test-token' })
   useUIStore.setState({ namespace: 'default', sidebarCollapsed: false, theme: 'light' })
 })
 
-describe('useSessionList', () => {
-  it('returns session list from API', async () => {
-    const { result } = renderHook(() => useSessionList(), { wrapper: createWrapper() })
+describe('useSessionListAll', () => {
+  it('reports when the bounded list walk stops before the collection ends', async () => {
+    let calls = 0
+    server.use(http.get('/api/v1/sessions', () => {
+      calls += 1
+      return HttpResponse.json({
+        items: [{ id: `session-${calls}` }],
+        metadata: { continue: `page-${calls}` },
+      })
+    }))
+
+    const { result } = renderHook(() => useSessionListAll('100', false), { wrapper: createWrapper() })
     await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(result.current.data).toEqual({ items: [], metadata: {} })
+    expect(calls).toBe(maxListWalkPages)
+    expect(result.current.data?.items).toHaveLength(maxListWalkPages)
+    expect(result.current.data?.truncated).toBe(true)
+    expect(result.current.data?.metadata.continue).toBe(`page-${maxListWalkPages}`)
   })
 })
 

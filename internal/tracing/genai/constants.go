@@ -26,10 +26,6 @@ const (
 	ToolTypeFunction     = "function"
 	ToolTypeExtension    = "extension"
 	ToolTypeDatastore    = "datastore"
-	ContentCaptureNone   = "none"
-	ContentCaptureSpan   = "span"
-	ContentCaptureEvent  = "event"
-	ContentCaptureAll    = "span_and_event"
 )
 
 const (

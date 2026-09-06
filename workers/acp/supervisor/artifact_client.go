@@ -51,13 +51,6 @@ type ArtifactClient struct {
 	maxUploadBytes   int64
 }
 
-func NewArtifactClient(baseURL string, client *http.Client, authorization ArtifactAuthorizationProvider) (*ArtifactClient, error) {
-	return newArtifactClient(baseURL, client, authorization, artifactClientLimits{
-		MaxDownloadBytes: defaultWorkspaceArtifactDownloadBytes,
-		MaxUploadBytes:   defaultWorkspaceDeltaUploadBytes,
-	})
-}
-
 func newArtifactClient(baseURL string, client *http.Client, authorization ArtifactAuthorizationProvider, limits artifactClientLimits) (*ArtifactClient, error) {
 	if limits.MaxDownloadBytes <= 0 || limits.MaxUploadBytes <= 0 {
 		return nil, fmt.Errorf("artifact transfer limits must be positive")

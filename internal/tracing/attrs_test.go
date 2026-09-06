@@ -33,35 +33,6 @@ func TestTaskAttributesOmitEmptyFieldsAndUseTenantFallback(t *testing.T) {
 	}
 }
 
-func TestToolAttributesIncludeExactSafeKeys(t *testing.T) {
-	attrs := ToolAttributes("delegate_task", ToolKindDelegate, 123, "invalid_arguments")
-	got := attrMap(attrs)
-
-	if got[AttrToolName].AsString() != "delegate_task" {
-		t.Fatalf("%s = %q", AttrToolName, got[AttrToolName].AsString())
-	}
-	if got[AttrToolKind].AsString() != ToolKindDelegate {
-		t.Fatalf("%s = %q", AttrToolKind, got[AttrToolKind].AsString())
-	}
-	if got[AttrToolResultSizeBytes].AsInt64() != 123 {
-		t.Fatalf("%s = %d", AttrToolResultSizeBytes, got[AttrToolResultSizeBytes].AsInt64())
-	}
-	if got["error.type"].AsString() != "invalid_arguments" {
-		t.Fatalf("error.type = %q", got["error.type"].AsString())
-	}
-}
-
-func TestToolAttributesOmitUnknownResultSizeAndEmptyError(t *testing.T) {
-	attrs := ToolAttributes("web_search", ToolKindBuiltin, -1, "")
-	got := attrMap(attrs)
-	if _, ok := got[AttrToolResultSizeBytes]; ok {
-		t.Fatalf("%s was emitted for unknown result size", AttrToolResultSizeBytes)
-	}
-	if _, ok := got["error.type"]; ok {
-		t.Fatal("error.type was emitted for empty error type")
-	}
-}
-
 func TestDelegateAttributesOmitEmptyValues(t *testing.T) {
 	attrs := DelegateAttributes("parent-a", "")
 	got := attrMap(attrs)

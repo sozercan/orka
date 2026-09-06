@@ -45,24 +45,6 @@ func TestNormalizeProviderName(t *testing.T) {
 	}
 }
 
-func TestContentCaptureModeParserFailsClosed(t *testing.T) {
-	tests := map[string]ContentCaptureMode{
-		"":               ContentCaptureModeNone,
-		"none":           ContentCaptureModeNone,
-		"off":            ContentCaptureModeNone,
-		"span":           ContentCaptureModeSpanOnly,
-		"event":          ContentCaptureModeEventOnly,
-		"span_and_event": ContentCaptureModeSpanAndEvent,
-		"all":            ContentCaptureModeSpanAndEvent,
-		"bogus":          ContentCaptureModeNone,
-	}
-	for input, want := range tests {
-		if got := ParseContentCaptureMode(input); got != want {
-			t.Fatalf("ParseContentCaptureMode(%q) = %v, want %v", input, got, want)
-		}
-	}
-}
-
 func TestHistogramBuckets(t *testing.T) {
 	if len(OperationDurationBuckets) != 14 {
 		t.Fatalf("operation duration bucket count = %d, want 14", len(OperationDurationBuckets))

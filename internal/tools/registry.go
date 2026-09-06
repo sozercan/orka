@@ -58,6 +58,7 @@ type ToolContext struct {
 	ParentTaskID              string
 	AgentName                 string
 	ToolCallID                string
+	OperationID               string
 	Tenant                    string
 	Provider                  string
 	ProviderType              string
@@ -68,10 +69,21 @@ type ToolContext struct {
 	// Broker-aware tools must fail closed on missing request-scoped dependencies
 	// instead of falling back to controller process environment or credentials.
 	Brokered bool
+	// TaskProvenanceProtected reports that Task provenance admission reserves
+	// controller-authenticated lineage metadata from direct namespace writes.
+	TaskProvenanceProtected bool
+	// ExternalEffects and OperationID let brokered coordination tools bind
+	// created resources to the controller-owned effect receipt for this exact
+	// tool call. The receipt remains authoritative when provenance admission is
+	// disabled and Task metadata is mutable.
+	ExternalEffects store.ExternalEffectStore
 	// Least-privilege durable dependencies for brokered memory tools.
 	MemoryReader         MemoryReader
 	MemoryProposalWriter MemoryProposalWriter
 	TranscriptSearcher   TranscriptSearcher
+	// RepositoryValidationBindings stores the controller-owned command binding
+	// created before a repository validation Task.
+	RepositoryValidationBindings RepositoryValidationBindingStore
 	// ResultStore for fetching task outputs (store.ResultStore)
 	ResultStore interface {
 		GetResult(ctx context.Context, namespace, taskName string) ([]byte, error)
@@ -83,21 +95,31 @@ type ToolContext struct {
 		DeleteSession(ctx context.Context, namespace, sessionID string) error
 	}
 	// Task creation helpers provided by the chat executor
-	GenerateTaskName               func() string
-	TaskLabels                     func() map[string]string
-	CheckTaskLimit                 func() *ChatToolError
-	AuthorizeTaskCreate            func(context.Context, *corev1alpha1.Task) *ChatToolError
-	AuthorizeTaskDelete            func(context.Context, *corev1alpha1.Task) *ChatToolError
-	AuthorizeAgentCreate           func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeAgentUpdate           func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeAgentDelete           func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeSecretRead            func(context.Context, string, string) *ChatToolError
+	GenerateTaskName     func() string
+	TaskLabels           func() map[string]string
+	CheckTaskLimit       func() *ChatToolError
+	AuthorizeTaskCreate  func(context.Context, *corev1alpha1.Task) *ChatToolError
+	AuthorizeTaskDelete  func(context.Context, *corev1alpha1.Task) *ChatToolError
+	AuthorizeAgentCreate func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	// AuthorizeAgentInitialTask preflights the combined Agent/Task operation
+	// before creating the Agent. Full Task authorization still runs later.
+	AuthorizeAgentInitialTask func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeAgentUpdate      func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeAgentDelete      func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeSecretRead       func(context.Context, string, string) *ChatToolError
+	AuthorizePodLogs          func(context.Context, string, string) error
+	// AuthorizeCodeExecResources checks creation and cleanup permissions for
+	// the complete temporary resource set before code_exec creates anything.
+	AuthorizeCodeExecResources     func(context.Context, []client.Object) error
 	RequireSecretReadAuthorization bool
-	IncrementTasks                 func()
-	ApprovalEmitter                func(context.Context, approvals.ApprovalTarget) error
-	ApprovalTargetSpecDigest       func(context.Context, string) (string, error)
-	ApprovalTargetArguments        func(context.Context, string, json.RawMessage) (json.RawMessage, error)
-	ApprovalTargetRefresh          func(context.Context, string, *corev1alpha1.Tool) error
+	// RequireGitHubTaskCredentials disables controller-global repository and
+	// credential fallback for external GitHub tool calls.
+	RequireGitHubTaskCredentials bool
+	IncrementTasks               func()
+	ApprovalEmitter              func(context.Context, approvals.ApprovalTarget) error
+	ApprovalTargetSpecDigest     func(context.Context, string) (string, error)
+	ApprovalTargetArguments      func(context.Context, string, json.RawMessage) (json.RawMessage, error)
+	ApprovalTargetRefresh        func(context.Context, string, *corev1alpha1.Tool) error
 }
 
 type toolContextKey struct{}
@@ -222,24 +244,6 @@ func (r *Registry) Get(name string) (Tool, bool) {
 	return tool, ok
 }
 
-func (r *Registry) get(name string) (Tool, bool) {
-	r.mu.RLock()
-	tool, ok := r.tools[name]
-	r.mu.RUnlock()
-	return tool, ok
-}
-
-// List returns all registered tools
-func (r *Registry) List() []Tool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	tools := make([]Tool, 0, len(r.tools))
-	for _, tool := range r.tools {
-		tools = append(tools, tool)
-	}
-	return tools
-}
-
 // Names returns all registered tool names in stable order.
 func (r *Registry) Names() []string {
 	r.mu.RLock()
@@ -255,7 +259,7 @@ func (r *Registry) Names() []string {
 // Execute executes a tool by name. It is the DRY instrumentation point for
 // built-in registry tools used by chat, proxy-compatible handlers, and workers.
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
-	tool, ok := r.get(name)
+	tool, ok := r.Get(name)
 	if telemetryDisabled() {
 		if !ok {
 			return "", fmt.Errorf("tool %q not found", name)
@@ -641,6 +645,7 @@ func RegisterBrokeredCoordinationTools(r *Registry, k8sClient client.Client) err
 	}
 	r.Register(NewDelegateTaskTool(k8sClient))
 	r.Register(NewWaitForTasksTool(k8sClient))
+	r.Register(NewRunValidationTool(k8sClient))
 	r.Register(NewSendMessageTool())
 	r.Register(NewCheckMessagesTool())
 	r.Register(NewRecallMemoryTool())

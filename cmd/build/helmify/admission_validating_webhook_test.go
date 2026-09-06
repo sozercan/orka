@@ -225,8 +225,8 @@ func TestSuspendQuotaLeaseWebhooksRouteProtectedWrites(t *testing.T) {
 			if selector == nil || selector.MatchLabels["kubernetes.io/metadata.name"] != wantNamespace {
 				t.Fatalf("namespaceSelector = %#v, want namespace %q", selector, wantNamespace)
 			}
-			expectedExpression := "request.name.startsWith('acp-suspend-quota-') || " +
-				"request.name.startsWith('acp-retention-fence-') || " +
+			expectedExpression := "request.?name.orValue('').startsWith('acp-suspend-quota-') || " +
+				"request.?name.orValue('').startsWith('acp-retention-fence-') || " +
 				"(request.operation == 'CREATE' && " +
 				"(object.metadata.?generateName.orValue('').startsWith('acp-suspend-quota-') || " +
 				"object.metadata.?generateName.orValue('').startsWith('acp-retention-fence-')))"

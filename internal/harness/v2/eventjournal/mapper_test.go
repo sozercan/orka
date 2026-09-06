@@ -93,9 +93,9 @@ func TestMapUpdateMapsACPUpdateKinds(t *testing.T) {
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			event := testUpdateEvent(uint64(index+2), now.Add(time.Duration(index)*time.Millisecond), test.update)
-			mapped, err := MapUpdate(event, mapCtx)
+			mapped, err := mapUpdate(event, mapCtx, mapUpdateOptions{})
 			if err != nil {
-				t.Fatalf("MapUpdate() error = %v", err)
+				t.Fatalf("mapUpdate() error = %v", err)
 			}
 			if mapped.Type != test.wantType || mapped.Severity != test.wantSeverity {
 				t.Fatalf("mapped type/severity = %s/%s, want %s/%s", mapped.Type, mapped.Severity, test.wantType, test.wantSeverity)
@@ -122,7 +122,7 @@ func TestMapUsagePreservesPromotedTelemetryContent(t *testing.T) {
 		Kind:  harnessv2.UpdateUsage,
 		Usage: &harnessv2.UsageUpdate{InputTokens: 100, OutputTokens: 25, CachedInputTokens: 60},
 	})
-	mapped, err := MapUpdate(event, testMapContext())
+	mapped, err := mapUpdate(event, testMapContext(), mapUpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestMapContextWindowUsageDoesNotMasqueradeAsTokenAccounting(t *testing.T) {
 			ContextWindowSize: &size,
 		},
 	})
-	mapped, err := MapUpdate(event, testMapContext())
+	mapped, err := mapUpdate(event, testMapContext(), mapUpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,9 +168,9 @@ func TestMapContextWindowUsageDoesNotMasqueradeAsTokenAccounting(t *testing.T) {
 }
 
 func TestMapZeroUsageSnapshotRemainsTokenTelemetry(t *testing.T) {
-	mapped, err := MapUpdate(testUpdateEvent(2, time.Now().UTC(), harnessv2.UpdateEvent{
+	mapped, err := mapUpdate(testUpdateEvent(2, time.Now().UTC(), harnessv2.UpdateEvent{
 		Kind: harnessv2.UpdateUsage, Usage: &harnessv2.UsageUpdate{},
-	}), testMapContext())
+	}), testMapContext(), mapUpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,12 +182,12 @@ func TestMapZeroUsageSnapshotRemainsTokenTelemetry(t *testing.T) {
 func TestMapDiagnosticRedactsCredentialSplitAcrossFields(t *testing.T) {
 	message := strings.Repeat("a", 24)
 	secret := mapperTestSecretPrefix + message
-	mapped, err := MapUpdate(testUpdateEvent(2, time.Now().UTC(), harnessv2.UpdateEvent{
+	mapped, err := mapUpdate(testUpdateEvent(2, time.Now().UTC(), harnessv2.UpdateEvent{
 		Kind: harnessv2.UpdateDiagnostic,
 		Diagnostic: &harnessv2.DiagnosticUpdate{
 			Code: mapperTestSecretPrefix, Message: message,
 		},
-	}), testMapContext())
+	}), testMapContext(), mapUpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,12 +207,12 @@ func TestMapDiagnosticRedactsCredentialSplitAcrossFields(t *testing.T) {
 func TestMapTerminalToolMetadataRedactsCredentialSplitAcrossFields(t *testing.T) {
 	kind := strings.Repeat("b", 24)
 	secret := mapperTestSecretPrefix + kind
-	mapped, err := MapUpdate(testUpdateEvent(2, time.Now().UTC(), harnessv2.UpdateEvent{
+	mapped, err := mapUpdate(testUpdateEvent(2, time.Now().UTC(), harnessv2.UpdateEvent{
 		Kind: harnessv2.UpdateToolCallUpdate,
 		ToolCall: &harnessv2.ToolCallUpdate{
 			ToolCallID: "call-split-metadata", Title: mapperTestSecretPrefix, Kind: kind, Status: harnessv2.ToolCallStatusCompleted,
 		},
-	}), testMapContext())
+	}), testMapContext(), mapUpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestMapTerminalToolRedactsCredentialSplitAcrossMetadataAndOutput(t *testing
 			ToolCallID: "call-split-output", Title: mapperTestSecretPrefix, Kind: "read", Status: harnessv2.ToolCallStatusCompleted,
 		},
 	})
-	mapped, err := mapToolUpdateWithContent(event, testMapContext(), output, false, false)
+	mapped, _, err := mapToolUpdateWithHistory(event, testMapContext(), &output, false, false, "", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestMapToolCallIDUsesStableNonSecretCorrelationID(t *testing.T) {
 				ToolCallID: rawID, Kind: "read", Status: harnessv2.ToolCallStatusPending,
 			},
 		})
-		mapped, err := MapUpdate(event, testMapContext())
+		mapped, err := mapUpdate(event, testMapContext(), mapUpdateOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -422,7 +422,7 @@ func TestMapUpdateOmitsUnredactedStreamText(t *testing.T) {
 		},
 	}
 	for index, update := range tests {
-		mapped, err := MapUpdate(testUpdateEvent(uint64(index+2), time.Now().UTC(), update), testMapContext())
+		mapped, err := mapUpdate(testUpdateEvent(uint64(index+2), time.Now().UTC(), update), testMapContext(), mapUpdateOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

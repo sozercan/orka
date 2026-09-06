@@ -69,6 +69,10 @@ var (
 		labels.AnnotationTraceState,
 		labels.AnnotationTraceBaggage,
 	}
+
+	controllerManagedTaskAnnotationKeys = []string{
+		labels.AnnotationParentTaskUID,
+	}
 )
 
 // TaskProvenanceConfig configures direct Kubernetes admission protection for
@@ -186,11 +190,9 @@ func (v *TaskProvenanceValidator) Handle(_ context.Context, req ctrladmission.Re
 }
 
 // presentTaskProvenanceFields lists Orka-managed fields present on a created
-// Task. A trusted worker keeps its provenance-field allowance, but workspace
-// settlement metadata stays reserved to controller identities: a compromised
-// worker with Task write access must never forge the settled marker, the
-// workspace link, or the incarnation pin and skip controller-owned revocation
-// and detach actions.
+// Task. A trusted worker keeps its provenance-field allowance, but
+// controller-authenticated lineage and workspace settlement metadata stay
+// reserved to controller identities.
 func presentTaskProvenanceFields(task *corev1alpha1.Task, workerTrusted bool) []string {
 	fields := []string{}
 	if !workerTrusted {
@@ -203,6 +205,7 @@ func presentTaskProvenanceFields(task *corev1alpha1.Task, workerTrusted bool) []
 		fields = append(fields, presentManagedMapFields(fieldMetadataLabels, task.Labels, managedTransactionLabelKeys)...)
 		fields = append(fields, presentManagedMapFields(fieldMetadataAnnotations, task.Annotations, managedTransactionAnnotationKeys)...)
 	}
+	fields = append(fields, presentManagedMapFields(fieldMetadataAnnotations, task.Annotations, controllerManagedTaskAnnotationKeys)...)
 	fields = append(fields, presentManagedPrefixFields(fieldMetadataLabels, task.Labels)...)
 	fields = append(fields, presentManagedPrefixFields(fieldMetadataAnnotations, task.Annotations)...)
 	return fields
@@ -220,6 +223,7 @@ func changedTaskProvenanceFields(oldTask, newTask *corev1alpha1.Task, workerTrus
 		fields = append(fields, changedManagedMapFields(fieldMetadataLabels, oldTask.Labels, newTask.Labels, managedTransactionLabelKeys)...)
 		fields = append(fields, changedManagedMapFields(fieldMetadataAnnotations, oldTask.Annotations, newTask.Annotations, managedTransactionAnnotationKeys)...)
 	}
+	fields = append(fields, changedManagedMapFields(fieldMetadataAnnotations, oldTask.Annotations, newTask.Annotations, controllerManagedTaskAnnotationKeys)...)
 	fields = append(fields, changedManagedPrefixFields(fieldMetadataLabels, oldTask.Labels, newTask.Labels)...)
 	fields = append(fields, changedManagedPrefixFields(fieldMetadataAnnotations, oldTask.Annotations, newTask.Annotations)...)
 	return fields

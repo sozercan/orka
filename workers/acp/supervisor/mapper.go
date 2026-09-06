@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	acpUpdateToolCall  = "tool_call"
-	acpContentTypeText = "text"
+	acpUpdateToolCall       = "tool_call"
+	acpUpdateToolCallUpdate = "tool_call_update"
+	acpContentTypeText      = "text"
 )
 
 const (
@@ -80,7 +81,7 @@ func mapACPUpdate(notification *acp.SessionNotification) (*harnessv2.UpdateEvent
 			Kind:             harnessv2.UpdateAssistantMessageChunk,
 			AssistantMessage: &harnessv2.AssistantMessageChunk{Text: content.Text},
 		}, content.Text, true, nil
-	case acpUpdateToolCall, "tool_call_update":
+	case acpUpdateToolCall, acpUpdateToolCallUpdate:
 		toolCallID, err := canonicalACPToolCallID(envelope.ToolCallID)
 		if err != nil {
 			return nil, "", false, err
@@ -94,7 +95,7 @@ func mapACPUpdate(notification *acp.SessionNotification) (*harnessv2.UpdateEvent
 		// that harness v2 deliberately does not project. A status-less update
 		// with no visible metadata would otherwise become an unbounded series of
 		// synthetic in_progress events carrying identical state.
-		if envelope.SessionUpdate == "tool_call_update" && envelope.Status == "" &&
+		if envelope.SessionUpdate == acpUpdateToolCallUpdate && envelope.Status == "" &&
 			envelope.Title == "" && envelope.Kind == "" && !contentPresent {
 			return nil, "", false, nil
 		}

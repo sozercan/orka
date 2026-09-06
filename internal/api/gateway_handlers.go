@@ -466,7 +466,9 @@ func (h *Handlers) listGatewayPage(ctx context.Context, list client.ObjectList, 
 	switch {
 	case h.apiReader != nil:
 		if err := h.apiReader.List(ctx, list, &opts); err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "failed to list "+what)
+			// An expired or malformed continue token is the caller's
+			// cursor problem (410/400), not a server failure.
+			return listPageError(what, err)
 		}
 	case h.client == nil:
 		return fiber.NewError(fiber.StatusServiceUnavailable, "gateway API reader is unavailable")

@@ -787,6 +787,23 @@ func authorizeContextTokenProviderUse(c fiber.Ctx, cfg ContextTokenAuthorization
 	return handleContextTokenAuthorizationFailures(cfg, ui.ContextToken, action, failures)
 }
 
+func authorizeContextTokenProviderReference(c fiber.Ctx, cfg ContextTokenAuthorizationConfig, action, namespace string, provider ProviderResolutionInfo) error {
+	if !cfg.Enabled() {
+		return nil
+	}
+	ui := GetUserInfo(c)
+	if ui == nil || ui.AuthType != AuthTypeContextToken || ui.ContextToken == nil {
+		return nil
+	}
+
+	failures := contextTokenProviderReferenceFailures(ui.ContextToken, cfg, namespace, provider)
+	if len(failures) == 0 {
+		metrics.RecordContextTokenAuthorization(action, "allowed", "ok")
+		return nil
+	}
+	return handleContextTokenAuthorizationFailures(cfg, ui.ContextToken, action, failures)
+}
+
 func contextTokenAllowsListedProviderModel(c fiber.Ctx, cfg ContextTokenAuthorizationConfig, action, namespace string, provider ProviderResolutionInfo, model string) bool {
 	if !cfg.Enabled() {
 		return true
@@ -993,6 +1010,19 @@ func contextTokenAuthorizationFailureReason(failures []string) string {
 }
 
 func contextTokenProviderUseFailures(token *ContextToken, cfg ContextTokenAuthorizationConfig, namespace string, provider ProviderResolutionInfo, model string) []string {
+	failures := contextTokenProviderReferenceFailures(token, cfg, namespace, provider)
+	tokenNamespace, hasTokenNamespace := contextString(token.TransactionContext, "namespace")
+	if want, ok := contextString(token.TransactionContext, "model"); ok && model != want {
+		failures = append(failures, fmt.Sprintf("model %q does not match token context %q", model, want))
+	}
+	if allowed, ok := contextStringList(token.TransactionContext, "allowedModels"); ok && !modelAllowed(provider, model, allowed, tokenNamespace, hasTokenNamespace) {
+		failures = append(failures, fmt.Sprintf("model %q is not allowed by token context", model))
+	}
+
+	return failures
+}
+
+func contextTokenProviderReferenceFailures(token *ContextToken, cfg ContextTokenAuthorizationConfig, namespace string, provider ProviderResolutionInfo) []string {
 	failures := []string{}
 	if !hasAnyScope(token.Scopes, cfg.ProviderUseScopes) {
 		failures = append(failures, fmt.Sprintf("missing one of required scopes %q", strings.Join(cfg.ProviderUseScopes, ",")))
@@ -1013,16 +1043,9 @@ func contextTokenProviderUseFailures(token *ContextToken, cfg ContextTokenAuthor
 	if allowed, ok := contextStringList(token.TransactionContext, "allowedProviders"); ok && !providerAllowed(provider, allowed, tokenNamespace, hasTokenNamespace) {
 		failures = append(failures, fmt.Sprintf("provider %q is not allowed by token context", provider.Name))
 	}
-	if want, ok := contextString(token.TransactionContext, "model"); ok && model != want {
-		failures = append(failures, fmt.Sprintf("model %q does not match token context %q", model, want))
-	}
-	if allowed, ok := contextStringList(token.TransactionContext, "allowedModels"); ok && !modelAllowed(provider, model, allowed, tokenNamespace, hasTokenNamespace) {
-		failures = append(failures, fmt.Sprintf("model %q is not allowed by token context", model))
-	}
 
 	return failures
 }
-
 func contextTokenAgentSpecFailures(ctx context.Context, c client.Client, token *ContextToken, agent *corev1alpha1.Agent) ([]string, error) {
 	if token == nil || agent == nil {
 		return nil, nil

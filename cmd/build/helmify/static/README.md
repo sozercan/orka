@@ -2,7 +2,7 @@
 
 This chart is generated from `cmd/build/helmify`; edit the generator inputs and
 run `make manifests` rather than editing generated chart copies directly. It
-packages all 24 production Orka CRDs under `crds/`. The development-only
+packages all 26 production Orka CRDs under `crds/`. The development-only
 `fake.workspace.orka.ai` CRDs are available separately from a matching source
 checkout at `config/development/fake-workspace-provider`.
 
@@ -220,7 +220,7 @@ A matching Orka source checkout provides the same guarded flow as
 competing CRD apply workflows for the same cluster.
 
 If another system owns the CRDs, perform the CRD-first step through that system,
-wait for all 24 production CRDs to become `Established`, and then upgrade Orka.
+wait for all 26 production CRDs to become `Established`, and then upgrade Orka.
 
 If a previous release was uninstalled, update its retained CRDs first and install
 the replacement release with `--skip-crds`.

@@ -38,16 +38,36 @@ var (
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		os.Exit(generalWorkerExitCode(err))
 	}
 }
 
+func generalWorkerExitCode(err error) int {
+	if errors.Is(err, errValidationCommandUnavailable) {
+		return workerenv.RepositoryValidationUnavailableExitCode
+	}
+	return 1
+}
+
 func run() (err error) {
+	if len(os.Args) > 1 && os.Args[1] == "--run-validation-network-sandbox" {
+		return runValidationNetworkSandbox(os.Args[2:])
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
 	if len(os.Args) > 1 && os.Args[1] == "--prepare-workspace-only" {
 		return prepareWorkspace(ctx)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--materialize-validation-command" {
+		return materializeValidationCommand(os.Args[2:])
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--wait-for-validation-network-access" {
+		return waitForValidationNetworkAccess(ctx, os.Args[2:])
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--wait-for-validation-network-policy" {
+		return waitForValidationNetworkPolicy(ctx, os.Args[2:])
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--security-mapper" {
 		return runSecurityMapper(ctx)

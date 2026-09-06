@@ -33,7 +33,7 @@ func (s *Store) GetControllerEpoch(ctx context.Context, name string) (*store.Con
 	if err := s.requireClient(); err != nil {
 		return nil, err
 	}
-	normalized, err := normalizeControllerEpochName(name)
+	normalized, err := store.NormalizeControllerEpochName(name)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +74,7 @@ func (s *Store) GetControllerEpochFence(ctx context.Context, name string) (store
 	if err := s.requireClient(); err != nil {
 		return store.ControllerEpochFence{}, err
 	}
-	normalized, err := normalizeControllerEpochName(name)
+	normalized, err := store.NormalizeControllerEpochName(name)
 	if err != nil {
 		return store.ControllerEpochFence{}, err
 	}
@@ -89,7 +89,7 @@ func (s *Store) GetControllerEpochFence(ctx context.Context, name string) (store
 	}
 	object, err := s.getControllerEpochObject(ctx, normalized)
 	if errors.Is(err, store.ErrNotFound) {
-		return store.ControllerEpochFence{}, controlConflict(
+		return store.ControllerEpochFence{}, store.ConflictErrorf(
 			"controller epoch object %q is missing while authoritative Lease %q exists",
 			controllerEpochObjectName(normalized), lease.Name,
 		)
@@ -112,7 +112,7 @@ func (s *Store) GetControllerEpochFence(ctx context.Context, name string) (store
 		return store.ControllerEpochFence{}, err
 	}
 	if latestLease.UID != lease.UID || latestEpoch != epoch {
-		return store.ControllerEpochFence{}, controlConflict("controller epoch authority changed during fence read")
+		return store.ControllerEpochFence{}, store.ConflictErrorf("controller epoch authority changed during fence read")
 	}
 	return store.ControllerEpochFence{Name: epoch.Name, Epoch: epoch.Epoch, HolderID: epoch.HolderID}, nil
 }
@@ -126,7 +126,7 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 	if err := s.requireClient(); err != nil {
 		return nil, err
 	}
-	name, err := normalizeControllerEpochName(change.Name)
+	name, err := store.NormalizeControllerEpochName(change.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -144,14 +144,14 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 	if change.NewEpoch < 1 {
 		return nil, store.ValidationErrorf("controller new epoch must be at least 1")
 	}
-	change.UpdatedAt = normalizeControlTime(change.UpdatedAt)
+	change.UpdatedAt = store.NormalizeControlTime(change.UpdatedAt)
 
 	key := types.NamespacedName{Namespace: s.controlNamespace, Name: controllerEpochLeaseName(change.Name)}
 	lease := &coordinationv1.Lease{}
 	err = s.readClient().Get(ctx, key, lease)
 	if apierrors.IsNotFound(err) {
 		if change.ExpectedVersion != 0 || change.ExpectedEpoch != 0 || change.NewEpoch != 1 {
-			return nil, controlConflict("controller epoch %q does not exist; creation requires expected version/epoch 0 and new epoch 1", change.Name)
+			return nil, store.ConflictErrorf("controller epoch %q does not exist; creation requires expected version/epoch 0 and new epoch 1", change.Name)
 		}
 		// Creating the inspection object is the API-server-serialized proof that
 		// this is a genuinely fresh control store. A pre-existing object, even
@@ -196,12 +196,12 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 	}
 	if current.Epoch == change.NewEpoch {
 		if current.HolderID != change.HolderID || current.RequestDigest != change.RequestDigest {
-			return nil, controlConflict("controller epoch %q target %d already exists with different holder or digest", change.Name, change.NewEpoch)
+			return nil, store.ConflictErrorf("controller epoch %q target %d already exists with different holder or digest", change.Name, change.NewEpoch)
 		}
 		return &current, nil
 	}
 	if current.Version != change.ExpectedVersion || current.Epoch != change.ExpectedEpoch {
-		return nil, controlConflict("controller epoch %q is version %d epoch %d, expected version %d epoch %d", change.Name, current.Version, current.Epoch, change.ExpectedVersion, change.ExpectedEpoch)
+		return nil, store.ConflictErrorf("controller epoch %q is version %d epoch %d, expected version %d epoch %d", change.Name, current.Version, current.Epoch, change.ExpectedVersion, change.ExpectedEpoch)
 	}
 	if change.NewEpoch != change.ExpectedEpoch+1 {
 		return nil, store.ValidationErrorf("controller epoch must advance exactly by one: expected new epoch %d", change.ExpectedEpoch+1)
@@ -209,7 +209,7 @@ func (s *Store) CompareAndSwapControllerEpoch(ctx context.Context, change store.
 	if active, expiresAt, lockErr := controllerEpochMutationLock(lease); lockErr != nil {
 		return nil, lockErr
 	} else if active && expiresAt.After(time.Now().UTC()) {
-		return nil, controlConflict("controller epoch %q has an active control-store mutation until %s", change.Name, expiresAt.Format(time.RFC3339Nano))
+		return nil, store.ConflictErrorf("controller epoch %q has an active control-store mutation until %s", change.Name, expiresAt.Format(time.RFC3339Nano))
 	}
 	object, err := s.getControllerEpochObject(ctx, change.Name)
 	if errors.Is(err, store.ErrNotFound) {
@@ -377,7 +377,7 @@ func (s *Store) getControllerEpochObject(ctx context.Context, name string) (*cor
 		return nil, mapKubernetesError("get controller epoch object", err)
 	}
 	if object.Spec.Name != name {
-		return nil, controlConflict("controller epoch object %s/%s has a different logical name", key.Namespace, key.Name)
+		return nil, store.ConflictErrorf("controller epoch object %s/%s has a different logical name", key.Namespace, key.Name)
 	}
 	return object, nil
 }
@@ -548,10 +548,10 @@ func validateControllerEpochObjectLeaseUID(object *corev1alpha1.ControllerEpoch,
 	raw, present := object.Annotations[annotationControllerEpochLeaseUID]
 	boundUID := strings.TrimSpace(raw)
 	if !present || boundUID == "" || raw != boundUID {
-		return controlConflict("controller epoch object %s/%s has no immutable authoritative Lease UID binding", object.Namespace, object.Name)
+		return store.ConflictErrorf("controller epoch object %s/%s has no immutable authoritative Lease UID binding", object.Namespace, object.Name)
 	}
 	if boundUID != leaseUID {
-		return controlConflict(
+		return store.ConflictErrorf(
 			"controller epoch object %s/%s is bound to Lease UID %q, not current UID %q",
 			object.Namespace, object.Name, boundUID, leaseUID,
 		)
@@ -595,7 +595,7 @@ func controllerEpochMirrorDigest(object *corev1alpha1.ControllerEpoch) (string, 
 	if err != nil {
 		return "", fmt.Errorf("encode controller epoch mirror digest: %w", err)
 	}
-	return canonicalBytesDigest(payload), nil
+	return store.CanonicalBytesDigest(payload), nil
 }
 
 func validateControllerEpochLeaseSnapshot(
@@ -606,7 +606,7 @@ func validateControllerEpochLeaseSnapshot(
 	predecessorDigest string,
 ) (*coordinationv1.Lease, error) {
 	if snapshot == nil || snapshot.Name != controllerEpochLeaseName(epoch.Name) || strings.TrimSpace(snapshot.ResourceVersion) == "" {
-		return nil, controlConflict("controller epoch %q status sync has an invalid Lease snapshot", epoch.Name)
+		return nil, store.ConflictErrorf("controller epoch %q status sync has an invalid Lease snapshot", epoch.Name)
 	}
 	snapshotUID, err := controllerEpochLeaseUID(snapshot)
 	if err != nil {
@@ -617,7 +617,7 @@ func validateControllerEpochLeaseSnapshot(
 		return nil, err
 	}
 	if snapshotPredecessorDigest != predecessorDigest {
-		return nil, controlConflict("controller epoch Lease %q predecessor digest changed before status sync", snapshot.Name)
+		return nil, store.ConflictErrorf("controller epoch Lease %q predecessor digest changed before status sync", snapshot.Name)
 	}
 	lease := &coordinationv1.Lease{}
 	key := types.NamespacedName{Namespace: s.controlNamespace, Name: snapshot.Name}
@@ -629,7 +629,7 @@ func validateControllerEpochLeaseSnapshot(
 		return nil, err
 	}
 	if leaseUID != snapshotUID {
-		return nil, controlConflict(
+		return nil, store.ConflictErrorf(
 			"controller epoch Lease %q changed from UID/resourceVersion %q/%q to %q/%q before status sync",
 			snapshot.Name, snapshotUID, snapshot.ResourceVersion, leaseUID, lease.ResourceVersion,
 		)
@@ -650,12 +650,12 @@ func validateControllerEpochLeaseSnapshot(
 		return nil, err
 	}
 	if currentPredecessorDigest != predecessorDigest {
-		return nil, controlConflict("controller epoch Lease %q predecessor digest no longer matches status sync", lease.Name)
+		return nil, store.ConflictErrorf("controller epoch Lease %q predecessor digest no longer matches status sync", lease.Name)
 	}
 	if current.Epoch != epoch.Epoch || current.Version != epoch.Version || current.HolderID != epoch.HolderID ||
 		current.RequestDigest != epoch.RequestDigest || !current.AcquiredAt.Equal(epoch.AcquiredAt) ||
 		!current.UpdatedAt.Equal(epoch.UpdatedAt) {
-		return nil, controlConflict(
+		return nil, store.ConflictErrorf(
 			"controller epoch Lease %q no longer matches epoch/version %d/%d holder %q before status sync",
 			lease.Name, epoch.Epoch, epoch.Version, epoch.HolderID,
 		)
@@ -686,7 +686,7 @@ func validateControllerEpochLeaseUIDBinding(
 			return false, false, fmt.Errorf("controller epoch object %s/%s has a non-canonical Lease UID binding", object.Namespace, object.Name)
 		}
 		if boundUID != leaseUID {
-			return false, false, controlConflict(
+			return false, false, store.ConflictErrorf(
 				"controller epoch object %s/%s is bound to Lease UID %q, not current UID %q",
 				object.Namespace, object.Name, boundUID, leaseUID,
 			)
@@ -697,13 +697,13 @@ func validateControllerEpochLeaseUIDBinding(
 		return false, false, nil
 	}
 	if !controllerEpochInitializationMarkerPresent(object) {
-		return false, false, controlConflict(
+		return false, false, store.ConflictErrorf(
 			"controller epoch object %s/%s has no immutable authoritative Lease UID binding",
 			object.Namespace, object.Name,
 		)
 	}
 	if predecessorDigest != "" {
-		return false, false, controlConflict(
+		return false, false, store.ConflictErrorf(
 			"controller epoch object %s/%s initialization marker cannot consume a predecessor digest",
 			object.Namespace, object.Name,
 		)
@@ -713,7 +713,7 @@ func validateControllerEpochLeaseUIDBinding(
 		return false, false, lockErr
 	}
 	if active && expiresAt.After(time.Now().UTC()) {
-		return false, false, controlConflict(
+		return false, false, store.ConflictErrorf(
 			"controller epoch object %s/%s cannot finish epoch-1 Lease UID binding while a control-store mutation is active until %s",
 			object.Namespace, object.Name, expiresAt.Format(time.RFC3339Nano),
 		)
@@ -742,7 +742,7 @@ func validateControllerEpochStatusSyncState(
 	status := object.Status
 	if controllerEpochStatusIsEmpty(status) {
 		if predecessorDigest != "" {
-			return decision, controlConflict("controller epoch %q blank mirror cannot consume a predecessor digest", epoch.Name)
+			return decision, store.ConflictErrorf("controller epoch %q blank mirror cannot consume a predecessor digest", epoch.Name)
 		}
 		if err := validateControllerEpochInitializationMarker(object, epoch, lease.Name); err != nil {
 			return decision, err
@@ -767,25 +767,25 @@ func validateControllerEpochStatusSyncState(
 		return decision, nil
 	}
 	if status.Epoch > epoch.Epoch || status.Version > epoch.Version {
-		return decision, controlConflict(
+		return decision, store.ConflictErrorf(
 			"controller epoch object %s/%s mirror %d/%d advanced beyond stale status sync target %d/%d",
 			object.Namespace, object.Name, status.Epoch, status.Version, epoch.Epoch, epoch.Version,
 		)
 	}
 	if status.Epoch != epoch.Epoch-1 || status.Version != epoch.Version-1 {
-		return decision, controlConflict(
+		return decision, store.ConflictErrorf(
 			"controller epoch object %s/%s mirror %d/%d is not the exact predecessor of status sync target %d/%d",
 			object.Namespace, object.Name, status.Epoch, status.Version, epoch.Epoch, epoch.Version,
 		)
 	}
 	if controllerEpochInitializationMarkerPresent(object) {
-		return decision, controlConflict(
+		return decision, store.ConflictErrorf(
 			"controller epoch object %s/%s still has an initialization marker before advancing mirror %d/%d",
 			object.Namespace, object.Name, epoch.Epoch, epoch.Version,
 		)
 	}
 	if predecessorDigest == "" {
-		return decision, controlConflict(
+		return decision, store.ConflictErrorf(
 			"controller epoch Lease %q has no authenticated predecessor digest for mirror %d/%d",
 			lease.Name, status.Epoch, status.Version,
 		)
@@ -809,7 +809,7 @@ func validateControllerEpochStatusSyncState(
 		return decision, err
 	}
 	if actualPredecessorDigest != predecessorDigest {
-		return decision, controlConflict(
+		return decision, store.ConflictErrorf(
 			"controller epoch object %s/%s predecessor mirror digest does not match authoritative Lease",
 			object.Namespace, object.Name,
 		)
@@ -835,7 +835,7 @@ func (s *Store) syncControllerEpochStatus(
 			return err
 		}
 		if object.Spec.Name != epoch.Name {
-			return controlConflict("controller epoch object %s/%s has a different logical name", key.Namespace, key.Name)
+			return store.ConflictErrorf("controller epoch object %s/%s has a different logical name", key.Namespace, key.Name)
 		}
 		decision, err := validateControllerEpochStatusSyncState(object, epoch, lease, predecessorDigest)
 		if err != nil {
@@ -877,7 +877,7 @@ func (s *Store) syncControllerEpochStatus(
 }
 
 func (s *Store) requireControllerEpoch(ctx context.Context, fence store.ControllerEpochFence) (store.ControllerEpochFence, epochSnapshot, error) {
-	normalized, err := normalizeEpochFence(fence)
+	normalized, err := store.NormalizeEpochFence(fence)
 	if err != nil {
 		return store.ControllerEpochFence{}, epochSnapshot{}, err
 	}
@@ -910,7 +910,7 @@ func (s *Store) requireControllerEpoch(ctx context.Context, fence store.Controll
 		key := types.NamespacedName{Namespace: s.controlNamespace, Name: controllerEpochLeaseName(normalized.Name)}
 		if err := s.readClient().Get(ctx, key, lease); err != nil {
 			if apierrors.IsNotFound(err) {
-				return store.ControllerEpochFence{}, epochSnapshot{}, controlConflict("controller epoch %q does not exist", normalized.Name)
+				return store.ControllerEpochFence{}, epochSnapshot{}, store.ConflictErrorf("controller epoch %q does not exist", normalized.Name)
 			}
 			return store.ControllerEpochFence{}, epochSnapshot{}, mapKubernetesError("get controller epoch fence Lease", err)
 		}
@@ -919,11 +919,11 @@ func (s *Store) requireControllerEpoch(ctx context.Context, fence store.Controll
 			return store.ControllerEpochFence{}, epochSnapshot{}, err
 		}
 		if current.Epoch != normalized.Epoch || current.HolderID != normalized.HolderID {
-			return store.ControllerEpochFence{}, epochSnapshot{}, controlConflict("controller epoch fence %s/%d/%s does not match current %d/%s", normalized.Name, normalized.Epoch, normalized.HolderID, current.Epoch, current.HolderID)
+			return store.ControllerEpochFence{}, epochSnapshot{}, store.ConflictErrorf("controller epoch fence %s/%d/%s does not match current %d/%s", normalized.Name, normalized.Epoch, normalized.HolderID, current.Epoch, current.HolderID)
 		}
 		object, err := s.getControllerEpochObject(ctx, normalized.Name)
 		if errors.Is(err, store.ErrNotFound) {
-			return store.ControllerEpochFence{}, epochSnapshot{}, controlConflict(
+			return store.ControllerEpochFence{}, epochSnapshot{}, store.ConflictErrorf(
 				"controller epoch object %q is missing while authoritative Lease %q exists",
 				controllerEpochObjectName(normalized.Name), lease.Name,
 			)
@@ -943,7 +943,7 @@ func (s *Store) requireControllerEpoch(ctx context.Context, fence store.Controll
 		}
 		now := time.Now().UTC()
 		if active && expiresAt.After(now) {
-			lastConflict = controlConflict("controller epoch %q is serializing another control-store mutation until %s", normalized.Name, expiresAt.Format(time.RFC3339Nano))
+			lastConflict = store.ConflictErrorf("controller epoch %q is serializing another control-store mutation until %s", normalized.Name, expiresAt.Format(time.RFC3339Nano))
 		} else {
 			updated := lease.DeepCopy()
 			if updated.Annotations == nil {

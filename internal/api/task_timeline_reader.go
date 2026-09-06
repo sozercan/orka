@@ -80,37 +80,6 @@ func (r taskTimelineReader) listThrough(ctx context.Context, throughSeq int64, m
 	return out, nil
 }
 
-func (r taskTimelineReader) listRecentThrough(ctx context.Context, throughSeq int64, maxEvents int) ([]store.ExecutionEvent, error) {
-	if throughSeq == 0 {
-		return nil, nil
-	}
-	if maxEvents <= 0 {
-		return nil, nil
-	}
-	after := max(throughSeq-int64(maxEvents), 0)
-	out := make([]store.ExecutionEvent, 0, maxEvents)
-	for {
-		batch, err := r.list(ctx, after, min(store.MaxExecutionEventLimit, maxEvents-len(out)), nil)
-		if err != nil {
-			return nil, err
-		}
-		if len(batch) == 0 {
-			break
-		}
-		for _, event := range batch {
-			if event.Seq > throughSeq || len(out) >= maxEvents {
-				return out, nil
-			}
-			out = append(out, event)
-			after = event.Seq
-		}
-		if after >= throughSeq || len(out) >= maxEvents || len(batch) < store.MaxExecutionEventLimit {
-			break
-		}
-	}
-	return out, nil
-}
-
 func (r taskTimelineReader) listRecentContextThrough(ctx context.Context, throughSeq int64, maxEvents int) ([]store.ExecutionEvent, bool, error) {
 	if throughSeq == 0 || maxEvents <= 0 {
 		return nil, false, nil

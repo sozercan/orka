@@ -598,6 +598,11 @@ func migrate(db *sql.DB) error {
 			findings_json      TEXT NOT NULL DEFAULT '[]',
 			summary            TEXT NOT NULL DEFAULT '',
 			suggested_comment  TEXT NOT NULL DEFAULT '',
+			validation_task          TEXT NOT NULL DEFAULT '',
+			validation_image         TEXT NOT NULL DEFAULT '',
+			validation_command_digest TEXT NOT NULL DEFAULT '',
+			validation_status        TEXT NOT NULL DEFAULT '',
+			validation_evidence      TEXT NOT NULL DEFAULT '',
 			rendered_comment   TEXT NOT NULL DEFAULT '',
 			marker             TEXT NOT NULL DEFAULT '',
 			github_review_id   TEXT NOT NULL DEFAULT '',
@@ -1055,6 +1060,15 @@ func migrate(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`UPDATE monitor_items SET github_updated_at = updated_at WHERE github_updated_at IS NULL OR github_updated_at = '0001-01-01T00:00:00Z'`); err != nil {
 		return fmt.Errorf("migration failed: %w", err)
+	}
+	if err := ensureSQLiteColumns(db, "review_records", []sqliteColumnMigration{
+		{Name: "validation_task", Definition: "validation_task TEXT NOT NULL DEFAULT ''"},
+		{Name: "validation_image", Definition: "validation_image TEXT NOT NULL DEFAULT ''"},
+		{Name: "validation_command_digest", Definition: "validation_command_digest TEXT NOT NULL DEFAULT ''"},
+		{Name: "validation_status", Definition: "validation_status TEXT NOT NULL DEFAULT ''"},
+		{Name: "validation_evidence", Definition: "validation_evidence TEXT NOT NULL DEFAULT ''"},
+	}); err != nil {
+		return err
 	}
 	if err := ensureSQLiteColumns(db, "command_events", []sqliteColumnMigration{
 		{Name: "source", Definition: "source TEXT NOT NULL DEFAULT ''"},

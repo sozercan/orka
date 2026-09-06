@@ -97,7 +97,7 @@ describe('GatewayPage', () => {
 
     render(<GatewayPage />)
 
-    expect(await screen.findByText('Could not load Gateways.')).toBeInTheDocument()
+    expect(await screen.findByText('Could not load Gateways')).toBeInTheDocument()
     expect(screen.getByText('inventory unavailable')).toBeInTheDocument()
     expect(screen.queryByText('No Gateways are configured in this namespace.')).not.toBeInTheDocument()
   })

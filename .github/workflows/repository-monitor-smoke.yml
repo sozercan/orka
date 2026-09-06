@@ -63,11 +63,11 @@ jobs:
             -count=1 \
             -v
           go test ./internal/controller \
-            -run 'TestRepositoryMonitor(Reconcile|Status)|TestReadRepositoryMonitorGitHubResponse|TestJobBuilder_Build_AgentTask_ReadOnlyAnnotation|TestJobBuilder_BuildWithOptions_ReadOnlyAgentWorkspaceWrapper|TestExtractStdoutTaskResult|TestStdoutResultPodLogOptionsReadsBoundedFullLog' \
+            -run 'TestRepositoryMonitor(Reconcile|Status)|TestReadRepositoryMonitorGitHubResponse|TestExtractStdoutTaskResult|TestStdoutResultPodLogOptionsReadsBoundedFullLog' \
             -count=1 \
             -v
           go test ./workers/common \
-            -run 'TestSubmitResult_ResultStdoutWritesMarkerFile|TestRunAgent_ResultStdoutSubmitsRawExecutorOutputWithGitWorkspace|TestRunAgent_AgentSandboxForwardsStdoutResultMarker|TestWorkspaceStdoutResultMarkerDownloadsMarkerWhenStdoutTruncated|TestRunAgent_ExecutionWorkspaceForwardsStdoutResultMarker' \
+            -run 'TestSubmitResult_ResultStdoutWritesMarkerFile' \
             -count=1 \
             -v
           go test ./internal/tools \

@@ -123,6 +123,43 @@ func (s *Store) ListSessions(ctx context.Context, namespace string) ([]store.Ses
 	return sessions, rows.Err()
 }
 
+// ListSessionsPage pushes the name cursor, type filter, ordering, and LIMIT
+// into SQL so a continuation request reads only its own page.
+func (s *Store) ListSessionsPage(ctx context.Context, namespace, afterName string, limit int, excludeType string) ([]store.SessionMetadata, bool, error) {
+	if limit <= 0 {
+		return nil, false, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT name, session_type, message_count, input_tokens, output_tokens, created_at, updated_at, active_task, active_task_uid
+		 FROM sessions
+		 WHERE namespace = ? AND name > ? AND (? = '' OR session_type <> ?)
+		 ORDER BY name ASC
+		 LIMIT ?`,
+		namespace, afterName, excludeType, excludeType, limit+1,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	var sessions []store.SessionMetadata
+	for rows.Next() {
+		var m store.SessionMetadata
+		if err := rows.Scan(&m.Name, &m.SessionType, &m.MessageCount, &m.InputTokens, &m.OutputTokens, &m.CreatedAt, &m.UpdatedAt, &m.ActiveTask, &m.ActiveTaskUID); err != nil {
+			return nil, false, err
+		}
+		sessions = append(sessions, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	more := len(sessions) > limit
+	if more {
+		sessions = sessions[:limit]
+	}
+	return sessions, more, nil
+}
+
 // DeleteSession removes a quiescent session, its settled durable turn state,
 // its messages (via CASCADE), and its session-scoped execution event read
 // model. Open turns, active mutation leases, reconciliation-blocked controls,

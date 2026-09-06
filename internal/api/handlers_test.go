@@ -45,6 +45,75 @@ import (
 
 const testWatchNamespace = "prod"
 
+func TestHandlers_ProviderReadsRequireKubernetesRBACForTokenReviewUser(t *testing.T) {
+	// TokenReview-authenticated reads run with the controller's credentials,
+	// so the Provider list and get handlers must pass a SubjectAccessReview
+	// for the caller before the orka-client Role grant means anything.
+	scheme := runtime.NewScheme()
+	_ = corev1alpha1.AddToScheme(scheme)
+
+	provider := &corev1alpha1.Provider{
+		ObjectMeta: metav1.ObjectMeta{Name: "openai", Namespace: "default"},
+		Spec:       corev1alpha1.ProviderSpec{Type: "openai", DefaultModel: "gpt-4o"},
+	}
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		wantVerb   string
+		wantName   string
+		allowed    bool
+		wantStatus int
+	}{
+		{"list denied", http.MethodGet, "/providers?namespace=default", "list", "", false, http.StatusForbidden},
+		{"list allowed", http.MethodGet, "/providers?namespace=default", "list", "", true, http.StatusOK},
+		{"get denied", http.MethodGet, "/providers/openai?namespace=default", "get", "openai", false, http.StatusForbidden},
+		{"get allowed", http.MethodGet, "/providers/openai?namespace=default", "get", "openai", true, http.StatusOK},
+		// Authorization runs before the read, so a denied caller cannot
+		// enumerate names through a 403-vs-404 difference.
+		{"get denied unknown name", http.MethodGet, "/providers/missing?namespace=default", "get", "missing", false, http.StatusForbidden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(provider.DeepCopy()).Build()
+			kubeClient := kubefake.NewSimpleClientset()
+			reviewed := false
+			kubeClient.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				review := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview)
+				require.Equal(t, "system:serviceaccount:default:limited", review.Spec.User)
+				require.NotNil(t, review.Spec.ResourceAttributes)
+				require.Equal(t, "default", review.Spec.ResourceAttributes.Namespace)
+				require.Equal(t, tt.wantVerb, review.Spec.ResourceAttributes.Verb)
+				require.Equal(t, corev1alpha1.GroupVersion.Group, review.Spec.ResourceAttributes.Group)
+				require.Equal(t, "providers", review.Spec.ResourceAttributes.Resource)
+				require.Equal(t, tt.wantName, review.Spec.ResourceAttributes.Name)
+				reviewed = true
+				review.Status.Allowed = tt.allowed
+				return true, review, nil
+			})
+
+			handlers := NewHandlers(HandlersConfig{Client: fakeClient, KubeClient: kubeClient})
+			app := fiber.New()
+			app.Use(func(c fiber.Ctx) error {
+				c.Locals(UserInfoContextKey, &UserInfo{
+					Username: "system:serviceaccount:default:limited",
+					Groups:   []string{"system:serviceaccounts", "system:serviceaccounts:default"},
+					AuthType: AuthTypeTokenReview,
+				})
+				return c.Next()
+			})
+			app.Get("/providers", handlers.ListProviders)
+			app.Get("/providers/:name", handlers.GetProvider)
+
+			resp, err := app.Test(httptest.NewRequest(tt.method, tt.path, nil))
+			require.NoError(t, err)
+			defer resp.Body.Close() //nolint:errcheck
+			require.Equal(t, tt.wantStatus, resp.StatusCode)
+			require.True(t, reviewed, "expected a SubjectAccessReview")
+		})
+	}
+}
+
 func TestHandlers_CreateTaskRequiresKubernetesRBACForTokenReviewUser(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1alpha1.AddToScheme(scheme)
@@ -2563,6 +2632,11 @@ func (s *sessionAccessRecordingStore) ListSessions(ctx context.Context, namespac
 	return s.SessionStore.ListSessions(ctx, namespace)
 }
 
+func (s *sessionAccessRecordingStore) ListSessionsPage(ctx context.Context, namespace, afterName string, limit int, excludeType string) ([]store.SessionMetadata, bool, error) {
+	s.listCalls++
+	return s.SessionStore.ListSessionsPage(ctx, namespace, afterName, limit, excludeType)
+}
+
 func (s *metadataOnlySessionStore) GetSession(ctx context.Context, namespace, name string) (*store.SessionRecord, error) {
 	s.getCalls++
 	return s.SessionStore.GetSession(ctx, namespace, name)
@@ -2658,6 +2732,78 @@ func TestHandlers_ListSessions_HidesGatewaySessions(t *testing.T) {
 	item, ok := items[0].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, "ordinary-session", item["name"])
+}
+
+func TestHandlers_ListSessions_HonorsLimitAndContinue(t *testing.T) {
+	handlers, app, ss := setupTestHandlersWithSessionManager()
+	ctx := context.Background()
+	for _, name := range []string{"session-a", "session-b", "session-c"} {
+		require.NoError(t, ss.CreateSession(ctx, &store.SessionRecord{
+			Namespace: "default", Name: name, SessionType: "task",
+		}))
+	}
+
+	app.Get("/sessions", handlers.ListSessions)
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/sessions?namespace=default&limit=2", nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var page1 ListResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&page1))
+	items, ok := page1.Items.([]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+	require.Equal(t, "session-b", page1.Metadata.Continue)
+
+	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/sessions?namespace=default&limit=2&continue="+page1.Metadata.Continue, nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var page2 ListResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&page2))
+	items, ok = page2.Items.([]any)
+	require.True(t, ok)
+	require.Len(t, items, 1)
+	item, ok := items[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "session-c", item["name"])
+	require.Empty(t, page2.Metadata.Continue)
+
+	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/sessions?namespace=default&limit=bogus", nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestHandlers_ListSessions_CursorEqualToCacheSentinelResumes(t *testing.T) {
+	handlers, app, ss := setupTestHandlersWithSessionManager()
+	ctx := context.Background()
+	// Sorted by name: "continue-not-supported" < "session-z". A page that
+	// ends on the sentinel-named session must still resume after it.
+	for _, name := range []string{"continue-not-supported", "session-z"} {
+		require.NoError(t, ss.CreateSession(ctx, &store.SessionRecord{
+			Namespace: "default", Name: name, SessionType: "task",
+		}))
+	}
+	app.Get("/sessions", handlers.ListSessions)
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/sessions?namespace=default&limit=1", nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var page1 ListResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&page1))
+	require.Equal(t, "continue-not-supported", page1.Metadata.Continue)
+
+	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/sessions?namespace=default&limit=1&continue="+page1.Metadata.Continue, nil))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var page2 ListResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&page2))
+	items, ok := page2.Items.([]any)
+	require.True(t, ok)
+	require.Len(t, items, 1)
+	item, ok := items[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "session-z", item["name"])
+	require.Empty(t, page2.Metadata.Continue)
 }
 
 func TestHandlers_ListSessions_Empty(t *testing.T) {

@@ -673,10 +673,10 @@ func TestAgentSandboxExecutorDownloadRecursivelyListsAndReadsFiles(t *testing.T)
 	handle := store.mustHandle(t, claim.Ref.Namespace, claim.Ref.ClaimName)
 	handle.lists = map[string][]sandbox.FileEntry{
 		".": {
-			{Name: "root.txt", Type: sandbox.FileTypeFile, Size: 4, ModTime: 1700000000},
+			{Name: "root.txt", Type: sandbox.FileTypeFile, Size: 4, ModTime: time.Unix(1700000000, 0)},
 			{Name: "dir", Type: sandbox.FileTypeDirectory},
 		},
-		"dir": {{Name: "child.txt", Type: sandbox.FileTypeFile, Size: 5, ModTime: 1700000001}},
+		"dir": {{Name: "child.txt", Type: sandbox.FileTypeFile, Size: 5, ModTime: time.Unix(1700000001, 0)}},
 	}
 	handle.reads = map[string][]byte{
 		"root.txt":      []byte("root"),

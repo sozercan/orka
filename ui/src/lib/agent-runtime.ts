@@ -1,7 +1,4 @@
-import {
-  builtInAgentRuntimeTypes,
-  type BuiltInAgentRuntimeType,
-} from "@/schemas/agent";
+import type { BuiltInAgentRuntimeType } from "@/schemas/agent";
 
 export type { BuiltInAgentRuntimeType } from "@/schemas/agent";
 
@@ -14,13 +11,6 @@ const BUILT_IN_AGENT_RUNTIME_LABELS: Record<
   copilot: { option: "GitHub Copilot ACP", compact: "copilot ACP" },
   opencode: { option: "OpenCode ACP", compact: "OpenCode ACP" },
 };
-
-export const BUILT_IN_AGENT_RUNTIME_OPTIONS = builtInAgentRuntimeTypes.map(
-  (value) => ({
-    value,
-    label: BUILT_IN_AGENT_RUNTIME_LABELS[value].option,
-  }),
-);
 
 export const OPENCODE_REVIEWED_RUNTIME_DEFAULTS = {
   defaultAllowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],

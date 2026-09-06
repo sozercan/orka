@@ -273,27 +273,32 @@ type ActionRecordFilter struct {
 
 // ReviewRecord stores one immutable typed review result.
 type ReviewRecord struct {
-	ID               string    `json:"id"`
-	MonitorNamespace string    `json:"monitorNamespace"`
-	MonitorName      string    `json:"monitorName"`
-	Kind             string    `json:"kind"`
-	Number           int64     `json:"number,omitempty"`
-	HeadSHA          string    `json:"headSHA,omitempty"`
-	TaskName         string    `json:"taskName,omitempty"`
-	TaskNamespace    string    `json:"taskNamespace,omitempty"`
-	Verdict          string    `json:"verdict,omitempty"`
-	Confidence       string    `json:"confidence,omitempty"`
-	Repairable       bool      `json:"repairable,omitempty"`
-	SecurityStatus   string    `json:"securityStatus,omitempty"`
-	FindingsJSON     string    `json:"findingsJSON,omitempty"`
-	Summary          string    `json:"summary,omitempty"`
-	SuggestedComment string    `json:"suggestedComment,omitempty"`
-	RenderedComment  string    `json:"renderedComment,omitempty"`
-	Marker           string    `json:"marker,omitempty"`
-	GitHubReviewID   string    `json:"githubReviewID,omitempty"`
-	GitHubCommentID  string    `json:"githubCommentID,omitempty"`
-	GitHubCommentURL string    `json:"githubCommentURL,omitempty"`
-	CreatedAt        time.Time `json:"createdAt"`
+	ID                      string    `json:"id"`
+	MonitorNamespace        string    `json:"monitorNamespace"`
+	MonitorName             string    `json:"monitorName"`
+	Kind                    string    `json:"kind"`
+	Number                  int64     `json:"number,omitempty"`
+	HeadSHA                 string    `json:"headSHA,omitempty"`
+	TaskName                string    `json:"taskName,omitempty"`
+	TaskNamespace           string    `json:"taskNamespace,omitempty"`
+	Verdict                 string    `json:"verdict,omitempty"`
+	Confidence              string    `json:"confidence,omitempty"`
+	Repairable              bool      `json:"repairable,omitempty"`
+	SecurityStatus          string    `json:"securityStatus,omitempty"`
+	FindingsJSON            string    `json:"findingsJSON,omitempty"`
+	Summary                 string    `json:"summary,omitempty"`
+	SuggestedComment        string    `json:"suggestedComment,omitempty"`
+	ValidationTask          string    `json:"validationTask,omitempty"`
+	ValidationImage         string    `json:"validationImage,omitempty"`
+	ValidationCommandDigest string    `json:"validationCommandDigest,omitempty"`
+	ValidationStatus        string    `json:"validationStatus,omitempty"`
+	ValidationEvidence      string    `json:"validationEvidence,omitempty"`
+	RenderedComment         string    `json:"renderedComment,omitempty"`
+	Marker                  string    `json:"marker,omitempty"`
+	GitHubReviewID          string    `json:"githubReviewID,omitempty"`
+	GitHubCommentID         string    `json:"githubCommentID,omitempty"`
+	GitHubCommentURL        string    `json:"githubCommentURL,omitempty"`
+	CreatedAt               time.Time `json:"createdAt"`
 }
 
 // ReviewRecordFilter constrains review record list queries.
@@ -444,6 +449,7 @@ type MonitorEvent struct {
 // MonitorEventFilter constrains monitor event list queries.
 type MonitorEventFilter struct {
 	Namespace   string
+	ID          string
 	MonitorName string
 	RunID       string
 	ItemKind    string

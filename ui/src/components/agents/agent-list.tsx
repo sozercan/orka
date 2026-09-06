@@ -3,6 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ListAccessError } from '@/components/ui/list-access-error'
 import { PageHeader } from '@/components/layout/page-header'
 import { Bot, Plus } from 'lucide-react'
 import { useAgentList } from '@/hooks/use-agents'
@@ -10,7 +11,8 @@ import type { Agent } from '@/schemas/agent'
 import { builtInAgentRuntimeLabel } from '@/lib/agent-runtime'
 
 export function AgentList() {
-  const { data, isLoading } = useAgentList()
+  const { data, isLoading, error } = useAgentList()
+  const agents = error ? [] : (data?.items ?? [])
 
   return (
     <div className="space-y-4">
@@ -33,11 +35,13 @@ export function AgentList() {
             </Card>
           ))}
         </div>
-      ) : (data?.items ?? []).length === 0 ? (
+      ) : error ? (
+        <Card><CardContent className="pt-6"><ListAccessError error={error} resource="agents" /></CardContent></Card>
+      ) : agents.length === 0 ? (
         <div className="text-center py-12 text-muted-foreground">No agents registered.</div>
       ) : (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {(data?.items ?? []).map((agent: Agent) => (
+          {agents.map((agent: Agent) => (
             <Link key={agent.metadata.uid || agent.metadata.name} to="/agents/$agentId" params={{ agentId: agent.metadata.name }}>
               <Card className="hover:border-primary/50 transition-colors cursor-pointer">
                 <CardHeader className="flex flex-row items-center gap-3 space-y-0">

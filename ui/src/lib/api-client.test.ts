@@ -152,8 +152,33 @@ describe('error handling', () => {
   })
 })
 
-describe('204 response', () => {
-  it('returns undefined', async () => {
+describe('successful response parsing', () => {
+  it('returns text from a non-JSON 202 response', async () => {
+    server.use(
+      http.post(`${API}/test-responses/accepted`, () => {
+        return new HttpResponse('Accepted', {
+          status: 202,
+          headers: { 'Content-Type': 'text/plain' },
+        })
+      })
+    )
+
+    const result = await api.post<string>('/test-responses/accepted')
+    expect(result).toBe('Accepted')
+  })
+
+  it('returns undefined from an empty 200 response', async () => {
+    server.use(
+      http.get(`${API}/test-responses/empty`, () => {
+        return new HttpResponse(null, { status: 200 })
+      })
+    )
+
+    const result = await api.get<void>('/test-responses/empty')
+    expect(result).toBeUndefined()
+  })
+
+  it('returns undefined from a 204 response', async () => {
     server.use(
       http.delete(`${API}/tasks/:id`, () => {
         return new HttpResponse(null, { status: 204 })
@@ -162,6 +187,19 @@ describe('204 response', () => {
 
     const result = await api.delete('/tasks/my-task')
     expect(result).toBeUndefined()
+  })
+
+  it('rejects malformed responses advertised as JSON', async () => {
+    server.use(
+      http.get(`${API}/test-responses/malformed-json`, () => {
+        return new HttpResponse('{not-json', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        })
+      })
+    )
+
+    await expect(api.get('/test-responses/malformed-json')).rejects.toBeInstanceOf(SyntaxError)
   })
 })
 

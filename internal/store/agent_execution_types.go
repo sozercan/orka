@@ -8,8 +8,6 @@ package store
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
@@ -62,8 +60,7 @@ type AgentExecutionSnapshot struct {
 // CanonicalAgentExecutionSnapshotDigest returns the canonical digest of a
 // plaintext snapshot body.
 func CanonicalAgentExecutionSnapshotDigest(body []byte) string {
-	sum := sha256.Sum256(body)
-	return "sha256:" + hex.EncodeToString(sum[:])
+	return CanonicalBytesDigest(body)
 }
 
 // AgentExecutionSnapshotStore persists immutable execution snapshots.
@@ -79,10 +76,6 @@ type AgentExecutionSnapshotStore interface {
 	// GetAgentExecutionSnapshot decrypts and returns one snapshot, verifying
 	// body integrity against the stored digest.
 	GetAgentExecutionSnapshot(ctx context.Context, key AgentExecutionSnapshotKey) (*AgentExecutionSnapshot, error)
-
-	// ListAgentExecutionSnapshotKeys returns every stored snapshot key for a
-	// Task UID, for retention checks and inventory.
-	ListAgentExecutionSnapshotKeys(ctx context.Context, taskUID string) ([]AgentExecutionSnapshotKey, error)
 
 	// DeleteAgentExecutionSnapshots removes every snapshot for a Task UID. The
 	// caller is responsible for proving all binding, attempt, lineage,
@@ -250,9 +243,6 @@ type SessionLineageStore interface {
 
 	// GetSessionLineage returns the lineage for one Session, or ErrNotFound.
 	GetSessionLineage(ctx context.Context, namespace, sessionName string) (*SessionLineage, error)
-
-	// DeleteSessionLineage removes the lineage during Session cleanup.
-	DeleteSessionLineage(ctx context.Context, namespace, sessionName string) error
 }
 
 // HarnessV1AttemptState is the durable harness v1 attempt state machine.
@@ -493,10 +483,6 @@ type HarnessV1AttemptStore interface {
 
 	// ListHarnessV1AttemptsByTask returns every attempt for one Task UID.
 	ListHarnessV1AttemptsByTask(ctx context.Context, namespace, taskUID string) ([]HarnessV1Attempt, error)
-
-	// ListActiveHarnessV1Attempts returns every nonterminal attempt for drain
-	// and retirement inventory.
-	ListActiveHarnessV1Attempts(ctx context.Context) ([]HarnessV1Attempt, error)
 
 	// TransitionHarnessV1Attempt applies a fenced CAS transition. A replay with
 	// the same operation ID and digest against the already-applied state is

@@ -420,7 +420,7 @@ render_admission_webhooks() {
       select(.name == "acpsuspendquotalease.core.orka.ai" and
              .clientConfig.service.path == "/validate-coordination-k8s-io-v1-acp-suspend-quota-lease" and
              .rules == [{"operations":["CREATE","UPDATE","DELETE"],"apiGroups":["coordination.k8s.io"],"apiVersions":["v1"],"resources":["leases"],"scope":"Namespaced"}] and
-             .matchConditions == [{"name":"reserved-acp-workspace-lease-name","expression":"request.name.startsWith(\u0027acp-suspend-quota-\u0027) || request.name.startsWith(\u0027acp-retention-fence-\u0027) || (request.operation == \u0027CREATE\u0027 && (object.metadata.?generateName.orValue(\u0027\u0027).startsWith(\u0027acp-suspend-quota-\u0027) || object.metadata.?generateName.orValue(\u0027\u0027).startsWith(\u0027acp-retention-fence-\u0027)))"}])] | length) == 1
+             .matchConditions == [{"name":"reserved-acp-workspace-lease-name","expression":"request.?name.orValue(\u0027\u0027).startsWith(\u0027acp-suspend-quota-\u0027) || request.?name.orValue(\u0027\u0027).startsWith(\u0027acp-retention-fence-\u0027) || (request.operation == \u0027CREATE\u0027 && (object.metadata.?generateName.orValue(\u0027\u0027).startsWith(\u0027acp-suspend-quota-\u0027) || object.metadata.?generateName.orValue(\u0027\u0027).startsWith(\u0027acp-retention-fence-\u0027)))"}])] | length) == 1
   ' "${admission_webhooks_manifest}" >/dev/null || {
     echo "admission wave must contain exactly nine unique, fail-closed, CA-pinned orka-admission webhooks, including attachment Secret and ACP workspace coordination Lease protection, and no legacy coexistence policies" >&2
     return 1

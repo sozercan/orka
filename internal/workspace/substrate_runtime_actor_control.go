@@ -484,10 +484,7 @@ type substrateRuntimeActorControl struct {
 
 // NewSubstrateRuntimeActorControl builds the control-only Substrate client for
 // ACP RuntimePool hosting.
-func NewSubstrateRuntimeActorControl(cfg SubstrateConfig, opts ...SubstrateOption) (SubstrateRuntimeActorControl, error) {
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+func NewSubstrateRuntimeActorControl(cfg SubstrateConfig) (SubstrateRuntimeActorControl, error) {
 	if cfg.ControlClient == nil {
 		client, err := newGRPCSubstrateControlClient(cfg)
 		if err != nil {

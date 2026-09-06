@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -24,7 +25,8 @@ func TestBuildWorkspaceDeltaPropagatesRequestMaxBytes(t *testing.T) {
 		t.Fatalf("write oversized workspace change: %v", err)
 	}
 
-	_, err = buildWorkspaceDelta(
+	_, err = buildWorkspaceDeltaContext(
+		context.Background(),
 		baseline,
 		root,
 		workspacedelta.IntentWrite,
@@ -38,7 +40,8 @@ func TestBuildWorkspaceDeltaPropagatesRequestMaxBytes(t *testing.T) {
 		t.Fatalf("buildWorkspaceDelta error = %v, want request limit before content retention", err)
 	}
 
-	result, err := buildWorkspaceDelta(
+	result, err := buildWorkspaceDeltaContext(
+		context.Background(),
 		baseline,
 		root,
 		workspacedelta.IntentWrite,

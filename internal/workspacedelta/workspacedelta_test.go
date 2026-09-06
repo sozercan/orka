@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -466,4 +467,129 @@ func readTestArchive(t *testing.T, artifact []byte) (map[string]archivedEntry, [
 		order = append(order, header.Name)
 	}
 	return entries, order
+}
+
+func TestCaptureContentFlaggerMarksBaselinePaths(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "flagged.js"), []byte("secret marker content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested", "plain.js"), []byte("ordinary content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := Capture(root, Options{ContentFlagger: func(content []byte) bool {
+		return bytes.Contains(content, []byte("secret marker"))
+	}})
+	if err != nil {
+		t.Fatalf("Capture() error = %v", err)
+	}
+	if !snapshot.BaselineContentFlagged("flagged.js") {
+		t.Fatal("flagged.js was not marked")
+	}
+	if snapshot.BaselineContentFlagged("nested/plain.js") {
+		t.Fatal("nested/plain.js was wrongly marked")
+	}
+	if snapshot.BaselineContentFlagged("absent.js") {
+		t.Fatal("unknown path reported flagged")
+	}
+	var nilSnapshot *Snapshot
+	if nilSnapshot.BaselineContentFlagged("flagged.js") {
+		t.Fatal("nil snapshot reported flagged")
+	}
+
+	// Without a flagger nothing is marked.
+	snapshot, err = Capture(root, Options{})
+	if err != nil {
+		t.Fatalf("Capture() error = %v", err)
+	}
+	if snapshot.BaselineContentFlagged("flagged.js") {
+		t.Fatal("flagger-less capture marked a path")
+	}
+}
+
+func TestCaptureContentFingerprinterOnlyRunsForFlaggedFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "flagged.js"), []byte("secret marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "plain.js"), []byte("ordinary\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var fingerprinted []string
+	snapshot, err := Capture(root, Options{
+		ContentFlagger: func(content []byte) bool { return bytes.Contains(content, []byte("secret marker")) },
+		ContentFingerprinter: func(content []byte) []string {
+			fingerprinted = append(fingerprinted, string(bytes.TrimSpace(content)))
+			return []string{"fp"}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fingerprinted) != 1 || fingerprinted[0] != "secret marker" {
+		t.Fatalf("fingerprinter ran for %v, want only the flagged file", fingerprinted)
+	}
+	if got := snapshot.BaselineContentFingerprints("plain.js"); got != nil {
+		t.Fatalf("unflagged file fingerprints = %v, want none", got)
+	}
+}
+
+func TestBuildDoesNotRerunContentPolicyOnPostCapture(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "app.js"), []byte("secret marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var flaggerCalls, fingerprinterCalls atomic.Int32
+	snapshot, err := Capture(root, Options{
+		ContentFlagger:       func([]byte) bool { flaggerCalls.Add(1); return true },
+		ContentFingerprinter: func([]byte) []string { fingerprinterCalls.Add(1); return []string{"fp"} },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flaggerCalls.Load() != 1 || fingerprinterCalls.Load() != 1 {
+		t.Fatalf("baseline calls flagger=%d fingerprinter=%d, want 1/1", flaggerCalls.Load(), fingerprinterCalls.Load())
+	}
+	if err := os.WriteFile(filepath.Join(root, "app.js"), []byte("secret marker\nmore\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(snapshot, root, IntentWrite); err != nil {
+		t.Fatal(err)
+	}
+	if flaggerCalls.Load() != 1 || fingerprinterCalls.Load() != 1 {
+		t.Fatalf("post-capture reran content policy: flagger=%d fingerprinter=%d", flaggerCalls.Load(), fingerprinterCalls.Load())
+	}
+	if !snapshot.BaselineContentFlagged("app.js") || len(snapshot.BaselineContentFingerprints("app.js")) != 1 {
+		t.Fatal("baseline flags were lost")
+	}
+}
+
+func TestCaptureContentFingerprinterRecordsBaselineFragments(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "flagged.js"), []byte("a\nSECRET-LINE\nb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := Capture(root, Options{ContentFingerprinter: func(content []byte) []string {
+		if strings.Contains(string(content), "SECRET-LINE") {
+			return []string{"fp-secret-line"}
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshot.BaselineContentFingerprints("flagged.js"); len(got) != 1 || got[0] != "fp-secret-line" {
+		t.Fatalf("fingerprints = %v", got)
+	}
+	if got := snapshot.BaselineContentFingerprints("absent.js"); got != nil {
+		t.Fatalf("absent path fingerprints = %v", got)
+	}
+	var nilSnapshot *Snapshot
+	if got := nilSnapshot.BaselineContentFingerprints("flagged.js"); got != nil {
+		t.Fatalf("nil snapshot fingerprints = %v", got)
+	}
 }

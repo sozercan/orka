@@ -47,45 +47,6 @@ func TestTurnJournalOpenIndexesStoredHarnessIdentity(t *testing.T) {
 	}
 }
 
-func TestTurnJournalHasPersistedFrames(t *testing.T) {
-	eventStore := storetest.NewFakeExecutionEventStore()
-	if _, err := eventStore.AppendExecutionEvent(context.Background(), &store.ExecutionEvent{
-		Namespace:  turnJournalNamespace,
-		StreamType: store.ExecutionEventStreamTypeTask,
-		StreamID:   turnJournalTask,
-		Type:       events.ExecutionEventTypeAgentRuntimeStarted,
-		Content:    []byte(`{"harness":{"runtimeSessionID":"runtime-1","turnID":"turn-abc","correlationID":"corr-1","seq":1}}`),
-	}); err != nil {
-		t.Fatalf("AppendExecutionEvent: %v", err)
-	}
-	journal := TurnJournal{EventStore: eventStore, MapContext: EventMapContext{Namespace: turnJournalNamespace, TaskName: turnJournalTask}}
-
-	has, err := journal.HasPersistedFrames(context.Background(), "turn-abc")
-	if err != nil {
-		t.Fatalf("HasPersistedFrames: %v", err)
-	}
-	if !has {
-		t.Fatal("expected persisted frames for turn-abc to be detected")
-	}
-
-	has, err = journal.HasPersistedFrames(context.Background(), "turn-other")
-	if err != nil {
-		t.Fatalf("HasPersistedFrames(other): %v", err)
-	}
-	if has {
-		t.Fatal("unexpected match for a different turn ID")
-	}
-
-	emptyJournal := TurnJournal{EventStore: storetest.NewFakeExecutionEventStore(), MapContext: EventMapContext{Namespace: turnJournalNamespace, TaskName: turnJournalTask}}
-	has, err = emptyJournal.HasPersistedFrames(context.Background(), "turn-abc")
-	if err != nil {
-		t.Fatalf("HasPersistedFrames(empty): %v", err)
-	}
-	if has {
-		t.Fatal("unexpected match against an empty store")
-	}
-}
-
 func TestTurnJournalPagesPastNonHarnessEvents(t *testing.T) {
 	eventStore := storetest.NewFakeExecutionEventStore()
 	for i := range store.MaxExecutionEventLimit {

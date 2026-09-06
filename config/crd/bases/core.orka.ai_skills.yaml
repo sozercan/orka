@@ -83,10 +83,6 @@ spec:
                 description: Source tracks where this skill was imported from (for
                   updates)
                 properties:
-                  context7:
-                    description: Context7 indicates whether this skill is indexed
-                      by Context7
-                    type: boolean
                   github:
                     description: GitHub is the GitHub repo path (e.g. "/anthropics/skills")
                     type: string

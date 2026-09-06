@@ -9,6 +9,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,11 +18,14 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/labels"
+	"github.com/orka-agents/orka/internal/redact"
+	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/workers/common"
 )
 
@@ -146,7 +150,9 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 	}
 
 	ns := ""
-	if toolCtx := GetToolContext(ctx); toolCtx != nil {
+	toolCtx := GetToolContext(ctx)
+	brokered := toolCtx != nil && toolCtx.Brokered
+	if toolCtx != nil {
 		ns = strings.TrimSpace(toolCtx.Namespace)
 	}
 	if ns == "" {
@@ -154,6 +160,10 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 	}
 	if ns == "" {
 		return "", fmt.Errorf("%s environment variable is not set", envOrkaTaskNamespace)
+	}
+	parent, err := t.validateBrokeredCaller(ctx, toolCtx, ns)
+	if err != nil {
+		return "", err
 	}
 
 	deadline := time.Now().Add(timeout)
@@ -176,9 +186,13 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 			var task corev1alpha1.Task
 			err := t.k8sClient.Get(ctx, types.NamespacedName{Name: taskName, Namespace: ns}, &task)
 			if err != nil {
+				allTerminal = false
 				results[taskName].Phase = taskPhaseErrorString
 				results[taskName].Result = fmt.Sprintf("error: %v", err)
 				continue
+			}
+			if err := validateBrokeredWaitTarget(ctx, toolCtx, parent, &task); err != nil {
+				return "", err
 			}
 
 			phase := task.Status.Phase
@@ -226,7 +240,13 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 				if fetchErr == nil {
 					// Parse structured result and strip diff to avoid context bloat.
 					sr := common.ParseStructuredResult(resultStr)
-					summary := truncateWaitTaskSummary(sr.Summary)
+					summaryText := sr.Summary
+					if brokered {
+						// Redact before truncation so a token crossing the summary
+						// boundary cannot leak as an unmatched prefix.
+						summaryText = redact.SensitiveText(summaryText)
+					}
+					summary := truncateWaitTaskSummary(summaryText)
 					results[taskName].Summary = summary
 					results[taskName].Verdict = sr.Verdict
 					results[taskName].Feedback = sr.Feedback
@@ -273,7 +293,11 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 	// Build ordered results
 	resultList := make([]TaskResultInfo, 0, len(waitArgs.Tasks))
 	for _, taskName := range waitArgs.Tasks {
-		resultList = append(resultList, *results[taskName])
+		result := *results[taskName]
+		if brokered {
+			redactBrokeredWaitTaskResult(&result)
+		}
+		resultList = append(resultList, result)
 	}
 
 	output := WaitForTasksResult{
@@ -287,6 +311,95 @@ func (t *WaitForTasksTool) Execute(ctx context.Context, args json.RawMessage) (s
 	}
 
 	return string(data), nil
+}
+
+func (t *WaitForTasksTool) validateBrokeredCaller(ctx context.Context, toolCtx *ToolContext, namespace string) (*corev1alpha1.Task, error) {
+	if toolCtx == nil || !toolCtx.Brokered {
+		return nil, nil
+	}
+	if t == nil || t.k8sClient == nil {
+		return nil, fmt.Errorf("brokered wait requires a Kubernetes client")
+	}
+	parentName := strings.TrimSpace(toolCtx.TaskID)
+	parentUID := strings.TrimSpace(toolCtx.TaskUID)
+	if parentName == "" || parentUID == "" || namespace != strings.TrimSpace(toolCtx.Namespace) {
+		return nil, fmt.Errorf("brokered wait requires authenticated task identity")
+	}
+	parent := &corev1alpha1.Task{}
+	if err := t.k8sClient.Get(ctx, types.NamespacedName{Name: parentName, Namespace: namespace}, parent); err != nil {
+		return nil, fmt.Errorf("load authenticated parent task: %w", err)
+	}
+	if string(parent.UID) != parentUID {
+		return nil, fmt.Errorf("authenticated parent task identity no longer matches the current Task")
+	}
+	return parent, nil
+}
+
+func validateBrokeredWaitTarget(ctx context.Context, toolCtx *ToolContext, parent, task *corev1alpha1.Task) error {
+	if toolCtx == nil || !toolCtx.Brokered {
+		return nil
+	}
+	if parent == nil || task == nil || task.Namespace != parent.Namespace ||
+		parent.Namespace != strings.TrimSpace(toolCtx.Namespace) {
+		return fmt.Errorf("task is not an authorized child of the authenticated parent task")
+	}
+	owner := metav1.GetControllerOf(task)
+	if toolCtx.TaskProvenanceProtected &&
+		strings.TrimSpace(task.Annotations[labels.AnnotationParentTaskUID]) == string(parent.UID) &&
+		owner != nil && owner.APIVersion == corev1alpha1.GroupVersion.String() &&
+		owner.Kind == taskKindString && owner.Name == parent.Name && owner.UID == parent.UID {
+		return nil
+	}
+	if authorized, err := brokeredDelegationReceiptAuthorizes(ctx, toolCtx, parent, task); err != nil {
+		return err
+	} else if authorized {
+		return nil
+	}
+	if task.Name != RepositoryValidationTaskName(parent) {
+		return fmt.Errorf("task is not an authorized child of the authenticated parent task")
+	}
+
+	binding, err := FindRepositoryValidationCommandBinding(ctx, toolCtx.RepositoryValidationBindings, task.Namespace, task.Name)
+	if err != nil {
+		return fmt.Errorf("verify durable repository validation child binding: %w", err)
+	}
+	if binding == nil || binding.MonitorNamespace != task.Namespace ||
+		binding.ReviewTaskName != parent.Name || binding.ReviewTaskUID != string(parent.UID) ||
+		binding.ValidationTaskName != task.Name {
+		return fmt.Errorf("task is not an authorized child of the authenticated parent task")
+	}
+	return nil
+}
+
+func brokeredDelegationReceiptAuthorizes(
+	ctx context.Context,
+	toolCtx *ToolContext,
+	parent, task *corev1alpha1.Task,
+) (bool, error) {
+	if toolCtx == nil || toolCtx.ExternalEffects == nil || parent == nil || task == nil {
+		return false, nil
+	}
+	effectID := strings.TrimSpace(task.Annotations[labels.AnnotationDelegationEffectID])
+	if effectID == "" {
+		return false, nil
+	}
+	effect, err := toolCtx.ExternalEffects.GetExternalEffect(ctx, effectID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("verify durable delegated child receipt: %w", err)
+	}
+	if effect.ID != effectID || effect.State != store.ExternalEffectSucceeded ||
+		effect.Identity.Kind != "acp-mcp-tool" || effect.Identity.Namespace != parent.Namespace {
+		return false, nil
+	}
+	var receipt DelegateTaskResult
+	if len(effect.Response) == 0 || json.Unmarshal(effect.Response, &receipt) != nil {
+		return false, nil
+	}
+	return receipt.TaskName == task.Name && receipt.TaskUID == string(task.UID) &&
+		receipt.ParentTaskUID == string(parent.UID), nil
 }
 
 func fetchTaskResultForNamespace(ctx context.Context, namespace, taskName string) (string, error) {
@@ -316,6 +429,89 @@ func boundWaitTaskData(data map[string]any) map[string]any {
 		"originalBytes": len(encoded),
 		"message":       "structured data payload exceeded wait_for_tasks inline limit; use artifact references for large outputs",
 	}
+}
+
+func redactBrokeredWaitTaskResult(result *TaskResultInfo) {
+	if result == nil {
+		return
+	}
+	result.Result = redact.SensitiveText(result.Result)
+	result.Summary = redact.SensitiveText(result.Summary)
+	result.Verdict = redact.SensitiveText(result.Verdict)
+	result.Feedback = redact.SensitiveText(result.Feedback)
+	for i := range result.Files {
+		result.Files[i] = redact.SensitiveText(result.Files[i])
+	}
+	result.Data = redactBrokeredWaitTaskData(result.Data)
+	for i := range result.Artifacts {
+		result.Artifacts[i].Filename = redact.SensitiveText(result.Artifacts[i].Filename)
+		result.Artifacts[i].ContentType = redact.SensitiveText(result.Artifacts[i].ContentType)
+		result.Artifacts[i].Description = redact.SensitiveText(result.Artifacts[i].Description)
+	}
+	result.BaseSHA = redact.SensitiveText(result.BaseSHA)
+	result.HeadSHA = redact.SensitiveText(result.HeadSHA)
+	result.PushBranch = redact.SensitiveText(result.PushBranch)
+	result.WorkspaceRef = redact.SensitiveText(result.WorkspaceRef)
+	result.WorkspaceBranch = redact.SensitiveText(result.WorkspaceBranch)
+	result.Iteration = redact.SensitiveText(result.Iteration)
+	result.RetryTaskName = redact.SensitiveText(result.RetryTaskName)
+	if result.FailureDetails != nil {
+		failure := *result.FailureDetails
+		failure.Message = redact.SensitiveText(failure.Message)
+		result.FailureDetails = &failure
+	}
+	if result.ExecutionOutcome != nil {
+		outcome := result.ExecutionOutcome.DeepCopy()
+		outcome.Message = redact.SensitiveText(outcome.Message)
+		result.ExecutionOutcome = outcome
+	}
+	if result.WorkspaceStatus != nil {
+		workspace := result.WorkspaceStatus.DeepCopy()
+		workspace.Message = redact.SensitiveText(workspace.Message)
+		for i := range workspace.Conditions {
+			workspace.Conditions[i].Message = redact.SensitiveText(workspace.Conditions[i].Message)
+		}
+		result.WorkspaceStatus = workspace
+	}
+}
+
+func redactBrokeredWaitTaskData(data map[string]any) map[string]any {
+	if len(data) == 0 {
+		return data
+	}
+	redacted := make(map[string]any, len(data))
+	for key, value := range data {
+		redacted[redact.SensitiveText(key)] = redactBrokeredWaitTaskValue(key, value)
+	}
+	return redacted
+}
+
+func redactBrokeredWaitTaskValue(key string, value any) any {
+	if brokeredWaitTaskValueIsSensitive(key, value) {
+		return "[REDACTED]"
+	}
+	switch typed := value.(type) {
+	case string:
+		return redact.SensitiveText(typed)
+	case map[string]any:
+		return redactBrokeredWaitTaskData(typed)
+	case []any:
+		redacted := make([]any, len(typed))
+		for i := range typed {
+			redacted[i] = redactBrokeredWaitTaskValue("", typed[i])
+		}
+		return redacted
+	default:
+		return value
+	}
+}
+
+func brokeredWaitTaskValueIsSensitive(key string, value any) bool {
+	if strings.TrimSpace(key) == "" {
+		return false
+	}
+	probe := fmt.Sprintf("%s=%v", key, value)
+	return redact.SensitiveText(probe) != probe
 }
 
 // Ensure WaitForTasksTool implements Tool

@@ -27,6 +27,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -55,7 +56,6 @@ import (
 	"github.com/orka-agents/orka/internal/tracing"
 	workerpkg "github.com/orka-agents/orka/internal/worker"
 	"github.com/orka-agents/orka/internal/workerenv"
-	"github.com/orka-agents/orka/internal/workspace"
 	"github.com/orka-agents/orka/internal/workspace/statusrules"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -120,6 +120,7 @@ type TaskReconciler struct {
 	ExecutionEventStore               store.ExecutionEventStore
 	DurableControlStore               store.DurableControlStore
 	AgentExecutionSnapshots           store.AgentExecutionSnapshotStore
+	RepositoryValidationBindings      tools.RepositoryValidationBindingStore
 	MCPRegistry                       *tools.Registry
 	ACPArtifactRetirer                artifactcap.IdentityRetirer
 	ACPPublicationReclaimer           ACPPublicationReclaimer
@@ -154,7 +155,6 @@ type TaskReconciler struct {
 	AgentSandboxConfig                AgentSandboxConfig
 	SubstrateEnabled                  bool
 	SubstrateConfig                   SubstrateConfig
-	SubstrateExecutorFactory          func(SubstrateConfig) (workspace.WorkspaceExecutor, error)
 	AIWorkerServiceAccountName        string
 	VendorWorkerServiceAccountName    string
 	ContainerWorkerServiceAccountName string
@@ -172,9 +172,11 @@ type TaskReconciler struct {
 // +kubebuilder:rbac:groups=core.orka.ai,resources=tasks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core.orka.ai,resources=tasks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core.orka.ai,resources=tasks/finalizers,verbs=update
-// +kubebuilder:rbac:groups=core.orka.ai,resources=sessions,verbs=get;list;delete
 // +kubebuilder:rbac:groups=core.orka.ai,resources=agents,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core.orka.ai,resources=tools,verbs=get;list;watch
+// sessions is a virtual resource: the API server authorizes session endpoints with a
+// SubjectAccessReview on core.orka.ai/sessions, so the manager role must grant it.
+// +kubebuilder:rbac:groups=core.orka.ai,resources=sessions,verbs=get;list;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
@@ -184,19 +186,13 @@ type TaskReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=replicationcontrollers,verbs=get;list;watch
-// +kubebuilder:rbac:groups=apps,resources=deployments;replicasets;statefulsets;daemonsets,verbs=get;list;watch
-// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;roles;rolebindings,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;update;delete
@@ -211,8 +207,6 @@ type TaskReconciler struct {
 // +kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxwarmpools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods/portforward,verbs=create
-// +kubebuilder:rbac:groups=metrics.k8s.io,resources=pods;nodes,verbs=get;list
 
 // updateStatusWithRetry updates the task status with retry on conflict.
 // It re-fetches the task on conflict, applies the mutate function, and retries.
@@ -622,14 +616,6 @@ func (r *TaskReconciler) handleDeletion(ctx context.Context, task *corev1alpha1.
 		if waitingForJob {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
-		releasedPoolLeases, err := r.releaseSubstratePoolActorLeasesAfterTerminalCleanup(ctx, task)
-		if err != nil {
-			log.Error(err, "failed to release substrate pool actor leases")
-			return ctrl.Result{}, err
-		}
-		if !releasedPoolLeases {
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
 
 		// Release session lock if held
 		if task.Spec.SessionRef != nil {
@@ -705,28 +691,39 @@ func (r *TaskReconciler) handlePending(ctx context.Context, task *corev1alpha1.T
 		}
 	}
 
-	// Enforce per-namespace task limit
+	// Controller-owned validation children must be able to run while their
+	// review parent occupies the namespace's only ordinary task slot.
 	if r.MaxTasksPerNamespace > 0 {
-		var namespaceTasks corev1alpha1.TaskList
-		if err := r.List(ctx, &namespaceTasks, client.InNamespace(task.Namespace)); err != nil {
-			log.Error(err, "failed to list namespace tasks for limit check")
+		validationTask, err := r.repositoryMonitorValidationTask(ctx, task)
+		if err != nil {
+			log.Error(err, "failed to verify repository validation provenance for namespace limit")
+			if errors.Is(err, errRepositoryMonitorValidationConfinement) {
+				return r.failTask(ctx, task, err.Error())
+			}
 			return ctrl.Result{}, err
 		}
-		active := int32(0)
-		for _, t := range namespaceTasks.Items {
-			if t.Name != task.Name && taskPhaseCountsTowardConcurrency(t.Status.Phase) {
-				active++
+		if !validationTask {
+			var namespaceTasks corev1alpha1.TaskList
+			if err := r.List(ctx, &namespaceTasks, client.InNamespace(task.Namespace)); err != nil {
+				log.Error(err, "failed to list namespace tasks for limit check")
+				return ctrl.Result{}, err
 			}
-		}
-		if active >= r.MaxTasksPerNamespace {
-			log.Info("namespace task limit reached, requeueing",
-				"namespace", task.Namespace,
-				"active", active,
-				"limit", r.MaxTasksPerNamespace,
-			)
-			r.Recorder.Eventf(task, corev1.EventTypeNormal, "NamespaceTaskLimitReached",
-				"namespace %q has %d active tasks (limit: %d), requeueing", task.Namespace, active, r.MaxTasksPerNamespace)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			active := int32(0)
+			for _, t := range namespaceTasks.Items {
+				if t.Name != task.Name && taskPhaseCountsTowardConcurrency(t.Status.Phase) {
+					active++
+				}
+			}
+			if active >= r.MaxTasksPerNamespace {
+				log.Info("namespace task limit reached, requeueing",
+					"namespace", task.Namespace,
+					"active", active,
+					"limit", r.MaxTasksPerNamespace,
+				)
+				r.Recorder.Eventf(task, corev1.EventTypeNormal, "NamespaceTaskLimitReached",
+					"namespace %q has %d active tasks (limit: %d), requeueing", task.Namespace, active, r.MaxTasksPerNamespace)
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
 		}
 	}
 
@@ -779,10 +776,6 @@ func (r *TaskReconciler) handlePending(ctx context.Context, task *corev1alpha1.T
 				return result, err
 			}
 			return r.queueHarnessV1Task(ctx, task)
-		case agentExecutionPathExternal:
-			return r.rejectPlannedAgentExecution(ctx, task, rejectAgentExecutionPlan(
-				externalAgentRuntimeDispatchUnsupportedReason(plan.externalRuntimeName),
-			))
 		default:
 			return ctrl.Result{}, fmt.Errorf("unknown agent execution path %q", plan.path)
 		}
@@ -1380,6 +1373,31 @@ func (r *TaskReconciler) createTaskJob(ctx context.Context, task *corev1alpha1.T
 		log.Info("skipping job creation because task is no longer runnable", "phase", latest.Status.Phase)
 		return ctrl.Result{}, nil
 	}
+	validationTask, err := r.repositoryMonitorValidationTask(ctx, latest)
+	if err != nil {
+		log.Error(err, "failed to verify repository validation provenance")
+		if errors.Is(err, errRepositoryMonitorValidationConfinement) {
+			return r.failTask(ctx, task, err.Error())
+		}
+		return ctrl.Result{}, err
+	}
+	gateReady, err := r.ensureRepositoryMonitorValidationNetworkGateForTask(ctx, latest, validationTask)
+	if err != nil {
+		log.Error(err, "failed to prepare repository validation network gate")
+		if errors.Is(err, errRepositoryMonitorValidationConfinement) {
+			return r.failTask(ctx, task, err.Error())
+		}
+		return ctrl.Result{}, err
+	}
+	if !gateReady {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	jobTask := task
+	if validationTask {
+		// Render from the same fresh object whose immutable binding was just
+		// verified. This closes the gap between the reconcile read and Job build.
+		jobTask = latest
+	}
 
 	// Ensure worker ServiceAccount and RBAC exist in the task namespace
 	if err := r.ensureWorkerRBAC(ctx, task.Namespace); err != nil {
@@ -1391,84 +1409,49 @@ func (r *TaskReconciler) createTaskJob(ctx context.Context, task *corev1alpha1.T
 		// Non-fatal: continue with job creation, it may still work
 	}
 
-	workspaceRequest, err := r.resolveExecutionWorkspaceRequest(ctx, task)
-	if err != nil {
-		log.Error(err, "failed to resolve execution workspace")
-		if statusErr := r.markExecutionWorkspaceValidationFailed(ctx, task, err); statusErr != nil {
-			log.Error(statusErr, "failed to update execution workspace validation status")
-			return ctrl.Result{}, statusErr
-		}
-		return r.failTask(ctx, task, fmt.Sprintf("failed to resolve execution workspace: %v", err))
-	}
-	reservedPoolActor := false
-	if workspaceRequest != nil && workspaceRequest.PoolName != "" {
-		reserved, err := r.reserveSubstratePoolActor(ctx, task, workspaceRequest)
-		if err != nil {
-			log.Error(err, "failed to reserve substrate pool actor")
-			return ctrl.Result{}, err
-		}
-		if !reserved {
-			log.Info("all substrate pool actors are busy",
-				"pool", workspaceRequest.PoolName,
-				"poolNamespace", workspaceRequest.PoolNamespace,
-			)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		reservedPoolActor = true
-	}
-
 	resolvedApprovalsJSON := ""
-	if taskNeedsApprovalState(task, agent) {
-		resolvedApprovalsJSON, err = r.resolvedApprovalsJSONForTask(ctx, task)
+	if taskNeedsApprovalState(jobTask, agent) {
+		resolvedApprovalsJSON, err = r.resolvedApprovalsJSONForTask(ctx, jobTask)
 		if err != nil {
 			log.Error(err, "failed to derive resolved approvals")
-			if reservedPoolActor {
-				if releaseErr := r.releaseSubstratePoolActorLeases(ctx, task); releaseErr != nil {
-					return ctrl.Result{}, releaseErr
-				}
-			}
 			return ctrl.Result{}, err
 		}
 	}
 
 	// Create the Job
-	job, err := r.JobBuilder.BuildWithOptions(ctx, task, agent, provider, JobBuildOptions{
-		ExecutionWorkspace:    workspaceRequest,
-		ResolvedApprovalsJSON: resolvedApprovalsJSON,
+	job, err := r.JobBuilder.BuildWithOptions(ctx, jobTask, agent, provider, JobBuildOptions{
+		ResolvedApprovalsJSON:       resolvedApprovalsJSON,
+		RepositoryMonitorValidation: validationTask,
 	})
 	if err != nil {
 		log.Error(err, "failed to build Job")
-		if reservedPoolActor {
-			if releaseErr := r.releaseSubstratePoolActorLeases(ctx, task); releaseErr != nil {
-				return ctrl.Result{}, releaseErr
-			}
-		}
 		return r.failTask(ctx, task, fmt.Sprintf("failed to build job: %v", err))
 	}
 
 	// Set owner reference
-	if err := controllerutil.SetControllerReference(task, job, r.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(jobTask, job, r.Scheme); err != nil {
 		log.Error(err, "failed to set owner reference")
-		if reservedPoolActor {
-			if releaseErr := r.releaseSubstratePoolActorLeases(ctx, task); releaseErr != nil {
-				return ctrl.Result{}, releaseErr
-			}
-		}
 		return ctrl.Result{}, err
 	}
 
 	// Create the Job
 	if err := r.Create(ctx, job); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			// Job already exists, update status
+			if validationTask {
+				existing := &batchv1.Job{}
+				if getErr := r.validationResourceReader().Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing); getErr != nil {
+					return ctrl.Result{}, getErr
+				}
+				if validationErr := validateRepositoryMonitorValidationJobAgainstExpected(latest, existing, job); validationErr != nil {
+					log.Error(validationErr, "refusing to adopt repository validation Job")
+					return r.failTask(ctx, task, validationErr.Error())
+				}
+				job = existing
+			}
+			// Job already exists, update status.
 			task.Status.JobName = job.Name
 		} else {
 			log.Error(err, "failed to create Job")
-			if reservedPoolActor {
-				if releaseErr := r.releaseSubstratePoolActorLeases(ctx, task); releaseErr != nil {
-					return ctrl.Result{}, releaseErr
-				}
-			}
 			return r.failTask(ctx, task, fmt.Sprintf("failed to create job: %v", err))
 		}
 	} else {
@@ -1531,271 +1514,6 @@ func (r *TaskReconciler) createTaskJob(ctx context.Context, task *corev1alpha1.T
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
-func (r *TaskReconciler) reserveSubstratePoolActor(
-	ctx context.Context,
-	task *corev1alpha1.Task,
-	request *ExecutionWorkspaceRequest,
-) (bool, error) {
-	if task == nil || request == nil || strings.TrimSpace(request.PoolName) == "" {
-		return true, nil
-	}
-	target := int(request.PoolTargetActors)
-	if target <= 0 {
-		return false, fmt.Errorf("substrate actor pool %q in namespace %q has no target actors", request.PoolName, request.PoolNamespace)
-	}
-	if actorID, found, err := r.substratePoolActorLeaseForTask(ctx, task); err != nil {
-		return false, err
-	} else if found {
-		if task.Status.Attempts > 0 && taskSubstratePoolActorCleanupRequired(task) {
-			return false, nil
-		}
-		request.ClaimName = actorID
-		return true, nil
-	}
-
-	prefix := deterministicSubstratePoolActorPrefix(request.PoolNamespace, request.PoolName)
-	startOrdinal := 0
-	if ordinal, ok := substratePoolActorOrdinalFromID(request.ClaimName, prefix); ok {
-		startOrdinal = ordinal
-	}
-	for offset := range target {
-		ordinal := (startOrdinal + offset) % target
-		actorID := deterministicSubstratePoolActorID(prefix, ordinal)
-		reserved, err := r.tryReserveSubstratePoolActor(ctx, task, request.PoolNamespace, actorID)
-		if err != nil {
-			return false, err
-		}
-		if reserved {
-			request.ClaimName = actorID
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (r *TaskReconciler) substratePoolActorLeaseForTask(
-	ctx context.Context,
-	task *corev1alpha1.Task,
-) (string, bool, error) {
-	if task == nil || task.UID == "" {
-		return "", false, nil
-	}
-	var leases coordinationv1.LeaseList
-	if err := r.List(ctx, &leases, client.MatchingLabels{
-		labels.LabelPurpose:                   substratePoolActorLeasePurpose,
-		substratePoolActorLeaseHolderUIDLabel: labels.SelectorValue(string(task.UID)),
-	}); err != nil {
-		return "", false, err
-	}
-	for i := range leases.Items {
-		lease := &leases.Items[i]
-		if !substratePoolActorLeaseHeldByTask(lease, task) {
-			continue
-		}
-		if actorID := substratePoolActorLeaseActorID(lease); actorID != "" {
-			return actorID, true, nil
-		}
-	}
-	return "", false, nil
-}
-
-func (r *TaskReconciler) tryReserveSubstratePoolActor(
-	ctx context.Context,
-	task *corev1alpha1.Task,
-	leaseNamespace string,
-	actorID string,
-) (bool, error) {
-	leaseName := substratePoolActorLeaseName(actorID)
-	lease := &coordinationv1.Lease{}
-	key := types.NamespacedName{Namespace: leaseNamespace, Name: leaseName}
-	err := r.Get(ctx, key, lease)
-	if apierrors.IsNotFound(err) {
-		lease = newSubstratePoolActorLease(task, leaseNamespace, leaseName, actorID)
-		if err := r.Create(ctx, lease); err != nil {
-			if apierrors.IsAlreadyExists(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if substratePoolActorLeaseHeldByTask(lease, task) {
-		return true, nil
-	}
-	busy, err := substratePoolActorLeaseHasActiveHolder(ctx, r.Client, lease)
-	if err != nil || busy {
-		return false, err
-	}
-	patch := client.MergeFromWithOptions(lease.DeepCopy(), client.MergeFromWithOptimisticLock{})
-	setSubstratePoolActorLeaseHolder(lease, task, actorID)
-	if err := r.Patch(ctx, lease, patch); err != nil {
-		if apierrors.IsConflict(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
-func (r *TaskReconciler) releaseSubstratePoolActorLeases(ctx context.Context, task *corev1alpha1.Task) error {
-	leases, err := r.substratePoolActorLeasesForTask(ctx, task)
-	if err != nil {
-		return err
-	}
-	return r.deleteSubstratePoolActorLeasesForTask(ctx, task, leases)
-}
-
-func (r *TaskReconciler) deleteSubstratePoolActorLeasesForTask(ctx context.Context, task *corev1alpha1.Task, leases []coordinationv1.Lease) error {
-	for i := range leases {
-		lease := &leases[i]
-		current := &coordinationv1.Lease{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: lease.Namespace, Name: lease.Name}, current); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return err
-		}
-		if !substratePoolActorLeaseHeldByTask(current, task) {
-			continue
-		}
-		if err := r.Delete(ctx, current, deleteCurrentObjectPreconditions(current)...); err != nil && !apierrors.IsNotFound(err) {
-			if apierrors.IsConflict(err) {
-				stillHeld, verifyErr := substrateLeaseStillMatchesAfterDeleteConflict(ctx, r.Client, current, func(latest *coordinationv1.Lease) bool {
-					return substratePoolActorLeaseHeldByTask(latest, task)
-				})
-				if verifyErr != nil {
-					return verifyErr
-				}
-				if !stillHeld {
-					continue
-				}
-			}
-			return err
-		}
-	}
-	return nil
-}
-
-func (r *TaskReconciler) releaseSubstratePoolActorLeasesAfterTerminalCleanup(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
-	leases, err := r.substratePoolActorLeasesForTask(ctx, task)
-	if err != nil {
-		return false, err
-	}
-	if len(leases) == 0 {
-		return true, nil
-	}
-	if !taskExecutionWorkspaceCleanupSucceeded(task) {
-		logf.FromContext(ctx).Info(
-			"deleting substrate pool actors before releasing terminal task leases",
-			"task", task.Name,
-			"namespace", task.Namespace,
-			"workspacePhase", taskExecutionWorkspacePhase(task),
-			"workspaceReason", taskExecutionWorkspaceReason(task),
-		)
-		if err := r.deleteSubstratePoolActorsForLeases(ctx, task, leases); err != nil {
-			logf.FromContext(ctx).Error(err, "failed to delete substrate pool actors before releasing terminal task leases")
-			return false, nil
-		}
-	}
-	return true, r.deleteSubstratePoolActorLeasesForTask(ctx, task, leases)
-}
-
-func (r *TaskReconciler) deleteSubstratePoolActorsForLeases(ctx context.Context, task *corev1alpha1.Task, leases []coordinationv1.Lease) error {
-	cfg := r.SubstrateConfig.WithDefaults()
-	executorFactory := r.SubstrateExecutorFactory
-	if executorFactory == nil {
-		executorFactory = func(cfg SubstrateConfig) (workspace.WorkspaceExecutor, error) {
-			return workspace.NewSubstrateExecutor(workspace.SubstrateConfig{
-				APIEndpoint:           cfg.APIEndpoint,
-				APICAFile:             cfg.APICAFile,
-				APIInsecureSkipVerify: cfg.APIInsecureSkipVerify,
-				RouterURL:             cfg.RouterURL,
-				ActorDNSSuffix:        cfg.ActorDNSSuffix,
-			})
-		}
-	}
-	executor, err := executorFactory(cfg)
-	if err != nil {
-		return err
-	}
-	defer closeWorkspaceExecutor(ctx, executor)
-	for i := range leases {
-		lease := &leases[i]
-		current := &coordinationv1.Lease{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: lease.Namespace, Name: lease.Name}, current); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return err
-		}
-		if !substratePoolActorLeaseHeldByTask(current, task) {
-			continue
-		}
-		actorID := substratePoolActorLeaseActorID(current)
-		if actorID == "" {
-			continue
-		}
-		if _, err := executor.Delete(ctx, workspace.DeleteRequest{
-			Ref:       workspace.WorkspaceRef{Namespace: current.Namespace, ClaimName: actorID, ID: actorID},
-			Reason:    "terminal pooled task actor cleanup",
-			Timeout:   cfg.ClaimTimeout,
-			SkipScrub: true,
-		}); err != nil {
-			return fmt.Errorf("deleting substrate pool actor %q: %w", actorID, err)
-		}
-	}
-	return nil
-}
-
-func (r *TaskReconciler) substratePoolActorLeasesForTask(
-	ctx context.Context,
-	task *corev1alpha1.Task,
-) ([]coordinationv1.Lease, error) {
-	if task == nil || task.UID == "" {
-		return nil, nil
-	}
-	var leases coordinationv1.LeaseList
-	if err := r.List(ctx, &leases, client.MatchingLabels{
-		labels.LabelPurpose:                   substratePoolActorLeasePurpose,
-		substratePoolActorLeaseHolderUIDLabel: labels.SelectorValue(string(task.UID)),
-	}); err != nil {
-		return nil, err
-	}
-	held := make([]coordinationv1.Lease, 0, len(leases.Items))
-	for i := range leases.Items {
-		lease := &leases.Items[i]
-		if substratePoolActorLeaseHeldByTask(lease, task) {
-			held = append(held, *lease)
-		}
-	}
-	return held, nil
-}
-
-func (r *TaskReconciler) taskHasSubstratePoolActorLeases(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
-	leases, err := r.substratePoolActorLeasesForTask(ctx, task)
-	if err != nil {
-		return false, err
-	}
-	return len(leases) > 0, nil
-}
-
-func taskExecutionWorkspacePhase(task *corev1alpha1.Task) corev1alpha1.ExecutionWorkspacePhase {
-	if task == nil || task.Status.ExecutionWorkspace == nil {
-		return ""
-	}
-	return task.Status.ExecutionWorkspace.Phase
-}
-
-func taskExecutionWorkspaceReason(task *corev1alpha1.Task) corev1alpha1.ExecutionWorkspaceReason {
-	if task == nil || task.Status.ExecutionWorkspace == nil {
-		return ""
-	}
-	return task.Status.ExecutionWorkspace.Reason
-}
-
 // handleRunning handles Tasks in Running phase
 func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.Task) (ctrl.Result, error) { //nolint:gocyclo
 	log := logf.FromContext(ctx)
@@ -1822,6 +1540,17 @@ func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.T
 				return result, err
 			}
 			log.Info("task timed out", "elapsed", elapsed, "timeout", task.Spec.Timeout.Duration)
+			validationCommandStarted, err := r.repositoryMonitorValidationCommandStarted(ctx, task)
+			if err != nil {
+				log.Error(err, "failed to classify timed-out repository validation")
+				if errors.Is(err, errRepositoryMonitorValidationConfinement) {
+					return r.failTask(ctx, task, err.Error())
+				}
+				return ctrl.Result{}, err
+			}
+			if validationCommandStarted {
+				return r.completeExecutedTask(ctx, task, corev1alpha1.TaskPhaseFailed, "task timed out")
+			}
 			return r.failTask(ctx, task, "task timed out")
 		}
 	}
@@ -1931,6 +1660,13 @@ func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.T
 		log.Error(err, "failed to get Job")
 		return ctrl.Result{}, err
 	}
+	if err := r.reconcileRepositoryMonitorValidationConfinement(ctx, task, job); err != nil {
+		log.Error(err, "repository validation confinement failed")
+		if errors.Is(err, errRepositoryMonitorValidationConfinement) {
+			return r.failTask(ctx, task, err.Error())
+		}
+		return ctrl.Result{}, err
+	}
 
 	// Check Job status
 	if job.Status.Succeeded > 0 {
@@ -1946,7 +1682,22 @@ func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.T
 		if result, handled, err := r.handleAutonomousApprovalState(ctx, task); err != nil || handled {
 			return result, err
 		}
+		validationCommandFailed := true
+		validationTask, validationErr := r.repositoryMonitorValidationTask(ctx, task)
+		if validationErr != nil {
+			return ctrl.Result{}, validationErr
+		}
+		if validationTask {
+			var err error
+			validationCommandFailed, err = r.repositoryMonitorValidationCommandFailed(ctx, task, job)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		if task.Spec.Timeout != nil && jobFailedDueToActiveDeadline(job) {
+			if !validationCommandFailed {
+				return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, "task timed out")
+			}
 			return r.completeExecutedTask(ctx, task, corev1alpha1.TaskPhaseFailed, "task timed out")
 		}
 		// Job failed, check retry policy
@@ -1959,6 +1710,9 @@ func (r *TaskReconciler) handleRunning(ctx context.Context, task *corev1alpha1.T
 		// fetch_task_output and adapt — e.g. recreate the Agent with more memory.
 		// Falls back to the generic "job failed" if no signal is available.
 		msg := r.diagnoseFailedJob(ctx, task)
+		if !validationCommandFailed {
+			return r.completeTask(ctx, task, corev1alpha1.TaskPhaseFailed, msg)
+		}
 		return r.completeExecutedTask(ctx, task, corev1alpha1.TaskPhaseFailed, msg)
 	}
 
@@ -2471,14 +2225,6 @@ func (r *TaskReconciler) handleCompleted(ctx context.Context, task *corev1alpha1
 	if waitingForJob {
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
-	releasedPoolLeases, err := r.releaseSubstratePoolActorLeasesAfterTerminalCleanup(ctx, task)
-	if err != nil {
-		log.Error(err, "failed to release substrate pool actor leases")
-		return ctrl.Result{}, err
-	}
-	if !releasedPoolLeases {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
 
 	if !terminalEventRecorded {
 		return ctrl.Result{RequeueAfter: time.Second}, nil
@@ -2504,7 +2250,7 @@ func (r *TaskReconciler) handleCompleted(ctx context.Context, task *corev1alpha1
 	}
 
 	// Detach can suspend or delete the RuntimePool that terminal recovery still
-	// needs. Apply it only after Job and lease cleanup plus durable ACP artifact
+	// needs. Apply it only after Job cleanup plus durable ACP artifact
 	// retirement have settled.
 	settled, settleErr := r.reconcileACPClassWorkspaceSettlement(ctx, task)
 	if settleErr != nil {
@@ -2550,18 +2296,15 @@ func (r *TaskReconciler) cleanupDeletedTaskJob(ctx context.Context, task *corev1
 		return false, fmt.Errorf("getting deleted task Job %q: %w", task.Status.JobName, err)
 	}
 
-	holdsPoolActor, err := r.taskHasSubstratePoolActorLeases(ctx, task)
-	if err != nil {
-		return false, err
-	}
+	validationTask := r.repositoryMonitorValidationSafetyTask(ctx, task)
 	propagationPolicy := metav1.DeletePropagationBackground
-	if holdsPoolActor {
+	if validationTask {
 		propagationPolicy = metav1.DeletePropagationForeground
 	}
 	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil && !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("deleting deleted task Job %q: %w", task.Status.JobName, err)
 	}
-	return holdsPoolActor, nil
+	return validationTask, nil
 }
 
 func (r *TaskReconciler) cleanupTerminalTaskJob(ctx context.Context, task *corev1alpha1.Task) (bool, error) {
@@ -2583,19 +2326,16 @@ func (r *TaskReconciler) cleanupTerminalTaskJob(ctx context.Context, task *corev
 		return false, nil
 	}
 
-	holdsPoolActor, err := r.taskHasSubstratePoolActorLeases(ctx, task)
-	if err != nil {
-		return false, err
-	}
+	validationTask := r.repositoryMonitorValidationSafetyTask(ctx, task)
 	propagationPolicy := metav1.DeletePropagationBackground
-	if holdsPoolActor {
+	if validationTask {
 		propagationPolicy = metav1.DeletePropagationForeground
 	}
 	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil && !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("deleting terminal task Job %q: %w", task.Status.JobName, err)
 	}
 
-	return holdsPoolActor, nil
+	return validationTask, nil
 }
 
 func (r *TaskReconciler) enforceParentScheduledTaskHistory(ctx context.Context, task *corev1alpha1.Task) error {
@@ -2674,6 +2414,9 @@ func (r *TaskReconciler) beginTaskFinalization(
 	log := logf.FromContext(ctx)
 	if err := r.collectResult(ctx, task); err != nil {
 		log.Error(err, "failed to collect result before workspace finalization")
+		if errors.Is(err, errRepositoryMonitorValidationClassificationUnavailable) {
+			return ctrl.Result{}, err
+		}
 	}
 	now := metav1.Now()
 	resultRef := task.Status.ResultRef
@@ -2726,6 +2469,9 @@ func (r *TaskReconciler) completeTaskWithOutcome(
 	// Collect result from Job output
 	if err := r.collectResult(ctx, task); err != nil {
 		log.Error(err, "failed to collect result")
+		if errors.Is(err, errRepositoryMonitorValidationClassificationUnavailable) {
+			return ctrl.Result{}, err
+		}
 		// Continue anyway, result collection is best-effort
 	}
 
@@ -2860,28 +2606,6 @@ func (r *TaskReconciler) retryTask(ctx context.Context, task *corev1alpha1.Task)
 	// Calculate backoff delay
 	delay := r.calculateRetryDelay(task)
 	oldJobName := task.Status.JobName
-	holdsPoolActor, err := r.taskHasSubstratePoolActorLeases(ctx, task)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if holdsPoolActor {
-		waitingForJob, err := r.cleanupRetryTaskJob(ctx, task, oldJobName)
-		if err != nil {
-			log.Error(err, "failed to delete old Job for pooled retry")
-			return ctrl.Result{}, err
-		}
-		if waitingForJob {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-		releasedPoolLeases, err := r.releaseSubstratePoolActorLeasesAfterTerminalCleanup(ctx, task)
-		if err != nil {
-			log.Error(err, "failed to release substrate pool actor leases for retry")
-			return ctrl.Result{}, err
-		}
-		if !releasedPoolLeases {
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
-	}
 
 	// Reset to pending for retry before deleting the old Job so a transient
 	// NotFound from asynchronous Job deletion does not fail the task.
@@ -2897,7 +2621,7 @@ func (r *TaskReconciler) retryTask(ctx context.Context, task *corev1alpha1.Task)
 	}
 
 	// Delete the old Job after clearing the running status.
-	if oldJobName != "" && !holdsPoolActor {
+	if oldJobName != "" {
 		job := &batchv1.Job{}
 		err := r.Get(ctx, types.NamespacedName{
 			Name:      oldJobName,
@@ -2914,33 +2638,6 @@ func (r *TaskReconciler) retryTask(ctx context.Context, task *corev1alpha1.Task)
 	}
 
 	return ctrl.Result{RequeueAfter: delay}, nil
-}
-
-func (r *TaskReconciler) cleanupRetryTaskJob(ctx context.Context, task *corev1alpha1.Task, jobName string) (bool, error) {
-	if jobName == "" {
-		return false, nil
-	}
-
-	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: task.Namespace}, job); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("getting retry task Job %q: %w", jobName, err)
-	}
-
-	holdsPoolActor, err := r.taskHasSubstratePoolActorLeases(ctx, task)
-	if err != nil {
-		return false, err
-	}
-	propagationPolicy := metav1.DeletePropagationBackground
-	if holdsPoolActor {
-		propagationPolicy = metav1.DeletePropagationForeground
-	}
-	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil && !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("deleting retry task Job %q: %w", jobName, err)
-	}
-	return holdsPoolActor, nil
 }
 
 // calculateRetryDelay calculates the delay before retry using exponential backoff
@@ -2979,9 +2676,19 @@ func (r *TaskReconciler) collectResult(ctx context.Context, task *corev1alpha1.T
 	if r.ResultStore == nil {
 		return nil
 	}
+	validationTask, err := r.repositoryMonitorValidationResultTask(ctx, task)
+	if err != nil {
+		return err
+	}
+	if validationTask {
+		// Validation commands may process repository fixtures or source that
+		// contain credentials. Their output is deliberately unavailable; the
+		// durable review record keeps only the command digest and safe status.
+		return nil
+	}
 
 	// Check if result already exists in store (written by worker via HTTP)
-	_, err := r.ResultStore.GetResult(ctx, task.Namespace, task.Name)
+	_, err = r.ResultStore.GetResult(ctx, task.Namespace, task.Name)
 	if err == nil {
 		// Result already exists (written by worker)
 		task.Status.ResultRef = &corev1alpha1.ResultReference{
@@ -3170,30 +2877,6 @@ func (r *TaskReconciler) validateExecutionWorkspace(task *corev1alpha1.Task) err
 	return validateExecutionWorkspacePolicyShape(task, ws)
 }
 
-// validateExecutionWorkspaceRequest retains the provider-specific validation
-// used by the legacy workspace request resolver. Agent execution admission
-// deliberately runs only validateExecutionWorkspace before contract routing:
-// planAgentExecution owns ACP-only provider and template gates so harness-v1
-// requests receive the v1-specific unsupported-workspace error.
-func (r *TaskReconciler) validateExecutionWorkspaceRequest(task *corev1alpha1.Task) error {
-	if err := r.validateExecutionWorkspace(task); err != nil {
-		return err
-	}
-	if task.Spec.Execution == nil || task.Spec.Execution.Workspace == nil || !task.Spec.Execution.Workspace.Enabled {
-		return nil
-	}
-
-	ws := task.Spec.Execution.Workspace
-	provider := resolveWorkspaceProvider(ws, r.ExecutionWorkspaceDefaultProvider)
-	if err := validateExecutionWorkspaceSubstrateOptions(ws, provider); err != nil {
-		return err
-	}
-	if err := r.validateExecutionWorkspaceProviderConfig(ws, provider); err != nil {
-		return err
-	}
-	return validateExecutionWorkspacePolicies(task, ws)
-}
-
 func validateExecutionWorkspaceBasics(
 	task *corev1alpha1.Task,
 	provider corev1alpha1.WorkspaceProvider,
@@ -3204,90 +2887,6 @@ func validateExecutionWorkspaceBasics(
 	if task.Spec.Type != corev1alpha1.TaskTypeAgent {
 		return fmt.Errorf("execution workspace is only supported for type: agent tasks")
 	}
-	return nil
-}
-
-func validateExecutionWorkspaceSubstrateOptions(
-	ws *corev1alpha1.ExecutionWorkspaceSpec,
-	provider corev1alpha1.WorkspaceProvider,
-) error {
-	if ws.Boot && provider != corev1alpha1.WorkspaceProviderSubstrate {
-		return fmt.Errorf("execution workspace boot is only supported for provider %q", corev1alpha1.WorkspaceProviderSubstrate)
-	}
-	if ws.PoolRef != nil && provider != corev1alpha1.WorkspaceProviderSubstrate {
-		return fmt.Errorf("execution workspace poolRef is only supported for provider %q", corev1alpha1.WorkspaceProviderSubstrate)
-	}
-	if ws.Snapshot != nil && provider != corev1alpha1.WorkspaceProviderSubstrate {
-		return fmt.Errorf("execution workspace snapshot is only supported for provider %q", corev1alpha1.WorkspaceProviderSubstrate)
-	}
-	if ws.Hibernation != nil && provider != corev1alpha1.WorkspaceProviderSubstrate {
-		return fmt.Errorf("execution workspace hibernation is only supported for provider %q", corev1alpha1.WorkspaceProviderSubstrate)
-	}
-	if ws.PoolRef != nil && strings.TrimSpace(ws.PoolRef.Name) == "" {
-		return fmt.Errorf("execution workspace poolRef.name is required")
-	}
-	if ws.Snapshot != nil {
-		if strings.TrimSpace(ws.Snapshot.RestoreURI) != "" ||
-			strings.TrimSpace(ws.Snapshot.CheckpointURI) != "" ||
-			ws.Snapshot.CheckpointOnRelease {
-			return fmt.Errorf("execution workspace snapshot restore/checkpoint is not supported yet")
-		}
-	}
-	if ws.Hibernation != nil {
-		switch ws.Hibernation.ProcessMode {
-		case "", corev1alpha1.ExecutionWorkspaceProcessModeFresh:
-		case corev1alpha1.ExecutionWorkspaceProcessModeResident:
-			return fmt.Errorf("execution workspace hibernation processMode %q is not supported yet", ws.Hibernation.ProcessMode)
-		default:
-			return fmt.Errorf("unsupported execution workspace hibernation processMode %q", ws.Hibernation.ProcessMode)
-		}
-	}
-
-	return nil
-}
-
-func (r *TaskReconciler) validateExecutionWorkspaceProviderConfig(
-	ws *corev1alpha1.ExecutionWorkspaceSpec,
-	provider corev1alpha1.WorkspaceProvider,
-) error {
-	switch provider {
-	case corev1alpha1.WorkspaceProviderAgentSandbox:
-		if !r.AgentSandboxEnabled {
-			return fmt.Errorf("execution workspace provider %q requires agent sandbox to be enabled", provider)
-		}
-		// ACP RuntimeSessions execute only in controller-rendered sandbox
-		// templates: the immutable runtime image, epoch-scoped Secret mounts,
-		// and fence environment cannot be hosted by an operator-provided
-		// template without exposing credentials through the provider API.
-		if ws.TemplateRef != nil {
-			return fmt.Errorf("execution workspace templateRef selects a legacy worker-path sandbox template; ACP RuntimeSessions run only in controller-rendered sandbox templates, so templateRef must be omitted")
-		}
-	case corev1alpha1.WorkspaceProviderSubstrate:
-		if !r.SubstrateEnabled {
-			return fmt.Errorf("execution workspace provider %q requires substrate to be enabled", provider)
-		}
-		cfg := r.SubstrateConfig.WithDefaults()
-		// Agent Tasks always use the ACP RuntimePool backend. The legacy
-		// workspace-agent bootstrap Secret is validated only by the separate
-		// workspace-provider API path and must not mask the ACP dispatch gate.
-		if err := cfg.ValidateACPRuntimePool(); err != nil {
-			return err
-		}
-		if substrateTemplateName(ws, cfg) == "" {
-			return fmt.Errorf("execution workspace templateRef.name is required when no substrate default template is configured")
-		}
-	}
-	return nil
-}
-
-func validateExecutionWorkspacePolicies(task *corev1alpha1.Task, ws *corev1alpha1.ExecutionWorkspaceSpec) error {
-	if err := validateExecutionWorkspacePolicyShape(task, ws); err != nil {
-		return err
-	}
-	if ws.PoolRef != nil && ws.CleanupPolicy == corev1alpha1.WorkspaceCleanupPolicyRetain {
-		return fmt.Errorf("execution workspace poolRef does not support cleanupPolicy %q until substrate workspace reset is available", ws.CleanupPolicy)
-	}
-
 	return nil
 }
 
@@ -3678,10 +3277,14 @@ func (r *TaskReconciler) handleScheduled(ctx context.Context, task *corev1alpha1
 		// for a skipped window: without it the same missed tick is
 		// re-evaluated on every reconcile and the schedule never resumes.
 		reanchor := metav1.NewTime(now)
-		_ = r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
+		if err := r.updateStatusWithRetry(ctx, task, func(t *corev1alpha1.Task) {
 			t.Status.NextScheduleTime = &nextScheduleCopy
 			t.Status.LastScheduleTime = &reanchor
-		})
+		}); err != nil {
+			// A failed cursor write must retry promptly: sleeping to the
+			// next cron tick with the stale cursor would skip that run too.
+			return ctrl.Result{}, fmt.Errorf("re-anchoring schedule cursor: %w", err)
+		}
 		return ctrl.Result{RequeueAfter: time.Until(next)}, nil
 	}
 
@@ -3867,6 +3470,7 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1alpha1.Task{}).
 		Owns(&batchv1.Job{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&corev1alpha1.Task{}).
 		Named("task").
 		Complete(r)

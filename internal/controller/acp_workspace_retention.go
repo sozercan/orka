@@ -1559,22 +1559,6 @@ func taskCreatedAfter(task *corev1alpha1.Task, cutoff *time.Time) bool {
 	return task != nil && cutoff != nil && !task.CreationTimestamp.IsZero() && task.CreationTimestamp.After(*cutoff)
 }
 
-// liveACPSessionContinuationExists reports whether any live, non-terminal
-// Task in the workspace's namespace targets this exact workspace incarnation
-// through its Session. The reader uses the Task CRD's server-side selectable
-// field; list errors fail closed as outstanding demand.
-func liveACPSessionContinuationExists(
-	ctx context.Context,
-	reader client.Reader,
-	workspace *workspacev1alpha1.ExecutionWorkspace,
-) (bool, error) {
-	successors, err := liveACPSessionContinuations(ctx, reader, workspace, "")
-	if err != nil {
-		return true, err
-	}
-	return len(successors) > 0, nil
-}
-
 // liveACPSessionContinuations returns every live, non-terminal continuation
 // Task targeting this exact workspace incarnation, in list order. It fails
 // closed (error, treated as demand outstanding by callers) on list errors.

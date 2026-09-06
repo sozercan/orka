@@ -289,12 +289,6 @@ type PRReconcilerFactory interface {
 	New(ctx context.Context, credentialPath string) (publisher.PullRequestReconciler, error)
 }
 
-type PRReconcilerFactoryFunc func(context.Context, string) (publisher.PullRequestReconciler, error)
-
-func (f PRReconcilerFactoryFunc) New(ctx context.Context, credentialPath string) (publisher.PullRequestReconciler, error) {
-	return f(ctx, credentialPath)
-}
-
 // Config contains only already-resolved secrets. The command package loads
 // them from files and clears the corresponding environment variables.
 type Config struct {

@@ -43,6 +43,7 @@ grep -F 'live_acp_kind_validate_vekil_catalog "${models_file}"' "${bootstrap}" >
 grep -F 'live_acp_kind_probe_configured_models' "${bootstrap}" >/dev/null
 # shellcheck disable=SC2016 # Match the literal delegation expression in the wrapper.
 grep -F '"${LIVE_ACP_VALIDATOR_SCRIPT}" "${validator_args[@]}"' "${wrapper}" >/dev/null
+grep -F 'export ACP_E2E_ALLOW_SHARED_POOL_MUTATION="${ACP_E2E_ALLOW_SHARED_POOL_MUTATION:-1}"' "${wrapper}" >/dev/null
 grep -F 'ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN' "${bootstrap}" >/dev/null
 grep -F 'Creating four role-separated release-gate credential Secrets' "${bootstrap}" >/dev/null
 if grep -Eq 'set +-x|echo .*COPILOT_GITHUB_TOKEN' "${bootstrap}" "${wrapper}"; then

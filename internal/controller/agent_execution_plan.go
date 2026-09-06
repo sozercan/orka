@@ -23,7 +23,6 @@ type agentExecutionPath string
 const (
 	agentExecutionPathACP       agentExecutionPath = "acp-runtime-pool"
 	agentExecutionPathHarnessV1 agentExecutionPath = "harness-v1"
-	agentExecutionPathExternal  agentExecutionPath = "acp-external-runtime"
 	agentExecutionPathRejected  agentExecutionPath = "rejected"
 )
 

@@ -151,3 +151,51 @@ describe('TaskList', () => {
     expect(screen.getByText('2d')).toBeInTheDocument()
   })
 })
+
+describe('TaskList paging and access', () => {
+  beforeEach(() => {
+    useUIStore.setState({ sidebarCollapsed: false, theme: 'light', namespace: 'default' })
+    useAuthStore.setState({ token: 'test-token' })
+  })
+
+  it('follows continue tokens through a Load more control and filters loaded rows', async () => {
+    server.use(
+      http.get('/api/v1/tasks', ({ request }) => {
+        const url = new URL(request.url)
+        if (url.searchParams.get('continue') === 'page-2') {
+          return HttpResponse.json({
+            items: [{ metadata: { name: 'zeta-task', namespace: 'default' }, spec: { type: 'ai' }, status: { phase: 'Succeeded' } }],
+            metadata: {},
+          })
+        }
+        return HttpResponse.json({
+          items: [{ metadata: { name: 'alpha-task', namespace: 'default' }, spec: { type: 'container' }, status: { phase: 'Running' } }],
+          metadata: { continue: 'page-2', remainingItemCount: 1 },
+        })
+      }),
+    )
+    const user = userEvent.setup()
+    render(<TaskList />)
+    await waitFor(() => expect(screen.getByText('alpha-task')).toBeInTheDocument())
+    expect(screen.queryByText('zeta-task')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /Load more/ }))
+    await waitFor(() => expect(screen.getByText('zeta-task')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /Load more/ })).not.toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Filter tasks'), 'succeeded')
+    expect(screen.getByText('zeta-task')).toBeInTheDocument()
+    expect(screen.queryByText('alpha-task')).not.toBeInTheDocument()
+  })
+
+  it('shows a not-authorized panel instead of the empty-state CTA on 403', async () => {
+    server.use(
+      http.get('/api/v1/tasks', () =>
+        HttpResponse.json({ error: { code: 403, message: 'not authorized' } }, { status: 403 }),
+      ),
+    )
+    render(<TaskList />)
+    await waitFor(() => expect(screen.getByText('Not authorized to view tasks')).toBeInTheDocument())
+    expect(screen.queryByText(/No tasks found/)).not.toBeInTheDocument()
+  })
+})

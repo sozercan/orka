@@ -382,9 +382,7 @@ func codexSessionProjection(
 	if !policy.unrestricted && !codexReadOnlySessionPolicy(request, policy) {
 		return ProviderSessionProjection{}, fmt.Errorf("codex ACP runtime cannot exactly enforce provider-native tool restrictions")
 	}
-	config := map[string]any{
-		"model": model, "openai_base_url": proxy.BaseURL, "check_for_update_on_startup": false,
-	}
+	config := codexBaseConfig(model, proxy.BaseURL)
 	if systemPrompt := request.AgentConfiguration.SystemPrompt; systemPrompt != "" {
 		config["developer_instructions"] = systemPrompt
 	}
@@ -408,6 +406,42 @@ func codexSessionProjection(
 	// any turn that modifies the workspace.
 	return ProviderSessionProjection{Environment: map[string]string{"CODEX_CONFIG": string(encoded)}}, nil
 }
+
+// codexBaseConfig is the Codex configuration every session starts from. The
+// provider proxy only admits the immutable HTTP profile, so the Responses
+// WebSocket transports are disabled up front: otherwise Codex attempts the
+// upgrade, receives 403 from the proxy, and prepends "Warning: Falling back
+// from WebSockets to HTTPS transport" to the agent's first message, which then
+// leaks into Task results.
+func codexBaseConfig(model, baseURL string) map[string]any {
+	return map[string]any{
+		"model": model, "model_provider": codexProviderID, "check_for_update_on_startup": false,
+		"model_providers": map[string]any{
+			codexProviderID: codexProviderDefinition(baseURL),
+		},
+	}
+}
+
+// codexProviderID names the Codex model provider that points at the session
+// provider proxy. Codex's built-in "openai" provider (selected implicitly by
+// openai_base_url) always opens a Responses WebSocket first; the proxy admits
+// only the immutable HTTP profile, so that attempt failed with 403 and Codex
+// prepended "Warning: Falling back from WebSockets to HTTPS transport" to the
+// first agent message. A custom provider with wire_api=responses uses plain
+// HTTPS from the start (verified against codex-cli 0.145.0).
+const codexProviderID = "orka"
+
+func codexProviderDefinition(baseURL string) map[string]any {
+	return map[string]any{
+		codexProviderNameKey: "Orka provider proxy",
+		"base_url":           baseURL,
+		"wire_api":           "responses",
+		"env_key":            "CODEX_API_KEY",
+	}
+}
+
+// codexProviderNameKey is the Codex provider display-name key.
+const codexProviderNameKey = "name"
 
 // codexReadOnlySessionPolicy reports whether the session's restricted tool
 // policy is exactly the read-intent {Glob, Grep, Read} surface, which is the
@@ -459,10 +493,18 @@ var copilotToolIDs = map[string][]string{
 	providerToolWrite:     {"create"},
 }
 
-var copilotAlwaysExcludedToolIDs = []string{
-	"ask_user", "code_review", "custom_tool", "custom_tools", "exit_plan_mode",
-	"github", "github-mcp-server", "list_agents", "lsp", "read_agent", "report_intent", "skill", "sql", "task", "write_agent",
-}
+// copilotAlwaysExcludedToolIDs are the built-in Copilot CLI tools every Orka
+// session removes from the model's catalog regardless of policy: sub-agent
+// orchestration, skills, SQL, and background task tools have no Orka
+// equivalent and would bypass the RuntimeSession boundary. The list is exactly
+// the set GitHub Copilot CLI 1.0.77 registers under the supervisor's flags
+// (verified in --acp mode): the CLI prints an "Unknown tool name" diagnostic
+// into the agent message stream for every --excluded-tools name outside its
+// catalog, and names such as ask_user, report_intent, exit_plan_mode, lsp, or
+// code_review are not registered tool names in that build at all. GitHub MCP
+// tools register as github-mcp-server-<tool> and are removed by
+// --disable-builtin-mcps; the ask_user tool is removed by --no-ask-user.
+var copilotAlwaysExcludedToolIDs = []string{"list_agents", "read_agent", "skill", "sql", "task", "write_agent"}
 
 func copilotSessionProjection(
 	request harnessv2.CreateRuntimeSessionRequest,
@@ -481,23 +523,23 @@ func copilotSessionProjection(
 		return ProviderSessionProjection{}, fmt.Errorf("copilot ACP runtime cannot enforce reasoning effort")
 	}
 	excluded := append([]string(nil), copilotAlwaysExcludedToolIDs...)
-	projection := ProviderSessionProjection{
-		AdditionalArgs: []string{"--excluded-tools=" + strings.Join(excluded, ",")},
-	}
-	if policy.unrestricted {
-		return projection, nil
-	}
-	if policy.allows(providerToolWebSearch) {
-		return ProviderSessionProjection{}, fmt.Errorf("copilot ACP runtime cannot exactly enforce the WebSearch provider-native tool")
-	}
-	for _, name := range providerNativeToolNames {
-		if policy.allows(name) {
-			continue
+	if !policy.unrestricted {
+		if policy.allows(providerToolWebSearch) {
+			return ProviderSessionProjection{}, fmt.Errorf("copilot ACP runtime cannot exactly enforce the WebSearch provider-native tool")
 		}
-		excluded = append(excluded, copilotToolIDs[name]...)
+		for _, name := range providerNativeToolNames {
+			if policy.allows(name) {
+				continue
+			}
+			excluded = append(excluded, copilotToolIDs[name]...)
+		}
 	}
-	projection.AdditionalArgs = []string{"--excluded-tools=" + strings.Join(excluded, ",")}
-	return projection, nil
+	// The CLI reports the exclusion list back as "Info:" agent message chunks
+	// at prompt start; the filter withholds exactly those chunks.
+	return ProviderSessionProjection{
+		AdditionalArgs:        []string{"--excluded-tools=" + strings.Join(excluded, ",")},
+		AgentDiagnosticFilter: &AgentDiagnosticFilter{Startup: copilotStartupDiagnostic(excluded)},
+	}, nil
 }
 
 func openCodeSessionProjection(
@@ -567,9 +609,7 @@ func providerProfile(
 				// the child to create nested Linux namespaces. Network remains restricted
 				// and on-request approvals remain active for explicit elevation requests.
 				mode := codexAgentModeOrkaExternal
-				config, err := json.Marshal(map[string]any{
-					"model": model, "openai_base_url": proxy.BaseURL, "check_for_update_on_startup": false,
-				})
+				config, err := json.Marshal(codexBaseConfig(model, proxy.BaseURL))
 				if err != nil {
 					return nil, err
 				}
@@ -890,8 +930,12 @@ func prepareCodexHome(paths acp.SessionPaths) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "config.toml"), []byte("check_for_update_on_startup = false\n"), 0o600)
+	return os.WriteFile(filepath.Join(dir, "config.toml"), []byte(codexHomeConfigTOML), 0o600)
 }
+
+// codexHomeConfigTOML is the static CODEX_HOME/config.toml; the per-session
+// provider definition travels in CODEX_CONFIG (see codexBaseConfig).
+const codexHomeConfigTOML = "check_for_update_on_startup = false\n"
 
 func openAIProxyURL(base string) string {
 	base = strings.TrimSuffix(strings.TrimSpace(base), "/")

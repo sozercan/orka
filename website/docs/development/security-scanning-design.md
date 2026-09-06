@@ -1,8 +1,9 @@
 ---
 slug: /security-scanning-design
+description: "How repository security scanning is built: review slices, findings, and the scan lifecycle."
 ---
 
-# Repository Security Scanning Design
+# Repository security scanning design
 
 This page documents the internal design of repository security scanning: the storage model,
 controller ingestion flow, artifact contract, and agent prompt contracts. For the
@@ -12,7 +13,7 @@ The feature is GitHub-first, human-in-the-loop for remediation, and built on top
 existing Task, ACP RuntimePool, artifact, scheduling, clean-room publication, and PR plumbing rather than a parallel
 execution system.
 
-## Design Decisions
+## Design decisions
 
 | Decision | Rationale |
 |----------|-----------|
@@ -128,7 +129,7 @@ Notes:
 - `historyDays` is intentionally simpler than a custom `30d` duration parser.
 - `forkRepo` and `prBaseBranch` map directly to existing workspace/PR concepts.
 
-## Storage Model
+## Storage model
 
 The `SecurityStore` interface (`internal/store/store.go`, SQLite implementation under
 `internal/store/sqlite/`) persists dynamic security data. Domain types live in
@@ -270,7 +271,7 @@ raw transcripts, or full request contexts.
 > before inserting the new model, so only the latest threat model is retained. The versioned
 > schema leaves room to preserve history later, but no prior versions are kept today.
 
-## Scanner Quality Policy
+## Scanner quality policy
 
 The default scanner policy is explicit and versioned. Review and validation prompts require
 concrete exploitability: attacker-controlled source, trust boundary crossed, sensitive sink
@@ -300,7 +301,7 @@ Scan runs and tasks record policy provenance with `scannerPolicyVersion`, `polic
 `ORKA_SECURITY_POLICY_DIGEST`, and `ORKA_SECURITY_POLICY_PROVENANCE`; the full policy text is
 not copied into SQLite.
 
-## Artifact Contract
+## Artifact contract
 
 Security runs communicate detailed outputs through artifacts, not just the task result
 text. Because `workers/common/artifacts.go` uploads a flat directory under
@@ -502,7 +503,7 @@ diff:
 }
 ```
 
-## Execution Model
+## Execution model
 
 The `RepositoryScan` controller (`internal/controller/repositoryscan_controller.go`):
 
@@ -582,7 +583,7 @@ finding, parses the structured Task result, loads `security-patch-<finding-id>.d
 delta and delivery receipt, upserts the `PatchProposal`, and updates finding state to `patch_ready` only when
 verification succeeds.
 
-## Prompt Contracts
+## Prompt contracts
 
 **Scanner agent** is instructed to: inspect current code and recent commits; generate or
 update a concise threat model; produce a bounded number of findings; prefer high-confidence
@@ -594,7 +595,7 @@ preserve existing behavior unless the finding requires a change; run focused tes
 available; write `security-patch-<finding-id>.diff` and `security-patch-<finding-id>.json`;
 and avoid creating a PR directly (PR creation is the API action).
 
-## Reusing PR Plumbing
+## Reusing PR plumbing
 
 The security API reuses the shared GitHub helper code that backs the built-in PR tools
 (`internal/tools/create_pull_request.go`, `review_pull_request.go`, `merge_pull_request.go`)
@@ -609,7 +610,7 @@ finding rows.
 The following repository-security Prometheus metrics are **planned but not yet registered**.
 They do not exist in `internal/metrics/` today; treat them as a design target, not a series
 you can scrape. (For metrics Orka actually exposes, see
-[Configuration → Prometheus Metrics](../concepts/configuration.md#prometheus-metrics).)
+[Configuration → Prometheus Metrics](../reference/configuration.md#prometheus-metrics).)
 
 - `orka_security_scan_runs_total{mode,status}`
 - `orka_security_review_slices_total{status}`

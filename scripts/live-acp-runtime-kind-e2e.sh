@@ -151,5 +151,8 @@ if [[ -z "${namespace}" ]]; then
   namespace="orka-system"
 fi
 validator_args+=(--namespace "${namespace}")
+# This wrapper owns a dedicated Kind cluster, so the shared controller watch
+# namespace cannot contain unrelated RuntimePool consumers.
+export ACP_E2E_ALLOW_SHARED_POOL_MUTATION="${ACP_E2E_ALLOW_SHARED_POOL_MUTATION:-1}"
 live_acp_kind_log "Running canonical live ACP runtime validator"
 "${LIVE_ACP_VALIDATOR_SCRIPT}" "${validator_args[@]}"

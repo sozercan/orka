@@ -62,10 +62,6 @@ type SkillSource struct {
 	// SkillName is the skill name within the source repo
 	// +optional
 	SkillName string `json:"skillName,omitempty"`
-
-	// Context7 indicates whether this skill is indexed by Context7
-	// +optional
-	Context7 bool `json:"context7,omitempty"`
 }
 
 // SkillStatus defines the observed state of Skill

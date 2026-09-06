@@ -317,7 +317,7 @@ func TestJournalRecoveryScansOnlyCurrentPromptTail(t *testing.T) {
 			Kind: harnessv2.UpdateUsage, Usage: &harnessv2.UsageUpdate{InputTokens: 1},
 		})
 		oldEvent.Identity.PromptID = "prompt-old"
-		mapped, err := MapUpdate(oldEvent, testMapContext())
+		mapped, err := mapUpdate(oldEvent, testMapContext(), mapUpdateOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -328,7 +328,7 @@ func TestJournalRecoveryScansOnlyCurrentPromptTail(t *testing.T) {
 	current := testUpdateEvent(2, time.Now().UTC(), harnessv2.UpdateEvent{
 		Kind: harnessv2.UpdateUsage, Usage: &harnessv2.UsageUpdate{OutputTokens: 2},
 	})
-	mapped, err := MapUpdate(current, testMapContext())
+	mapped, err := mapUpdate(current, testMapContext(), mapUpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

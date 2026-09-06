@@ -356,10 +356,7 @@ func (c *missingValidationTaskList) List(ctx context.Context, list client.Object
 }
 
 func defaultRecoveredScanTask(task *corev1alpha1.Task) {
-	task.Spec.ConcurrencyPolicy = corev1alpha1.ForbidConcurrent
-	task.Spec.StartingDeadlineSeconds = new(int64(100))
-	task.Spec.SuccessfulRunsHistoryLimit = new(int32(3))
-	task.Spec.FailedRunsHistoryLimit = new(int32(1))
+	task.Spec = taskSpecWithServerDefaults(task.Spec)
 	task.Spec.RequestedBy = &corev1alpha1.RequestedBy{Subject: "controller"}
 	task.Spec.Transaction = &corev1alpha1.TaskTransaction{ID: "test-transaction-metadata"}
 }

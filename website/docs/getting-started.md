@@ -1,52 +1,178 @@
-# Getting Started
+---
+description: "Install Orka on a Kubernetes cluster and run your first agent task."
+---
 
-Orka is a Kubernetes-native platform for running AI agents and tool-using workflows as
-durable, observable Tasks. Native AI and container work runs in hardened worker Jobs; ACP
-coding agents run as fenced RuntimeSessions in controller-owned RuntimePools. The controller
-stores results and delivery receipts and handles sessions, priorities, and delegation.
+# Getting started
 
-## Mental Model
+Orka runs AI agents on Kubernetes. You describe work as a **Task**, and Orka runs it in
+a Pod, keeps a durable record of what happened, and gives you the result over a REST API,
+a CLI, or a built-in web dashboard.
 
-Three custom resources cover most use cases:
+The point is that the API keys stay in the cluster. Developers get a ServiceAccount token,
+not an LLM key, and the platform team decides which models and providers are allowed.
 
-- **Provider** — an LLM backend (Anthropic, OpenAI, or Azure OpenAI) plus its API-key Secret.
-- **Agent** — a reusable configuration: Provider/model, system prompt, tools, skills,
-  ACP runtime profile, or coordination settings.
-- **Task** — one unit of work. `type: ai` runs through Orka's built-in AI worker, `type: agent`
-  runs a Codex, Claude, Copilot, or OpenCode ACP session in a RuntimePool, and `type: container` runs an
-  arbitrary container command.
+## Mental model
 
-A Task references an Agent, an Agent references a Provider. Results are retrieved over the
-REST API, the CLI, or the embedded dashboard. See [Architecture](concepts/architecture.md)
-for the full component picture.
+Three custom resources cover most of what you will do:
+
+| Resource | What it is |
+| --- | --- |
+| **Provider** | An LLM backend — Anthropic, OpenAI, or Azure OpenAI — plus the Secret holding its API key. |
+| **Agent** | A reusable configuration: which Provider and model to use, a system prompt, which tools it may call. |
+| **Task** | One unit of work. This is the thing you create to make something happen. |
+
+A Task points at an Agent; an Agent points at a Provider.
+
+There are three kinds of Task, and the difference matters because they run in different places:
+
+- **`type: ai`** — Orka's own AI worker. It runs in a per-Task Kubernetes Job, calls the
+  model, and can use built-in tools like web search and code execution.
+- **`type: agent`** — a real coding-agent CLI (Codex, Claude Code, GitHub Copilot CLI, or
+  OpenCode) running inside Orka. See [What ACP means](#what-acp-means) below.
+- **`type: container`** — an arbitrary container command. No model involved. Useful for
+  build and test steps that an agent needs done. See
+  [Container tasks](guides/container-tasks.md) for the filesystem rules, which trip
+  most people up the first time.
+
+[Architecture](concepts/architecture.md) has the full component picture.
+
+### What ACP means
+
+ACP is the **Agent Client Protocol** — a JSON-RPC protocol that coding-agent CLIs speak
+over stdin/stdout, so a program can drive them instead of a human typing at a terminal.
+It is an external open protocol, not an Orka invention:
+see [agentclientprotocol.com](https://agentclientprotocol.com).
+
+Orka uses it to run agent CLIs as a service. Rather than starting a fresh container per
+request, Orka keeps a pool of long-lived agent processes (a **RuntimePool**) and talks to
+them over ACP. That is why `type: agent` Tasks start faster than a container would, and
+why the docs talk about pools and sessions rather than Jobs.
+
+Terms like *fence*, *epoch*, and *fail closed* show up throughout these docs.
+The [Glossary](reference/glossary.md) defines all of them in one place.
 
 ## Prerequisites
 
-- Docker 17.03+
-- kubectl (version compatible with your cluster)
-- Access to a Kubernetes cluster
-- An LLM API key (Anthropic, OpenAI, or Azure OpenAI)
+- A Kubernetes cluster and a `kubectl` that can reach it. For a laptop,
+  [kind](https://kind.sigs.k8s.io/) or [minikube](https://minikube.sigs.k8s.io/) is fine.
+- OpenSSL for generating the installation credentials and certificates.
+- An API key for at least one LLM provider (Anthropic, OpenAI, or Azure OpenAI).
 
-For development, you also need:
-- Go 1.25.3+
-- Bun (for UI build)
+That is all you need for the released install below. Running `type: agent` coding agents
+on the newer RuntimePool path needs more — see
+[Installing from source](#option-b-current-main-from-source).
 
-## Installation
+For building Orka yourself, see [Development](development/development.md) for the
+toolchain versions.
 
-### Using Helm
+## Install
 
-A harness-v2 installation requires operator-managed secret material before
-`helm install`: a 32-byte agent-execution snapshot key, a webhook serving
-certificate with its CA, and the Vekil-backed provider proxy enabled. Set the
-file paths first, then run the block; Helm fails rendering if any of these
-values are missing:
+There are two versions of Orka, and it is worth being clear about which one you are getting.
+
+| | Latest release (v0.1.3) | `main` |
+| --- | --- | --- |
+| Install | Published images, no clone | Build the images yourself |
+| `type: ai` and `type: container` Tasks | Yes | Yes |
+| Chat, gateways, repository monitors, security scanning | Yes | Yes |
+| `type: agent` coding agents | Yes, via the legacy Job path | Yes, via RuntimePools |
+| Harness modes, RuntimePools, workspace providers | **No** | Yes |
+
+Most of these docs describe `main`. v0.1.3 does run `type: agent` Tasks, but through an
+older per-Task Job and harness-wrapper path, so any page here that mentions ACP,
+RuntimePools, or harness modes does not apply to it. See [Release status](reference/release-status.md) for the full breakdown.
+
+### Option A: latest release
 
 ```bash
-: "${SNAPSHOT_KEY_FILE:?set SNAPSHOT_KEY_FILE to a 32-byte key file, e.g. from: openssl rand 32 > snapshot.key}"
-: "${WEBHOOK_CERT_FILE:?set WEBHOOK_CERT_FILE to the webhook serving certificate}"
-: "${WEBHOOK_PRIVATE_KEY_FILE:?set WEBHOOK_PRIVATE_KEY_FILE to the webhook private key}"
-: "${WEBHOOK_CA_FILE:?set WEBHOOK_CA_FILE to the CA certificate}"
+# The manifest mounts a harness-wrapper-auth Secret but does not create it,
+# so make the namespace and that Secret first or the Pods never start.
+kubectl create namespace orka-system
+kubectl -n orka-system create secret generic harness-wrapper-auth \
+  --from-literal=token="$(openssl rand -hex 32)"
 
+kubectl apply -f https://raw.githubusercontent.com/orka-agents/orka/v0.1.3/deploy/orka.yaml
+```
+
+That installs the CRDs, RBAC, the controller, and the harness wrapper. Wait for it:
+
+```bash
+kubectl -n orka-system rollout status deploy/orka-controller-manager
+```
+
+Or with Helm:
+
+```bash
+helm repo add orka https://orka-agents.github.io/orka/charts
+helm repo update
+helm install orka orka/orka --version 0.1.3 \
+  --namespace orka-system --create-namespace
+```
+
+Check [the tag list](https://github.com/orka-agents/orka/tags) for a newer version before
+pinning to v0.1.3. The project publishes tags and chart artifacts; it does not currently
+create GitHub Release entries, so the tags are the list to watch.
+
+Then continue with [Give yourself an API client](#give-yourself-an-api-client).
+
+### Option B: current `main`, from source
+
+No container images are published from `main` — the release workflow only runs on `v*`
+tags — so this path builds them locally. Use it for coding-agent Tasks that run through
+ACP, or for developing Orka itself.
+
+You will need, in addition to the prerequisites above:
+
+- Go, Bun, and Docker — see [Development](development/development.md#prerequisites) for versions
+- [Helm](https://helm.sh/docs/intro/install/) for the chart install below
+- A **provider proxy**. Built-in coding agents never receive an LLM API key directly;
+  all their model traffic goes through an authenticated proxy in front of
+  [Vekil](operations/provider-proxy.md). Set that up first — the chart refuses to
+  install without it.
+- A TLS certificate for the admission webhooks, and a 32-byte encryption key for
+  execution snapshots.
+
+```bash
+git clone https://github.com/orka-agents/orka.git
+cd orka
+```
+
+Choose a registry prefix you can push to and your cluster can pull from. Replace
+`ghcr.io/your-org/orka` below, authenticate Docker to that registry, and run the build,
+push, and install commands in the same shell. Use a fresh tag when rebuilding with local
+source changes.
+
+```bash
+export ORKA_IMAGE_PREFIX=ghcr.io/your-org/orka
+export ORKA_IMAGE_TAG="dev-$(git rev-parse --short=12 HEAD)"
+export IMG="${ORKA_IMAGE_PREFIX}:${ORKA_IMAGE_TAG}"
+export AI_WORKER_IMG="${ORKA_IMAGE_PREFIX}/ai-worker:${ORKA_IMAGE_TAG}"
+export GENERAL_WORKER_IMG="${ORKA_IMAGE_PREFIX}/general-worker:${ORKA_IMAGE_TAG}"
+export HARNESS_WRAPPER_IMG="${ORKA_IMAGE_PREFIX}/agent-harness-wrapper:${ORKA_IMAGE_TAG}"
+export ACP_CODEX_RUNTIME_IMG="${ORKA_IMAGE_PREFIX}/acp-codex-runtime:${ORKA_IMAGE_TAG}"
+export ACP_CLAUDE_RUNTIME_IMG="${ORKA_IMAGE_PREFIX}/acp-claude-runtime:${ORKA_IMAGE_TAG}"
+export ACP_COPILOT_RUNTIME_IMG="${ORKA_IMAGE_PREFIX}/acp-copilot-runtime:${ORKA_IMAGE_TAG}"
+export ACP_OPENCODE_RUNTIME_IMG="${ORKA_IMAGE_PREFIX}/acp-opencode-runtime:${ORKA_IMAGE_TAG}"
+export WORKSPACE_PUBLISHER_IMG="${ORKA_IMAGE_PREFIX}/workspace-publisher:${ORKA_IMAGE_TAG}"
+
+make docker-build-all
+make docker-push-all
+```
+
+The Helm command below uses these repositories and the same tag for both native workers.
+The controller, publisher, and ACP runtimes require registry digests. After pushing, list
+their references and replace the corresponding digest placeholders in the Helm command:
+
+```bash
+docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+  "$IMG" "$WORKSPACE_PUBLISHER_IMG" \
+  "$ACP_CODEX_RUNTIME_IMG" "$ACP_CLAUDE_RUNTIME_IMG" \
+  "$ACP_COPILOT_RUNTIME_IMG" "$ACP_OPENCODE_RUNTIME_IMG"
+```
+
+Claim a namespace for the install. The label is not optional — the controller checks it at
+startup and exits if it is missing or does not match:
+
+```bash
 kubectl create -f - <<'EOF'
 apiVersion: v1
 kind: Namespace
@@ -55,160 +181,146 @@ metadata:
   labels:
     orka.ai/controller-mode: harness-v2
 EOF
+```
 
-kubectl -n orka-system create secret generic agent-execution-snapshot-key \
-  --from-file=snapshot-key="${SNAPSHOT_KEY_FILE}"
+Create the two required Secrets. The snapshot key encrypts stored agent execution records;
+keep it somewhere safe, because rotating it makes existing snapshots unreadable:
+
+```bash
+kubectl -n orka-system create secret generic orka-agent-snapshot-key \
+  --from-literal=key="$(openssl rand -base64 32)"
+```
+
+Now the webhook certificate. The chart serves admission on the Service
+`orka-webhook.orka-system.svc`, so the certificate has to name exactly that — a
+certificate for any other name is rejected by the API server at admission time, not at
+install time. For local evaluation a self-signed certificate is fine; use your own CA or
+[cert-manager](https://cert-manager.io/) for anything real.
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout /tmp/webhook.key -out /tmp/webhook.crt \
+  -subj "/CN=orka-webhook.orka-system.svc" \
+  -addext "subjectAltName=DNS:orka-webhook.orka-system.svc,DNS:orka-webhook.orka-system.svc.cluster.local"
+
 kubectl -n orka-system create secret generic orka-webhook-tls \
   --type=kubernetes.io/tls \
-  --from-file=tls.crt="${WEBHOOK_CERT_FILE}" \
-  --from-file=tls.key="${WEBHOOK_PRIVATE_KEY_FILE}" \
-  --from-file=ca.crt="${WEBHOOK_CA_FILE}"
+  --from-file=tls.crt=/tmp/webhook.crt \
+  --from-file=tls.key=/tmp/webhook.key \
+  --from-file=ca.crt=/tmp/webhook.crt
+```
 
-WEBHOOK_CA_BUNDLE="$(kubectl -n orka-system get secret orka-webhook-tls \
-  -o jsonpath='{.data.ca\.crt}')"
+:::note[Why `ca.crt` is the certificate again]
+The certificate is self-signed, so it is its own issuer. The chart reads `ca.crt` to build
+the `caBundle` the API server uses to trust the webhook. With a real CA, `ca.crt` is that
+CA's certificate instead.
+:::
 
-helm install orka charts/orka \
+Install the chart. Use `manifest_staging/charts/orka` — that is the chart that matches
+`main`. The `charts/orka` directory at the repo root is the snapshot of the last release
+and is a generation behind:
+
+```bash
+WEBHOOK_CA_BUNDLE="$(kubectl -n orka-system get secret orka-webhook-tls -o jsonpath='{.data.ca\.crt}')"
+
+helm install orka ./manifest_staging/charts/orka \
   --namespace orka-system \
   --set controller.mode=harness-v2 \
   --set controller.watchNamespace=orka-system \
-  --set controller.image.repository=docker.io/sozercan/orka \
-  --set controller.image.digest=sha256:<controller-digest> \
-  --set publisher.image.repository=docker.io/sozercan/orka-workspace-publisher \
-  --set publisher.image.digest=sha256:<publisher-digest> \
-  --set controller.acpRuntime.codexImage=docker.io/sozercan/orka-acp-codex@sha256:<codex-digest> \
-  --set controller.acpRuntime.claudeImage=docker.io/sozercan/orka-acp-claude@sha256:<claude-digest> \
-  --set controller.acpRuntime.copilotImage=docker.io/sozercan/orka-acp-copilot@sha256:<copilot-digest> \
-  --set controller.acpRuntime.opencodeImage=docker.io/sozercan/orka-acp-opencode@sha256:<opencode-digest> \
-  --set-string controller.agentExecutionSnapshot.existingSecret=agent-execution-snapshot-key \
-  --set-string controller.agentExecutionSnapshot.key=snapshot-key \
+  --set controller.image.repository="${ORKA_IMAGE_PREFIX}" \
+  --set controller.image.digest="sha256:<controller-digest>" \
+  --set workers.ai.image.repository="${ORKA_IMAGE_PREFIX}/ai-worker" \
+  --set-string workers.ai.image.tag="${ORKA_IMAGE_TAG}" \
+  --set workers.general.image.repository="${ORKA_IMAGE_PREFIX}/general-worker" \
+  --set-string workers.general.image.tag="${ORKA_IMAGE_TAG}" \
+  --set publisher.image.repository="${ORKA_IMAGE_PREFIX}/workspace-publisher" \
+  --set publisher.image.digest="sha256:<publisher-digest>" \
+  --set controller.acpRuntime.codexImage="${ORKA_IMAGE_PREFIX}/acp-codex-runtime@sha256:<codex-digest>" \
+  --set controller.acpRuntime.claudeImage="${ORKA_IMAGE_PREFIX}/acp-claude-runtime@sha256:<claude-digest>" \
+  --set controller.acpRuntime.copilotImage="${ORKA_IMAGE_PREFIX}/acp-copilot-runtime@sha256:<copilot-digest>" \
+  --set controller.acpRuntime.opencodeImage="${ORKA_IMAGE_PREFIX}/acp-opencode-runtime@sha256:<opencode-digest>" \
+  --set-string controller.agentExecutionSnapshot.existingSecret=orka-agent-snapshot-key \
+  --set-string controller.agentExecutionSnapshot.key=key \
   --set-string webhooks.tls.existingSecret=orka-webhook-tls \
   --set-string webhooks.caBundle="${WEBHOOK_CA_BUNDLE}" \
   --set providerProxy.enabled=true
 ```
 
-The provider proxy requires Vekil reachable at
-`http://vekil.vekil-system.svc:1337`; alternate upstreams are rejected.
+You can leave out the four `acpRuntime` image lines. Any runtime you do not configure is
+simply unavailable, and Tasks that ask for it fail with a clear error rather than falling
+back to something else.
 
-The chart defaults new installations to `harness-v2`. Controller mode remains
-an immutable installation identity and cannot be changed during an upgrade.
+If Helm refuses to render, that is deliberate — the chart checks its inputs up front
+rather than installing something broken. [Troubleshooting](operations/troubleshooting.md)
+lists the guards and what each one wants.
 
-A normal fresh install creates Orka's 26 cluster-scoped CRDs before the
-controller resources. Use `--skip-crds` only when one designated platform or
-release owner already manages compatible Orka CRDs for the cluster; all other
-Orka releases should use that flag.
-
-:::important[CRDs before every upgrade]
-Helm does not create or update files from `crds/` during `helm upgrade`.
-Apply the CRDs from the exact target chart before **every** upgrade. This also
-applies when upgrading from a chart that installed no CRDs. Helm retains CRDs
-and Orka custom resources on uninstall.
+:::info[Kustomize instead of Helm]
+Install the shared CRDs from `config/crd` through your cluster's designated CRD owner
+before deploying workloads. The `config/acp-production` workload overlay excludes CRDs;
+it adds the network policy that stops model traffic from bypassing the provider proxy.
+`make deploy` checks the shared CRD prerequisite and creates the artifact, publisher,
+and proxy Secrets before applying that overlay. Its controller, publisher, and runtime
+image variables must use the pushed `repository@sha256:...` references.
 :::
 
-Follow the complete commands and ownership guidance in
-[`charts/orka/README.md`](https://github.com/orka-agents/orka/blob/main/charts/orka/README.md).
+### Two installs on one cluster
 
-This installs one static `harness-v2` control plane. To keep harness v1 on the
-same cluster, install it as a different release with a different controller
-namespace, labeled watch namespace, endpoint, RBAC, Lease, store, Secrets, and
-wrapper data plane. Existing Tasks and Sessions never move between releases.
-See [Operating harness v1 and v2 on one cluster](operations/harness-modes.md).
+Controller mode is fixed for the life of an install and cannot be changed by upgrading.
+To run the older `harness-v1` contract alongside `harness-v2`, install it as a separate
+release in a separate namespace. Tasks never move between them.
+See [Harness modes](operations/harness-modes.md).
 
-### Using kubectl
+### Upgrades
 
-The development target creates the required ACP artifact, publisher, provider-proxy, and SCM-proxy Secrets without replacing existing values:
+Helm does not update CRDs on `helm upgrade` — that is a Helm behavior, not an Orka one.
+Apply the CRDs from the target chart yourself first, every time.
+[Upgrading](operations/upgrading.md) has the procedure.
+
+## Give yourself an API client
+
+The REST API authenticates with Kubernetes ServiceAccount tokens. A Helm release named
+`orka` creates an `orka-client` ServiceAccount with the right permissions. For a raw-manifest
+or Kustomize install, first [create the client ServiceAccount and its RBAC roles](operations/troubleshooting.md#i-get-403-from-the-api),
+then continue here.
+
+Forward the API port. For Option A's release manifest:
 
 ```bash
-# Install CRDs
-make install
-
-# Claim the controller namespace for this immutable installation mode
-kubectl create -f - <<'EOF'
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: orka-system
-  labels:
-    orka.ai/controller-mode: harness-v2
-EOF
-
-# For local evaluation only, generate a seven-day self-signed serving
-# certificate and provision the admission runtime's required TLS Secret.
-# Production installations should provision an operator-managed certificate.
-bash scripts/lib/e2e-admission-tls.sh
-
-# Deploy controller
-make deploy \
-  IMG=docker.io/sozercan/orka@sha256:<controller-digest> \
-  WORKSPACE_PUBLISHER_IMG=docker.io/sozercan/orka-workspace-publisher@sha256:<publisher-digest> \
-  ACP_CODEX_RUNTIME_IMG=docker.io/sozercan/orka-acp-codex@sha256:<codex-digest> \
-  ACP_CLAUDE_RUNTIME_IMG=docker.io/sozercan/orka-acp-claude@sha256:<claude-digest> \
-  ACP_COPILOT_RUNTIME_IMG=docker.io/sozercan/orka-acp-copilot@sha256:<copilot-digest> \
-  ACP_OPENCODE_RUNTIME_IMG=docker.io/sozercan/orka-acp-opencode@sha256:<opencode-digest>
+kubectl port-forward -n orka-system svc/orka-api 8080:8080
 ```
 
-The Kustomize install does not create an API client identity. The Helm chart
-creates the `orka-client` ServiceAccount used by the examples below; for a
-Kustomize install create it yourself with the same scope as the Helm client
-Role — Task create/delete, RepositoryMonitor management, read-only catalog
-resources, session and gateway reads:
+For a Helm release named `orka`, use this instead:
 
 ```bash
-kubectl -n orka-system create serviceaccount orka-client
-kubectl -n orka-system create role orka-client \
-  --verb=get,list,watch,create,delete --resource=tasks.core.orka.ai
-kubectl -n orka-system create role orka-client-monitors \
-  --verb=get,list,watch,create,update,patch,delete --resource=repositorymonitors.core.orka.ai
-kubectl -n orka-system create role orka-client-read \
-  --verb=get,list,watch \
-  --resource=agents.core.orka.ai,tools.core.orka.ai,skills.core.orka.ai,providers.core.orka.ai,runtimepools.core.orka.ai,agentruntimes.core.orka.ai
-kubectl -n orka-system create role orka-client-sessions \
-  --verb=get,list,delete --resource=sessions.core.orka.ai
-kubectl -n orka-system create role orka-client-gateway \
-  --verb=get,list,watch --resource=gateways.gateway.orka.ai,gatewaybindings.gateway.orka.ai
-kubectl create clusterrole orka-client-gatewayclass-viewer \
-  --verb=get,list,watch --resource=gatewayclasses.gateway.orka.ai
-kubectl -n orka-system create rolebinding orka-client \
-  --role=orka-client --serviceaccount=orka-system:orka-client
-kubectl -n orka-system create rolebinding orka-client-monitors \
-  --role=orka-client-monitors --serviceaccount=orka-system:orka-client
-kubectl -n orka-system create rolebinding orka-client-read \
-  --role=orka-client-read --serviceaccount=orka-system:orka-client
-kubectl -n orka-system create rolebinding orka-client-sessions \
-  --role=orka-client-sessions --serviceaccount=orka-system:orka-client
-kubectl -n orka-system create rolebinding orka-client-gateway \
-  --role=orka-client-gateway --serviceaccount=orka-system:orka-client
-kubectl create clusterrolebinding orka-client-gatewayclass-viewer \
-  --clusterrole=orka-client-gatewayclass-viewer --serviceaccount=orka-system:orka-client
+kubectl port-forward -n orka-system svc/orka 8080:8080
 ```
 
-`sessions` is a virtual API resource: the REST API authorizes session reads
-and deletes with a SubjectAccessReview even though no CRD backs it. `providers`
-read access is what the dashboard Chat provider picker (`GET /providers`)
-checks. The dashboard Gateways page lists `gateways` and `gatewaybindings`
-(namespaced) and cluster-scoped `gatewayclasses`, each authorized by a
-SubjectAccessReview, so the gateway Role and the `gatewayclasses` ClusterRole
-mirror the reads the Helm client identity is granted.
-
-`make deploy` applies the same resources as the canonical
-`config/acp-production` Kustomize overlay. For direct Kustomize workflows, use
-that overlay rather than `config/default`; it includes the Vekil ingress policy
-that permits model traffic only through the authenticated provider proxy.
-
-## Quick Start
-
-### 1. Create an LLM Provider
+In another terminal, create a client token:
 
 ```bash
-# Create an API key secret
-kubectl create secret generic anthropic-secret \
+export ORKA_TOKEN="$(kubectl -n orka-system create token orka-client)"
+```
+
+:::warning[Namespace matters]
+Almost every command on this page needs `-n orka-system`. Orka watches exactly one
+namespace, and resources created elsewhere are silently ignored — no error, they just
+never run. `kubectl create token orka-client` fails the same way without it.
+:::
+
+## Your first task
+
+### 1. Create a Provider
+
+```bash
+kubectl -n orka-system create secret generic anthropic-secret \
   --from-literal=api-key=your-api-key
 
-# Create a Provider
-kubectl apply -f - <<EOF
+kubectl apply -f - <<'EOF'
 apiVersion: core.orka.ai/v1alpha1
 kind: Provider
 metadata:
   name: anthropic
+  namespace: orka-system
 spec:
   type: anthropic
   secretRef:
@@ -220,12 +332,13 @@ EOF
 
 ### 2. Create an Agent
 
-```yaml
-kubectl apply -f - <<EOF
+```bash
+kubectl apply -f - <<'EOF'
 apiVersion: core.orka.ai/v1alpha1
 kind: Agent
 metadata:
   name: assistant
+  namespace: orka-system
 spec:
   providerRef:
     name: anthropic
@@ -238,12 +351,13 @@ EOF
 
 ### 3. Run a Task
 
-```yaml
-kubectl apply -f - <<EOF
+```bash
+kubectl apply -f - <<'EOF'
 apiVersion: core.orka.ai/v1alpha1
 kind: Task
 metadata:
   name: hello-task
+  namespace: orka-system
 spec:
   type: ai
   agentRef:
@@ -252,61 +366,64 @@ spec:
 EOF
 ```
 
-### 4. Check the Result
+### 4. Read the result
 
 ```bash
-kubectl get task hello-task
+kubectl -n orka-system get task hello-task
 
-# Get the result via the REST API
-curl http://localhost:8080/api/v1/tasks/hello-task/result \
-  -H "Authorization: Bearer $(kubectl create token orka-client)"
+curl -H "Authorization: Bearer ${ORKA_TOKEN}" \
+  http://localhost:8080/api/v1/tasks/hello-task/result
 ```
 
-### 5. Retrieve Artifacts
+If the Task never leaves `Pending`, see
+[Troubleshooting](operations/troubleshooting.md#my-task-stays-pending).
 
-After a task completes, you can list and download generated artifacts:
+### 5. Collect artifacts
+
+Files a Task writes to its artifact directory are retrievable once it finishes.
+The sample `hello-task` asks for a text answer, so an empty artifact list is expected:
 
 ```bash
-# API: list and download artifacts
-curl http://localhost:8080/api/v1/tasks/hello-task/artifacts \
-  -H "Authorization: Bearer $(kubectl create token orka-client)"
-curl -L http://localhost:8080/api/v1/tasks/hello-task/artifacts/output.json \
-  -H "Authorization: Bearer $(kubectl create token orka-client)" \
-  -o output.json
-
-# CLI
-orka task artifacts <task-name>
-orka task download <task-name> [filename] -o <path>
+curl -H "Authorization: Bearer ${ORKA_TOKEN}" \
+  http://localhost:8080/api/v1/tasks/hello-task/artifacts
 ```
 
-## Agent Runtimes Quick Start
+For the optional CLI commands, use an Orka source checkout with the
+[Go toolchain](development/development.md#prerequisites). For a Task that writes artifacts,
+replace `<task-name>` with its name and `<artifact-name>` with a filename returned by
+`task artifacts`:
 
-ACP agent runtimes run the supported Codex, Claude, Copilot, and OpenCode profiles as
-fenced RuntimeSessions in controller-owned RuntimePools. External
-`orka.harness.v2` registrations can be probed and conformance-tested, but
-`runtimeRef` Task dispatch remains fail-closed until the external v2 dispatcher
-support boundary is enabled.
+```bash
+make build-cli
+./bin/orka --server http://localhost:8080 --token "$ORKA_TOKEN" -n orka-system \
+  task artifacts '<task-name>'
+./bin/orka --server http://localhost:8080 --token "$ORKA_TOKEN" -n orka-system \
+  task download '<task-name>' '<artifact-name>'
+```
 
-### 1. Configure the central provider proxy
+## Running a coding agent
 
-Built-in ACP Agents never reference provider Secrets. Configure Vekil with the
-upstream provider credentials and keep Orka's authenticated provider proxy in
-front of it. The controller gives RuntimePools only the proxy bearer and the
-reviewed provider/model scope; the upstream credential never enters the ACP
-process tree.
+This section needs an [Option B](#option-b-current-main-from-source) install.
 
-For Kustomize installs, verify that `config/acp-production` is applied and that
-the `provider-auth-proxy` Deployment is Ready before submitting ACP Tasks. Helm
-deployments enable the same boundary with `providerProxy.enabled=true`.
+A `type: agent` Task runs a real coding-agent CLI against a git repository. Orka clones the
+repo, hands the agent a working copy, and records everything it does.
 
-### 2. Create an Agent with Runtime
+### 1. Check the provider proxy is up
 
-```yaml
-kubectl apply -f - <<EOF
+Built-in agent runtimes never see a provider Secret. They get a token for Orka's proxy and
+a specific model they are allowed to use; the real API key stays with
+[Vekil](operations/provider-proxy.md). Confirm the `provider-auth-proxy` Deployment is
+Ready before submitting agent Tasks.
+
+### 2. Create an Agent with a runtime
+
+```bash
+kubectl apply -f - <<'EOF'
 apiVersion: core.orka.ai/v1alpha1
 kind: Agent
 metadata:
   name: claude-agent
+  namespace: orka-system
 spec:
   model:
     name: claude-sonnet-4-20250514
@@ -315,42 +432,38 @@ spec:
     contractVersion: orka.harness.v2
     defaultMaxTurns: 50
     defaultAllowBash: true
-    defaultAllowedTools:
-      - Read
-      - Write
-      - Edit
-      - Bash
+    defaultAllowedTools: [Read, Write, Edit, Bash]
 EOF
 ```
 
-For Codex Agents, keep `defaultAllowBash: true` for now. The current Codex
-runtime implementation fails fast when bash is disabled because the upstream
-Codex CLI does not yet expose a reliable shell-disable mode. For OpenCode
-Agents, set `runtime.type: opencode`, use the provider/model form expected by
-OpenCode (such as `openai/gpt-5.4`), and set reviewed `model.contextWindow`
-and `model.maxTokens` ceilings. Orka requires both values and pins them into the
-immutable RuntimePool profile so OpenCode compaction and proxy output limits do
-not depend on mutable catalog discovery.
+Two runtime-specific notes:
 
-### 3. Run an Agent Task
+- **Codex** needs `defaultAllowBash: true`. The upstream Codex CLI has no reliable way to
+  disable its shell, so Orka fails fast rather than pretending the restriction holds.
+- **OpenCode** uses `provider/model` names such as `openai/gpt-5.4`, and requires
+  `model.contextWindow` and `model.maxTokens`. Orka pins both into the pool so compaction
+  limits do not shift when a catalog updates.
 
-```yaml
-kubectl apply -f - <<EOF
+### 3. Run it
+
+```bash
+kubectl apply -f - <<'EOF'
 apiVersion: core.orka.ai/v1alpha1
 kind: Task
 metadata:
   name: code-review
+  namespace: orka-system
 spec:
   type: agent
   agentRef:
     name: claude-agent
-  prompt: "Review the code in this repo for security issues. Do not modify files."
+  prompt: "Review this repo for security issues. Do not modify files."
   workspace:
     intent: read
     gitRepo: "https://github.com/example/repo.git"
     branch: main
-    # Optional for a private source repository. This Secret is resolved only
-    # by the clean-room credential broker, never by the ACP runtime.
+    # For a private repo. Only the clean-room publisher resolves this Secret —
+    # the agent process never sees the credential.
     # readCredentialRef:
     #   name: repository-read
   agentRuntime:
@@ -358,86 +471,75 @@ spec:
 EOF
 ```
 
-### 4. Check the Result
+### 4. Watch it
 
 ```bash
-kubectl get task code-review
-kubectl get runtimepools
-orka task status code-review
+kubectl -n orka-system get task code-review
+kubectl -n orka-system get runtimepools
 
-curl http://localhost:8080/api/v1/tasks/code-review/result \
-  -H "Authorization: Bearer $(kubectl create token orka-client)"
+make build-cli
+./bin/orka --server http://localhost:8080 --token "$ORKA_TOKEN" -n orka-system \
+  task status code-review
 ```
 
-See [Agent Runtimes](concepts/agent-runtimes.md) for full configuration reference.
+[Agent runtimes](concepts/agent-runtimes.md) has the full configuration reference.
 
-## Optional Runtime Isolation
+## Stronger isolation
 
-If your cluster exposes Kubernetes `RuntimeClass` objects such as `gvisor` or `kata-qemu`, native `ai` and container Tasks can route worker Jobs through them with `spec.execution`. Built-in ACP agent Tasks instead use reviewed RuntimePool resource profiles.
+If your cluster has `RuntimeClass` objects such as `gvisor` or `kata-qemu`, `ai` and
+`container` Tasks can run through them via `spec.execution`. Set a default on the Agent and
+override per Task. Coding-agent Tasks use RuntimePool resource profiles instead.
+See [Configuration](reference/configuration.md#execution) and
+[Security](concepts/security.md#execution-workloads).
 
-```yaml
-apiVersion: core.orka.ai/v1alpha1
-kind: Task
-metadata:
-  name: isolated-hello
-spec:
-  type: ai
-  agentRef:
-    name: assistant
-  prompt: "Summarize the repo"
-```
-
-Use `Agent.spec.execution` for defaults, then override it per task when needed. See [Configuration](concepts/configuration.md#execution), [Agent Runtimes](concepts/agent-runtimes.md#runtime-and-credential-boundaries), and [Security](concepts/security.md#execution-workloads) for details.
-
-## Accessing the Dashboard
+## The dashboard
 
 ```bash
-# Port-forward the controller service
+# Helm names the Service after the release (svc/orka); the release
+# manifest from Option A names it svc/orka-api. Pick the one you installed.
 kubectl port-forward -n orka-system svc/orka 8080:8080
-
-# Open in browser
 open http://localhost:8080
 ```
 
-## CLI Tool
+The UI ships inside the controller binary — there is nothing extra to deploy.
+See [Web dashboard](guides/ui.md).
 
-The `orka` CLI provides browser-based authentication for the web dashboard.
+## The CLI
 
 ```bash
-# Build the CLI
 make build-cli
-
-# Login (extracts token from kubeconfig and opens browser)
-./bin/orka login
-
-# Login with custom server
+./bin/orka login                                  # reads your kubeconfig, opens a browser
 ./bin/orka login --server https://orka.example.com
-
-# Login with explicit token
-./bin/orka login --token <token>
-
-# Specify kubeconfig
-./bin/orka login --kubeconfig ~/.kube/my-config
+./bin/orka login --token '<token>'
 ```
 
-The CLI supports token extraction from bearer tokens, token files, exec-based auth (GKE, AWS IAM), and OIDC auth providers.
+It can pull a token from a bearer token, a token file, exec-based auth (GKE, AWS IAM), or
+an OIDC provider. Full command list: [CLI reference](reference/cli.md).
 
-## Next Steps
+## Next steps
 
-**Core concepts**
+**Learn the pieces**
 
-- [Architecture](concepts/architecture.md) — Controller, workers, CRDs, and task lifecycle
-- [Configuration](concepts/configuration.md) — Helm values, controller flags, and metrics
-- [Memory](concepts/memory.md) — Namespace-scoped durable memory and reviewable proposals
-- [Transaction Token Integration](concepts/transaction-tokens.md) — Request-scoped transaction-token auth
-- [Agent Sandbox Workspaces](concepts/agent-sandbox.md) / [Substrate](concepts/substrate.md) — Deferred execution-workspace providers behind the ACP v2 seam
-- [Security](concepts/security.md) — Pod hardening, authentication, and multi-tenancy
+- [Glossary](reference/glossary.md) — every term these docs assume
+- [Architecture](concepts/architecture.md) — how a Task becomes a Pod
+- [Configuration](reference/configuration.md) — Helm values and controller flags
+- [Security](concepts/security.md) — hardening, auth, and tenancy
 
-**Guides & reference**
+**Do something with it**
 
-- [Agent Runtimes](concepts/agent-runtimes.md) — ACP v2 RuntimePools, RuntimeSessions, workspace policy, and delivery
-- [Interactive Chat](guides/chat.md) — Chat endpoint with tool execution
-- [Multi-Agent Coordination](guides/multi-agent-coordination.md) — Coordinator agents and delegation
-- [OpenAI Compatibility](reference/openai-compat.md) — Use any OpenAI-compatible client via `/openai/v1/`
-- [Anthropic Compatibility](reference/anthropic-compat.md) — Use Anthropic clients (Claude Code, etc.) via `/anthropic/v1/`
-- [API Reference](reference/api-reference.md) — REST API endpoints
+- [Interactive chat](guides/chat.md) — talk to an orchestrator that creates Tasks for you
+- [Container tasks](guides/container-tasks.md) — build and test steps that actually work
+- [Multi-agent coordination](reference/multi-agent-coordination.md) — one agent delegating to several
+- [Repository monitors](guides/repository-monitors.md) — automatic PR review queues
+- [Scheduled tasks](guides/scheduled-tasks.md) — cron-driven agents
+
+**Connect your own tools**
+
+- [OpenAI-compatible API](reference/openai-compat.md) — Continue, Cursor, and similar
+- [Anthropic-compatible API](reference/anthropic-compat.md) — Claude Code and similar
+- [REST API](reference/api-reference.md)
+
+**When it breaks**
+
+- [Troubleshooting](operations/troubleshooting.md)
+- [Operations runbook](operations/runbook.md)

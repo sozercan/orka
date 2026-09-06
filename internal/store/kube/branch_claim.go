@@ -29,7 +29,7 @@ func (s *Store) CreateBranchClaimWithResult(ctx context.Context, claim *store.Br
 	if err := s.requireBranchClaimAccess(); err != nil {
 		return nil, false, err
 	}
-	normalized, normalizedFence, err := normalizeBranchClaimForCreate(claim, fence)
+	normalized, normalizedFence, err := store.NormalizeBranchClaimForCreate(claim, fence)
 	if err != nil {
 		return nil, false, err
 	}
@@ -44,7 +44,7 @@ func (s *Store) CreateBranchClaimWithResult(ctx context.Context, claim *store.Br
 			return nil, false, fenceErr
 		}
 		if fenced {
-			return nil, false, controlConflict("Session UID %q is being deleted or was already deleted", normalized.OwnerUID)
+			return nil, false, store.ConflictErrorf("Session UID %q is being deleted or was already deleted", normalized.OwnerUID)
 		}
 	}
 
@@ -115,7 +115,7 @@ func (s *Store) ReclaimBranchClaim(ctx context.Context, request store.ReclaimBra
 	if err := s.requireBranchClaimAccess(); err != nil {
 		return err
 	}
-	normalized, err := normalizeBranchClaimReclamationRequest(request)
+	normalized, err := store.NormalizeBranchClaimReclamationRequest(request)
 	if err != nil {
 		return err
 	}
@@ -134,11 +134,11 @@ func (s *Store) ReclaimBranchClaim(ctx context.Context, request store.ReclaimBra
 		return err
 	}
 	claim := branchClaimFromObject(object)
-	if branchClaimReclamationIdentityReplaced(claim, normalized) {
+	if store.BranchClaimReclamationIdentityReplaced(claim, normalized) {
 		return nil
 	}
-	if !branchClaimMatchesReclamation(claim, normalized) {
-		return controlConflict("branch claim %q no longer matches the exact Task-owner reclamation fence", claim.ID)
+	if !store.BranchClaimMatchesReclamation(claim, normalized) {
+		return store.ConflictErrorf("branch claim %q no longer matches the exact Task-owner reclamation fence", claim.ID)
 	}
 	uid := object.UID
 	resourceVersion := object.ResourceVersion
@@ -152,7 +152,7 @@ func (s *Store) ReclaimBranchClaim(ctx context.Context, request store.ReclaimBra
 	if errors.Is(getErr, store.ErrNotFound) {
 		return nil
 	}
-	if getErr == nil && branchClaimReclamationIdentityReplaced(branchClaimFromObject(fresh), normalized) {
+	if getErr == nil && store.BranchClaimReclamationIdentityReplaced(branchClaimFromObject(fresh), normalized) {
 		return nil
 	}
 	if getErr != nil {
@@ -188,15 +188,15 @@ func (s *Store) CompareAndSwapBranchClaim(ctx context.Context, change store.Bran
 	claim := branchClaimFromObject(object)
 	if claim.LastOperationID == change.OperationID {
 		if claim.LastOperationDigest != change.OperationDigest {
-			return nil, controlConflict("branch claim operation %q was reused with a different digest", change.OperationID)
+			return nil, store.ConflictErrorf("branch claim operation %q was reused with a different digest", change.OperationID)
 		}
 		if claim.Generation == change.NewGeneration && claim.LastVerified.Equal(change.NewLastVerified) && claim.Availability == change.NewAvailability && claim.BlockedReason == change.BlockedReason && claim.RelatedPublicationID == change.RelatedPublicationID {
 			return &claim, nil
 		}
-		return nil, controlConflict("branch claim operation %q was already applied with different target values", change.OperationID)
+		return nil, store.ConflictErrorf("branch claim operation %q was already applied with different target values", change.OperationID)
 	}
 	if claim.Version != change.ExpectedVersion || claim.Generation != change.ExpectedGeneration || !claim.LastVerified.Equal(change.ExpectedLastVerified) || claim.Availability != change.ExpectedAvailability {
-		return nil, controlConflict("branch claim %q no longer matches expected version, generation, baseline, or availability", claim.ID)
+		return nil, store.ConflictErrorf("branch claim %q no longer matches expected version, generation, baseline, or availability", claim.ID)
 	}
 
 	updated := object.DeepCopy()
@@ -216,7 +216,7 @@ func (s *Store) CompareAndSwapBranchClaim(ctx context.Context, change store.Bran
 
 func (s *Store) completeBranchClaimCreation(ctx context.Context, object *corev1alpha1.BranchClaim, normalized store.BranchClaim, fence store.ControllerEpochFence, snapshot epochSnapshot) (*store.BranchClaim, error) {
 	if !sameBranchClaimSpec(object, normalized) {
-		return nil, controlConflict("branch claim %q was reused with a different owner or request digest", normalized.ID)
+		return nil, store.ConflictErrorf("branch claim %q was reused with a different owner or request digest", normalized.ID)
 	}
 	if object.Status.Version > 0 {
 		existing := branchClaimFromObject(object)
@@ -256,151 +256,9 @@ func (s *Store) getBranchClaimObject(ctx context.Context, id string) (*corev1alp
 		return nil, mapKubernetesError("get branch claim", err)
 	}
 	if object.Spec.ID != id {
-		return nil, controlConflict("branch claim object %q has a different canonical ID", object.Name)
+		return nil, store.ConflictErrorf("branch claim object %q has a different canonical ID", object.Name)
 	}
 	return object, nil
-}
-
-func normalizeBranchClaimForCreate(claim *store.BranchClaim, fence store.ControllerEpochFence) (store.BranchClaim, store.ControllerEpochFence, error) {
-	if claim == nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, store.ValidationErrorf("branch claim is required")
-	}
-	normalized := *claim
-	normalized.RepositoryID = strings.TrimSpace(normalized.RepositoryID)
-	normalized.Ref = strings.TrimSpace(normalized.Ref)
-	normalized.OwnerUID = strings.TrimSpace(normalized.OwnerUID)
-	if err := store.ValidateControlIdentifier("publication repository ID", normalized.RepositoryID); err != nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, err
-	}
-	if err := store.ValidateFullBranchRef(normalized.Ref); err != nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, err
-	}
-	canonicalID, err := store.CanonicalBranchClaimID(normalized.RepositoryID, normalized.Ref)
-	if err != nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, err
-	}
-	normalized.ID = strings.TrimSpace(normalized.ID)
-	if normalized.ID == "" {
-		normalized.ID = canonicalID
-	}
-	if normalized.ID != canonicalID {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, store.ValidationErrorf("branch claim ID must equal canonical ID %q", canonicalID)
-	}
-	if normalized.OwnerKind != store.BranchClaimOwnerTask && normalized.OwnerKind != store.BranchClaimOwnerSession {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, store.ValidationErrorf("unsupported branch claim owner kind %q", normalized.OwnerKind)
-	}
-	if err := store.ValidateControlIdentifier("branch claim owner UID", normalized.OwnerUID); err != nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.Generation == 0 {
-		normalized.Generation = 1
-	}
-	if normalized.Generation != 1 {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, store.ValidationErrorf("new branch claim generation must be one")
-	}
-	if err := normalized.LastVerified.Validate("branch baseline"); err != nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.Availability == "" {
-		normalized.Availability = store.BranchClaimAvailable
-	}
-	if !isKnownBranchClaimAvailability(normalized.Availability) {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, store.ValidationErrorf("unsupported branch claim availability %q", normalized.Availability)
-	}
-	normalized.BlockedReason = strings.TrimSpace(normalized.BlockedReason)
-	normalized.RelatedPublicationID = strings.TrimSpace(normalized.RelatedPublicationID)
-	if normalized.Availability == store.BranchClaimAvailable && (normalized.BlockedReason != "" || normalized.RelatedPublicationID != "") {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, store.ValidationErrorf("available branch claim must not have block metadata")
-	}
-	if normalized.Availability == store.BranchClaimReconciliationBlocked && normalized.BlockedReason == "" {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, store.ValidationErrorf("reconciliation-blocked branch claim requires a reason")
-	}
-	if err := store.ValidateControlReason("branch claim blocked reason", normalized.BlockedReason); err != nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, err
-	}
-	if err := store.ValidateCanonicalDigest("branch claim request digest", normalized.RequestDigest); err != nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, err
-	}
-	normalizedFence, err := normalizeEpochFence(fence)
-	if err != nil {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.Version != 0 && normalized.Version != 1 {
-		return store.BranchClaim{}, store.ControllerEpochFence{}, store.ValidationErrorf("new branch claim version must be zero or one")
-	}
-	now := normalizeControlTime(normalized.CreatedAt)
-	normalized.CreatedAt = now
-	if normalized.UpdatedAt.IsZero() {
-		normalized.UpdatedAt = now
-	} else {
-		normalized.UpdatedAt = normalized.UpdatedAt.UTC()
-	}
-	normalized.ControllerEpochName = normalizedFence.Name
-	normalized.ControllerEpoch = normalizedFence.Epoch
-	normalized.Version = 1
-	normalized.LastOperationID = ""
-	normalized.LastOperationDigest = ""
-	return normalized, normalizedFence, nil
-}
-
-func normalizeBranchClaimReclamationRequest(request store.ReclaimBranchClaimRequest) (store.ReclaimBranchClaimRequest, error) {
-	request.ID = strings.TrimSpace(request.ID)
-	request.ExpectedRepositoryID = strings.TrimSpace(request.ExpectedRepositoryID)
-	request.ExpectedRef = strings.TrimSpace(request.ExpectedRef)
-	request.ExpectedOwnerUID = strings.TrimSpace(request.ExpectedOwnerUID)
-	request.ExpectedRequestDigest = strings.TrimSpace(request.ExpectedRequestDigest)
-	if err := store.ValidateControlIdentifier("branch claim ID", request.ID); err != nil {
-		return store.ReclaimBranchClaimRequest{}, err
-	}
-	if err := store.ValidateControlIdentifier("publication repository ID", request.ExpectedRepositoryID); err != nil {
-		return store.ReclaimBranchClaimRequest{}, err
-	}
-	if err := store.ValidateFullBranchRef(request.ExpectedRef); err != nil {
-		return store.ReclaimBranchClaimRequest{}, err
-	}
-	canonicalID, err := store.CanonicalBranchClaimID(request.ExpectedRepositoryID, request.ExpectedRef)
-	if err != nil {
-		return store.ReclaimBranchClaimRequest{}, err
-	}
-	if request.ID != canonicalID {
-		return store.ReclaimBranchClaimRequest{}, store.ValidationErrorf("branch claim ID must equal canonical ID %q", canonicalID)
-	}
-	if request.ExpectedOwnerKind != store.BranchClaimOwnerTask && request.ExpectedOwnerKind != store.BranchClaimOwnerSession {
-		return store.ReclaimBranchClaimRequest{}, store.ValidationErrorf("branch claim owner kind is not reclaimable")
-	}
-	if err := store.ValidateControlIdentifier("branch claim owner UID", request.ExpectedOwnerUID); err != nil {
-		return store.ReclaimBranchClaimRequest{}, err
-	}
-	if request.ExpectedVersion < 1 || request.ExpectedGeneration < 1 {
-		return store.ReclaimBranchClaimRequest{}, store.ValidationErrorf("branch claim expected version and generation must be at least 1")
-	}
-	if err := request.ExpectedLastVerified.Validate("expected branch baseline"); err != nil {
-		return store.ReclaimBranchClaimRequest{}, err
-	}
-	if request.ExpectedAvailability != store.BranchClaimAvailable {
-		return store.ReclaimBranchClaimRequest{}, store.ValidationErrorf("only available branch claims may be reclaimed")
-	}
-	if err := store.ValidateCanonicalDigest("branch claim request digest", request.ExpectedRequestDigest); err != nil {
-		return store.ReclaimBranchClaimRequest{}, err
-	}
-	normalizedFence, err := normalizeEpochFence(request.Fence)
-	if err != nil {
-		return store.ReclaimBranchClaimRequest{}, err
-	}
-	request.Fence = normalizedFence
-	return request, nil
-}
-
-func branchClaimReclamationIdentityReplaced(claim store.BranchClaim, request store.ReclaimBranchClaimRequest) bool {
-	return claim.OwnerKind != request.ExpectedOwnerKind || claim.OwnerUID != request.ExpectedOwnerUID || claim.RequestDigest != request.ExpectedRequestDigest
-}
-
-func branchClaimMatchesReclamation(claim store.BranchClaim, request store.ReclaimBranchClaimRequest) bool {
-	return claim.ID == request.ID && claim.RepositoryID == request.ExpectedRepositoryID && claim.Ref == request.ExpectedRef &&
-		claim.OwnerKind == request.ExpectedOwnerKind && claim.OwnerUID == request.ExpectedOwnerUID &&
-		claim.Generation == request.ExpectedGeneration && claim.LastVerified.Equal(request.ExpectedLastVerified) &&
-		claim.Availability == request.ExpectedAvailability && claim.BlockedReason == "" && claim.RelatedPublicationID == "" &&
-		claim.RequestDigest == request.ExpectedRequestDigest && claim.Version == request.ExpectedVersion
 }
 
 func validateBranchClaimCAS(change *store.BranchClaimCAS) error {
@@ -416,7 +274,7 @@ func validateBranchClaimCAS(change *store.BranchClaimCAS) error {
 	if err := change.NewLastVerified.Validate("new branch baseline"); err != nil {
 		return err
 	}
-	if !isKnownBranchClaimAvailability(change.ExpectedAvailability) || !isKnownBranchClaimAvailability(change.NewAvailability) {
+	if !store.IsKnownBranchClaimAvailability(change.ExpectedAvailability) || !store.IsKnownBranchClaimAvailability(change.NewAvailability) {
 		return store.ValidationErrorf("unsupported branch claim availability transition %q -> %q", change.ExpectedAvailability, change.NewAvailability)
 	}
 	change.BlockedReason = strings.TrimSpace(change.BlockedReason)
@@ -437,7 +295,7 @@ func validateBranchClaimCAS(change *store.BranchClaimCAS) error {
 	if err := store.ValidateCanonicalDigest("branch claim operation digest", change.OperationDigest); err != nil {
 		return err
 	}
-	change.UpdatedAt = normalizeControlTime(change.UpdatedAt)
+	change.UpdatedAt = store.NormalizeControlTime(change.UpdatedAt)
 	return nil
 }
 
@@ -478,8 +336,4 @@ func remoteRefToAPI(value store.RemoteRefState) corev1alpha1.ControlRemoteRefSta
 
 func remoteRefFromAPI(value corev1alpha1.ControlRemoteRefState) store.RemoteRefState {
 	return store.RemoteRefState{Absent: value.Absent, SHA: value.SHA}
-}
-
-func isKnownBranchClaimAvailability(value store.BranchClaimAvailability) bool {
-	return value == store.BranchClaimAvailable || value == store.BranchClaimReconciliationBlocked
 }

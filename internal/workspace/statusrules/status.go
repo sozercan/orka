@@ -8,7 +8,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
-	"github.com/orka-agents/orka/internal/workspace"
 )
 
 // Update is the internal worker-to-API Execution Workspace status update shape.
@@ -125,16 +124,6 @@ func IsOptionalCleanupPolicy(policy corev1alpha1.WorkspaceCleanupPolicy) bool {
 	return policy == "" || IsConcreteCleanupPolicy(policy)
 }
 
-func StatusReusePolicy(policy corev1alpha1.WorkspaceReusePolicy) (corev1alpha1.WorkspaceReusePolicy, bool) {
-	if policy == "" {
-		return corev1alpha1.WorkspaceReusePolicyNone, true
-	}
-	if IsConcreteReusePolicy(policy) {
-		return policy, true
-	}
-	return "", false
-}
-
 func StatusCleanupPolicy(policy, defaultPolicy corev1alpha1.WorkspaceCleanupPolicy) (corev1alpha1.WorkspaceCleanupPolicy, bool) {
 	if policy == "" {
 		if IsConcreteCleanupPolicy(defaultPolicy) {
@@ -179,31 +168,6 @@ func ValidationFailedStatus(failure ValidationFailure) *corev1alpha1.ExecutionWo
 		Message:       failure.Message,
 		ObservedAt:    failure.ObservedAt,
 	}.Status()
-}
-
-func ApplyReadyResult(update *Update, ready *workspace.ReadyResult) {
-	if update == nil || ready == nil {
-		return
-	}
-	if !ready.Placement.IsZero() {
-		update.Placement = &corev1alpha1.ExecutionWorkspacePlacementStatus{
-			WorkerNamespace: ready.Placement.WorkerNamespace,
-			WorkerPool:      ready.Placement.WorkerPool,
-			WorkerPodName:   ready.Placement.WorkerPodName,
-		}
-	}
-	if !ready.Density.IsZero() {
-		update.Density = &corev1alpha1.ExecutionWorkspaceDensityStatus{
-			WorkerCount:         int32(max(ready.Density.WorkerCount, 0)),
-			ActorCount:          int32(max(ready.Density.ActorCount, 0)),
-			RunningActorCount:   int32(max(ready.Density.RunningActorCount, 0)),
-			SuspendedActorCount: int32(max(ready.Density.SuspendedActorCount, 0)),
-			ActorsPerWorker:     ready.Density.ActorsPerWorker,
-		}
-	}
-	if ready.ResumeLatency > 0 {
-		update.ResumeLatency = &metav1.Duration{Duration: ready.ResumeLatency}
-	}
 }
 
 func CleanupSucceeded(status *corev1alpha1.ExecutionWorkspaceStatus) bool {

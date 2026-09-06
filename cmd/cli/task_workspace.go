@@ -453,6 +453,7 @@ func printTaskRuntimeStatusTable(cmd *cobra.Command, status map[string]any) erro
 		{"Runtime session generation", anyString(execution["runtimeSessionGeneration"])},
 		{"Delivery", anyString(delivery["state"])},
 		{"Delivery outcome", anyString(delivery["outcome"])},
+		{"Delivery message", anyString(delivery["message"])},
 		{"Publication branch", anyString(delivery["branch"])},
 		{"Verified remote", compactCLIValue(anyString(delivery["verifiedRemoteSHA"]))},
 	}

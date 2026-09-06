@@ -16,7 +16,10 @@
 
 # Cluster + namespace. Demos 10-60 read Agents/Tasks/secrets from DEMO_NAMESPACE
 # the installers). Select the unified cluster context.
-export DEMO_NAMESPACE="${DEMO_NAMESPACE:-demo-magic}"
+# The static harness-v2 controller reconciles exactly one namespace
+# (--watch-namespace, orka-system for make deploy), so demo resources default
+# to that namespace; a Task created anywhere else is never picked up.
+export DEMO_NAMESPACE="${DEMO_NAMESPACE:-orka-system}"
 # Mint the Orka API token from the SA in DEMO_NAMESPACE (orka-client exists in
 # both default and demo-magic on the unified cluster). The Anthropic/OpenAI
 # compat endpoints resolve the Provider CRD from the caller token's namespace

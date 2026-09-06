@@ -48,6 +48,10 @@ export function RuntimeCanvas() {
   const { data, isLoading, error: taskListError, refetch: refetchTasks } = useTaskListAll('100', following ? 10000 : false)
 
   const tasks = data?.items ?? []
+  // The full-list walk is bounded; beyond that the roster is a prefix and
+  // active tasks outside it are invisible, so say so instead of reporting
+  // a misleading "0 active".
+  const rosterTruncated = Boolean(data?.truncated)
   const runningTasks = tasks.filter(isLiveTask)
   // Read task-event caches populated by focused views (notably the spotlight)
   // without issuing one history request per running task. Without a backend
@@ -117,6 +121,11 @@ export function RuntimeCanvas() {
       ) : tasks.length === 0 ? (
         <Card>
           <CardContent className="flex flex-col items-center gap-4 py-12">
+            {rosterTruncated ? (
+              <p className="text-sm text-muted-foreground" role="status">
+                Task roster is truncated: only the first pages of this namespace were loaded, so active tasks may be missing.
+              </p>
+            ) : null}
             <SonarPing />
             <EmptyState
               headline={`No tasks in namespace "${namespace}"`}
@@ -126,6 +135,12 @@ export function RuntimeCanvas() {
           </CardContent>
         </Card>
       ) : (
+        <>
+          {rosterTruncated ? (
+            <p className="text-sm text-muted-foreground" role="status">
+              Task roster is truncated: only the first pages of this namespace were loaded, so active tasks may be missing.
+            </p>
+          ) : null}
         <div className="grid gap-4 lg:grid-cols-3">
           <div className="space-y-4 lg:col-span-2">
             <ActiveSpotlight task={active} following={following} />
@@ -133,6 +148,7 @@ export function RuntimeCanvas() {
           </div>
           <AgentsRoster tasks={runningTasks} activeTaskName={active?.metadata.name} latestActivity={latestActivity} />
         </div>
+        </>
       )}
     </div>
   )

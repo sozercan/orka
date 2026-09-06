@@ -52,9 +52,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
+	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
 	"github.com/orka-agents/orka/internal/events"
 	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	orkametrics "github.com/orka-agents/orka/internal/metrics"
+	storekube "github.com/orka-agents/orka/internal/store/kube"
 	"github.com/orka-agents/orka/internal/workspace"
 )
 
@@ -412,6 +414,18 @@ func (r *RuntimePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	cfg, err := r.runtimePoolConfig(pool)
+	if err != nil && acpRuntimePoolImageRequiresHistoricalRecovery(pool, r.AllowedImages) {
+		if historicalConfig, historicalErr := r.runtimePoolConfigForDrain(pool); historicalErr == nil {
+			authorized, authorizationErr := r.historicalRuntimePoolImageAuthorized(ctx, pool, historicalConfig)
+			if authorizationErr != nil {
+				return ctrl.Result{}, authorizationErr
+			}
+			if authorized {
+				cfg = historicalConfig
+				err = nil
+			}
+		}
+	}
 	if err != nil {
 		if pool.Spec.ExecutionWorkspace != nil {
 			preserveFence, preserveErr := r.workspacePoolFailureRequiresDurableStatePreservation(ctx, pool)
@@ -568,11 +582,251 @@ func (r *RuntimePoolReconciler) runtimePoolConfig(pool *corev1alpha1.RuntimePool
 	return r.runtimePoolConfigWithImageAdmission(pool, true)
 }
 
-// runtimePoolConfigForDrain reconstructs the deployed pool configuration for
-// authenticated deletion-time drain. The image must remain digest-pinned, but
-// an approved-image rotation must not strand the previously admitted workload.
+// runtimePoolConfigForDrain reconstructs the exact pool configuration without
+// applying the current-image allowlist. Callers outside deletion must first
+// prove that the historical image was authorized for this exact pool object.
 func (r *RuntimePoolReconciler) runtimePoolConfigForDrain(pool *corev1alpha1.RuntimePool) (runtimePoolConfig, error) {
 	return r.runtimePoolConfigWithImageAdmission(pool, false)
+}
+
+func (r *RuntimePoolReconciler) historicalRuntimePoolImageAuthorized(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	cfg runtimePoolConfig,
+) (bool, error) {
+	condition := meta.FindStatusCondition(pool.Status.Conditions, acpRuntimePoolImageProvenanceCondition)
+	if condition != nil && condition.Status == metav1.ConditionTrue &&
+		condition.ObservedGeneration > 0 && condition.ObservedGeneration <= pool.Generation &&
+		condition.Reason == acpRuntimePoolImageProvenanceReason {
+		// RuntimePool UID plus the CRD's immutable runtime image/profile,
+		// trust-domain, runtime-namespace, and workspace binding keep this proof
+		// attached to one exact workload identity. Controller-owned replica and
+		// capacity changes may advance generation without invalidating it.
+		return true, nil
+	}
+	if pool.Spec.ExecutionWorkspace != nil {
+		return r.backfillHistoricalWorkspaceRuntimePoolImageProvenance(ctx, pool)
+	}
+
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: cfg.namespace, Name: cfg.baseName}, deployment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for key, value := range map[string]string{
+		runtimePoolManagedByLabel: runtimePoolManagedByLabelValue,
+		runtimePoolUIDLabel:       string(pool.UID),
+		runtimePoolNameLabel:      pool.Name,
+		runtimePoolNamespaceLabel: pool.Namespace,
+	} {
+		if deployment.Labels[key] != value || deployment.Spec.Template.Labels[key] != value {
+			return false, nil
+		}
+	}
+	return historicalRuntimePoolTemplateMatches(pool, cfg, deployment.Spec.Template), nil
+}
+
+func (r *RuntimePoolReconciler) backfillHistoricalWorkspaceRuntimePoolImageProvenance(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+) (bool, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	tasks := &corev1alpha1.TaskList{}
+	if err := reader.List(ctx, tasks, client.InNamespace(pool.Namespace)); err != nil {
+		return false, fmt.Errorf("list Tasks for historical workspace RuntimePool image provenance: %w", err)
+	}
+	message := ""
+	for i := range tasks.Items {
+		if !historicalWorkspaceRuntimePoolTaskBindingMatches(&tasks.Items[i], pool) {
+			continue
+		}
+		message = "RuntimePool image and profile match an exact controller-written Task execution binding"
+		break
+	}
+	if message == "" {
+		matches, err := r.historicalWorkspaceRuntimePoolSessionLineageMatches(ctx, reader, pool)
+		if err != nil {
+			return false, err
+		}
+		if !matches {
+			return false, nil
+		}
+		message = "RuntimePool image and profile match an admitted workspace and immutable Session lineage"
+	}
+	r.setRuntimePoolCondition(
+		pool,
+		&pool.Status,
+		acpRuntimePoolImageProvenanceCondition,
+		metav1.ConditionTrue,
+		acpRuntimePoolImageProvenanceReason,
+		message,
+	)
+	return true, nil
+}
+
+func historicalWorkspaceRuntimePoolTaskBindingMatches(
+	task *corev1alpha1.Task,
+	pool *corev1alpha1.RuntimePool,
+) bool {
+	if task == nil || pool == nil || task.Namespace != pool.Namespace || task.UID == "" || pool.UID == "" {
+		return false
+	}
+	execution := task.Status.Execution
+	binding := task.Status.AgentExecutionBinding
+	if execution == nil || binding == nil ||
+		strings.TrimSpace(execution.RuntimePoolName) != pool.Name ||
+		strings.TrimSpace(execution.RuntimePoolUID) != string(pool.UID) ||
+		binding.SchemaVersion != 1 ||
+		binding.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 ||
+		binding.Backend != corev1alpha1.AgentExecutionBackendRuntimePool ||
+		binding.Task.UID != task.UID || binding.Task.BoundSpecGeneration != task.Generation ||
+		binding.RuntimeType != corev1alpha1.AgentRuntimeType(pool.Spec.Runtime.Profile.ProviderKind) ||
+		binding.RuntimeProfileDigest != pool.Spec.Runtime.Profile.Digest ||
+		binding.RuntimeProfileDigestSchemaVersion != 1 {
+		return false
+	}
+	canonicalDigest, err := canonicalAgentExecutionBindingDigest(*binding)
+	return err == nil && canonicalDigest == binding.BindingDigest
+}
+
+func (r *RuntimePoolReconciler) historicalWorkspaceRuntimePoolSessionLineageMatches(
+	ctx context.Context,
+	reader client.Reader,
+	pool *corev1alpha1.RuntimePool,
+) (bool, error) {
+	// Session workspaces may outlive every Task that used them. The core
+	// admission marker and condition prove the linked workspace was admitted by
+	// Orka, while the immutable Session UID, deterministic pool name, and
+	// append-once lineage digest bind that workspace to this historical runtime
+	// image, profile, and workspace configuration.
+	sessionName, sessionUID, matched, err := historicalWorkspaceRuntimePoolSessionIdentity(ctx, reader, pool)
+	if err != nil || !matched {
+		return false, err
+	}
+	return historicalWorkspaceRuntimePoolSessionControlMatches(ctx, reader, pool, sessionName, sessionUID)
+}
+
+func historicalWorkspaceRuntimePoolSessionIdentity(
+	ctx context.Context,
+	reader client.Reader,
+	pool *corev1alpha1.RuntimePool,
+) (string, string, bool, error) {
+	workspaceName := strings.TrimSpace(pool.Labels[acpExecutionWorkspaceLinkLabel])
+	workspaceUID := strings.TrimSpace(pool.Annotations[acpExecutionWorkspaceUIDAnnotation])
+	if workspaceName == "" || workspaceUID == "" || pool.Spec.ExecutionWorkspace == nil {
+		return "", "", false, nil
+	}
+	linkedWorkspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: workspaceName}, linkedWorkspace); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", "", false, nil
+		}
+		return "", "", false, fmt.Errorf("read linked ExecutionWorkspace for historical RuntimePool image provenance: %w", err)
+	}
+	if linkedWorkspace.UID == "" || string(linkedWorkspace.UID) != workspaceUID ||
+		linkedWorkspace.Labels[workspacev1alpha1.ProviderControllerLabel] != acpWorkspaceControllerLabelValue ||
+		linkedWorkspace.Annotations[acpExecutionWorkspacePoolAnnotation] != pool.Name ||
+		linkedWorkspace.Annotations[acpWorkspaceBackendAnnotation] != string(pool.Spec.ExecutionWorkspace.Provider) ||
+		linkedWorkspace.Spec.Mode != workspacev1alpha1.ExecutionWorkspaceModeInteractive ||
+		linkedWorkspace.Spec.SessionRef == nil || !workspaceHasCoreAdmissionEvidence(linkedWorkspace) {
+		return "", "", false, nil
+	}
+	sessionName := strings.TrimSpace(linkedWorkspace.Spec.SessionRef.Name)
+	sessionUID := strings.TrimSpace(string(linkedWorkspace.Spec.SessionRef.UID))
+	workspaceSlot := strings.TrimSpace(linkedWorkspace.Spec.Slot)
+	if workspaceSlot == "" {
+		workspaceSlot = defaultWorkspaceSlotName
+	}
+	if sessionName == "" || sessionUID == "" {
+		return "", "", false, nil
+	}
+	poolIdentity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+		acpWorkspaceSessionUIDMapKey: sessionUID,
+		acpWorkspaceSlotMapKey:       workspaceSlot,
+	})
+	if err != nil {
+		return "", "", false, err
+	}
+	matched := pool.Name == acpWorkspaceRuntimePoolName("session", harnessv2.ProfileDigest(poolIdentity))
+	return sessionName, sessionUID, matched, nil
+}
+
+func historicalWorkspaceRuntimePoolSessionControlMatches(
+	ctx context.Context,
+	reader client.Reader,
+	pool *corev1alpha1.RuntimePool,
+	sessionName string,
+	sessionUID string,
+) (bool, error) {
+	sessionControl := &corev1alpha1.RuntimeSessionControl{}
+	controlKey := types.NamespacedName{
+		Namespace: pool.Namespace,
+		Name:      storekube.RuntimeSessionControlObjectName(sessionName),
+	}
+	if err := reader.Get(ctx, controlKey, sessionControl); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read RuntimeSessionControl for historical RuntimePool image provenance: %w", err)
+	}
+	lineage := sessionControl.Status.Lineage
+	if sessionControl.Spec.SessionName != sessionName || sessionControl.Spec.SessionUID != sessionUID ||
+		sessionControl.Spec.Owner.Kind != "Session" || sessionControl.Spec.Owner.UID != sessionUID ||
+		sessionControl.Status.Version < 1 || lineage == nil || lineage.SessionUID != sessionUID || lineage.Generation < 1 ||
+		lineage.ContractVersion != corev1alpha1.AgentRuntimeContractHarnessV2 ||
+		lineage.RuntimeIdentity != pool.Spec.Runtime.Profile.ProviderKind || lineage.EstablishedAt.IsZero() {
+		return false, nil
+	}
+	if ref := strings.TrimSpace(sessionControl.Spec.RuntimePoolRef); ref != "" && ref != pool.Name {
+		return false, nil
+	}
+	if uid := strings.TrimSpace(sessionControl.Spec.RuntimePoolUID); uid != "" && uid != string(pool.UID) {
+		return false, nil
+	}
+	if digest := strings.TrimSpace(sessionControl.Spec.RuntimeProfileDigest); digest != "" && digest != pool.Spec.Runtime.Profile.Digest {
+		return false, nil
+	}
+
+	namespace := &corev1.Namespace{}
+	if err := reader.Get(ctx, types.NamespacedName{Name: pool.Namespace}, namespace); err != nil {
+		return false, fmt.Errorf("read namespace identity for historical RuntimePool image provenance: %w", err)
+	}
+	if namespace.UID == "" || lineage.NamespaceUID != namespace.UID {
+		return false, nil
+	}
+	expectedLineage, err := acpSessionLineageConfigurationDigest(
+		pool.Spec.Runtime.Profile.Digest,
+		pool.Spec.Runtime.Image,
+		pool.Spec.ExecutionWorkspace.BindingDigest,
+	)
+	if err != nil {
+		return false, err
+	}
+	return lineage.ConfigDigest == expectedLineage, nil
+}
+
+func historicalRuntimePoolTemplateMatches(
+	pool *corev1alpha1.RuntimePool,
+	cfg runtimePoolConfig,
+	template corev1.PodTemplateSpec,
+) bool {
+	if pool == nil || len(template.Spec.Containers) != 1 ||
+		template.Spec.Containers[0].Image != pool.Spec.Runtime.Image {
+		return false
+	}
+	deployedPool, deployedConfig, err := runtimePoolValidationTargetFromTemplate(pool, template)
+	if err != nil {
+		return false
+	}
+	return deployedPool.Generation <= pool.Generation &&
+		deployedPool.Spec.Runtime.Profile.Digest == pool.Spec.Runtime.Profile.Digest &&
+		deployedConfig.protocol == cfg.protocol &&
+		reflect.DeepEqual(deployedConfig.profile, cfg.profile)
 }
 
 func (r *RuntimePoolReconciler) runtimePoolConfigWithImageAdmission(
@@ -660,16 +914,9 @@ func (r *RuntimePoolReconciler) validateRuntimePoolImage(pool *corev1alpha1.Runt
 		return err
 	}
 	image := strings.TrimSpace(pool.Spec.Runtime.Image)
-	allowedImage := ""
-	switch strings.TrimSpace(pool.Spec.Runtime.Profile.ProviderKind) {
-	case runtimePoolProviderCodex:
-		allowedImage = strings.TrimSpace(r.AllowedImages.Codex)
-	case runtimePoolProviderClaude:
-		allowedImage = strings.TrimSpace(r.AllowedImages.Claude)
-	case runtimePoolProviderCopilot:
-		allowedImage = strings.TrimSpace(r.AllowedImages.Copilot)
-	case runtimePoolProviderOpencode:
-		allowedImage = strings.TrimSpace(r.AllowedImages.Opencode)
+	allowedImage, err := configuredACPRuntimeImage(pool.Spec.Runtime.Profile.ProviderKind, r.AllowedImages)
+	if err != nil {
+		return err
 	}
 	if allowedImage == "" || image != allowedImage {
 		return fmt.Errorf("spec.runtime.image is not the controller-approved image for provider %q", pool.Spec.Runtime.Profile.ProviderKind)
@@ -3139,6 +3386,10 @@ func (r *RuntimePoolReconciler) finishRuntimePoolResourceFailure(
 	return r.finishRuntimePoolStatus(ctx, pool, status, runtimePoolRequeue)
 }
 
+// runtimePoolConflictRequeue is how soon a reconcile that lost the status
+// optimistic lock re-reads the pool.
+const runtimePoolConflictRequeue = time.Second
+
 func (r *RuntimePoolReconciler) finishRuntimePoolStatus(
 	ctx context.Context,
 	pool *corev1alpha1.RuntimePool,
@@ -3155,6 +3406,12 @@ func (r *RuntimePoolReconciler) finishRuntimePoolStatus(
 	base := pool.DeepCopy()
 	pool.Status = status
 	if err := r.Status().Patch(ctx, pool, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		if apierrors.IsConflict(err) {
+			// Another writer (the drain, session, or supervisor probe path)
+			// advanced the pool first; recompute from the fresh object instead
+			// of surfacing the optimistic-lock miss as a reconcile error.
+			return ctrl.Result{RequeueAfter: runtimePoolConflictRequeue}, nil
+		}
 		return ctrl.Result{}, err
 	}
 	recordRuntimePoolMetrics(pool, status)

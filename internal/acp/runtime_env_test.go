@@ -74,7 +74,7 @@ func TestBuildChildEnvironmentStartsFromEmptyAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	values := EnvironmentMap(env)
+	values := environmentMap(env)
 	if _, ok := values["SUPERVISOR_SECRET"]; ok {
 		t.Fatal("ambient supervisor environment leaked")
 	}
@@ -211,12 +211,6 @@ func TestUIDAllocatorPersistsHighWaterBeforeReturningIdentity(t *testing.T) {
 	}
 	if failing.Remaining() != failing.Capacity() {
 		t.Fatalf("failed persistence consumed capacity: remaining=%d capacity=%d", failing.Remaining(), failing.Capacity())
-	}
-}
-
-func TestSessionIdentityLabel(t *testing.T) {
-	if got := SessionIdentityLabel(42, 7); got != "uid-42-g7" {
-		t.Fatalf("label = %q", got)
 	}
 }
 
@@ -365,4 +359,15 @@ func TestSameDurableWorkspaceIdentity(t *testing.T) {
 			t.Fatalf("SameDurableWorkspaceIdentity(%q, %q) = %v, want %v", tc.first, tc.second, got, tc.want)
 		}
 	}
+}
+
+func environmentMap(env []string) map[string]string {
+	result := make(map[string]string, len(env))
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			result[name] = value
+		}
+	}
+	return result
 }

@@ -529,6 +529,91 @@ func harnessProfileForTest() harnessv2.RuntimeProfile {
 	}
 }
 
+func TestCurrentACPRuntimeDeliveryPlanRequiresCompatibleAdapters(t *testing.T) {
+	oldImage := "docker.io/example/codex@sha256:" + strings.Repeat("a", 64)
+	newImage := "docker.io/example/codex@sha256:" + strings.Repeat("b", 64)
+	buildPlan := func(profile harnessv2.RuntimeProfile) ACPRuntimePlan {
+		t.Helper()
+		digest, err := harnessv2.CanonicalProfileDigest(profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+			"profileDigest": string(digest), "runtimeImage": oldImage,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ACPRuntimePlan{
+			PoolName: acpRuntimePoolName(profile.ProviderKind, harnessv2.ProfileDigest(identity)),
+			Image:    oldImage, Profile: profile, Digest: digest,
+		}
+	}
+
+	compatibleProfile := harnessProfileForTest()
+	compatibleProfile.AdapterDigests = acp.BuiltInRuntimeAdapterDigests(compatibleProfile.ProviderKind)
+	compatible := buildPlan(compatibleProfile)
+	rotatedSelection, err := currentACPRuntimeDeliveryPlan(compatible, ACPRuntimeImages{Codex: newImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := rotatedSelection.plan
+	if !rotatedSelection.allowPoolCreation {
+		t.Fatal("compatible plain-pool image rotation unexpectedly forbids pool creation")
+	}
+	if rotated.Image != newImage || rotated.PoolName == compatible.PoolName || rotated.Digest != compatible.Digest {
+		t.Fatalf("compatible image rotation = %#v, want new image/pool with frozen profile digest %q", rotated, compatible.Digest)
+	}
+
+	incompatibleProfile := compatibleProfile
+	incompatibleProfile.AdapterDigests = cloneMap(compatibleProfile.AdapterDigests)
+	incompatibleProfile.AdapterDigests["codex-acp"] = "sha256:" + strings.Repeat("9", 64)
+	incompatible := buildPlan(incompatibleProfile)
+	if _, err := currentACPRuntimeDeliveryPlan(incompatible, ACPRuntimeImages{Codex: newImage}); err == nil ||
+		!strings.Contains(err.Error(), "do not match the frozen runtime profile") {
+		t.Fatalf("incompatible adapter rotation error = %v, want frozen-profile rejection", err)
+	}
+	if _, err := currentACPRuntimeDeliveryPlan(compatible, ACPRuntimeImages{}); err == nil ||
+		!strings.Contains(err.Error(), "configured digest-pinned image") {
+		t.Fatalf("missing approved image error = %v, want configured-image rejection", err)
+	}
+
+	workspace := compatible
+	workspace.PoolName = "acp-ws-codex-0123456789abcdef"
+	workspace.Workspace = &ACPRuntimeWorkspaceBinding{
+		Provider:      corev1alpha1.WorkspaceProviderAgentSandbox,
+		BindingDigest: "sha256:" + strings.Repeat("c", 64),
+	}
+	currentWorkspace, err := currentACPRuntimeDeliveryPlan(workspace, ACPRuntimeImages{Codex: oldImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !currentWorkspace.allowPoolCreation || !reflect.DeepEqual(currentWorkspace.plan, workspace) {
+		t.Fatalf("current workspace delivery = %#v, want frozen plan with creation allowed", currentWorkspace)
+	}
+	retiredWorkspace, err := currentACPRuntimeDeliveryPlan(workspace, ACPRuntimeImages{Codex: newImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retiredWorkspace.allowPoolCreation || !reflect.DeepEqual(retiredWorkspace.plan, workspace) {
+		t.Fatalf("retired workspace delivery = %#v, want frozen plan with creation forbidden", retiredWorkspace)
+	}
+	removedWorkspace, err := currentACPRuntimeDeliveryPlan(workspace, ACPRuntimeImages{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removedWorkspace.allowPoolCreation || !reflect.DeepEqual(removedWorkspace.plan, workspace) {
+		t.Fatalf("removed workspace delivery = %#v, want exact-pool-only frozen plan", removedWorkspace)
+	}
+	incompatibleWorkspace := incompatible
+	incompatibleWorkspace.PoolName = workspace.PoolName
+	incompatibleWorkspace.Workspace = workspace.Workspace
+	if _, err := currentACPRuntimeDeliveryPlan(incompatibleWorkspace, ACPRuntimeImages{Codex: newImage}); err == nil ||
+		!strings.Contains(err.Error(), "do not match the frozen runtime profile") {
+		t.Fatalf("incompatible workspace adapter error = %v, want frozen-profile rejection", err)
+	}
+}
+
 func TestPlanACPRuntimePoolIdentityRotatesWithImageDigest(t *testing.T) {
 	task := &corev1alpha1.Task{Spec: corev1alpha1.TaskSpec{Type: corev1alpha1.TaskTypeAgent}}
 	agent := &corev1alpha1.Agent{

@@ -112,7 +112,7 @@ type RepositoryMonitorSpec struct {
 	// +optional
 	Policy RepositoryMonitorPolicySpec `json:"policy,omitempty"`
 
-	// Validation configures deterministic validation commands for repair.
+	// Validation configures isolated validation for pull request reviews.
 	// +optional
 	Validation RepositoryMonitorValidationSpec `json:"validation,omitempty"`
 }
@@ -457,10 +457,6 @@ type RepositoryMonitorReviewPublishInlineSpec struct {
 	// +kubebuilder:validation:Maximum=50
 	// +optional
 	MaxComments *int32 `json:"maxComments,omitempty"`
-
-	// OnlyChangedLines restricts inline comments to RIGHT-side changed lines. V1 treats this as true.
-	// +optional
-	OnlyChangedLines *bool `json:"onlyChangedLines,omitempty"`
 }
 
 // RepositoryMonitorRepairSpec configures bounded repair behavior.
@@ -468,11 +464,6 @@ type RepositoryMonitorRepairSpec struct {
 	// Enabled enables repair jobs.
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
-
-	// RequireMaintainerOptIn requires an explicit maintainer command or label.
-	// +kubebuilder:default=true
-	// +optional
-	RequireMaintainerOptIn *bool `json:"requireMaintainerOptIn,omitempty"`
 
 	// MaxRepairsPerPR bounds total automated repairs per PR.
 	// +kubebuilder:validation:Minimum=0
@@ -488,11 +479,6 @@ type RepositoryMonitorRepairSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	MaxValidationRetries *int32 `json:"maxValidationRetries,omitempty"`
-
-	// MaxReviewFixRetries bounds review-fix loop retries.
-	// +kubebuilder:validation:Minimum=0
-	// +optional
-	MaxReviewFixRetries *int32 `json:"maxReviewFixRetries,omitempty"`
 }
 
 // RepositoryMonitorAutomergeSpec configures automerge behavior.
@@ -500,11 +486,6 @@ type RepositoryMonitorAutomergeSpec struct {
 	// Enabled enables automerge jobs.
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
-
-	// RequireMaintainerOptIn requires explicit maintainer opt-in.
-	// +kubebuilder:default=true
-	// +optional
-	RequireMaintainerOptIn *bool `json:"requireMaintainerOptIn,omitempty"`
 
 	// RequireGlobalMergeGate requires the controller-wide merge gate.
 	// +kubebuilder:default=true
@@ -530,14 +511,6 @@ type RepositoryMonitorPolicySpec struct {
 	// +optional
 	PauseLabels []string `json:"pauseLabels,omitempty"`
 
-	// OptInLabels names labels that opt a PR into repair or automerge.
-	// +optional
-	OptInLabels RepositoryMonitorOptInLabels `json:"optInLabels,omitempty"`
-
-	// AdvisoryLabels controls advisory label synchronization.
-	// +optional
-	AdvisoryLabels RepositoryMonitorAdvisoryLabels `json:"advisoryLabels,omitempty"`
-
 	// AllowedRepositoryPermissions lists GitHub permissions allowed to issue write commands.
 	// +kubebuilder:validation:items:Enum=admin;maintain;write
 	// +listType=set
@@ -545,33 +518,26 @@ type RepositoryMonitorPolicySpec struct {
 	AllowedRepositoryPermissions []string `json:"allowedRepositoryPermissions,omitempty"`
 }
 
-// RepositoryMonitorOptInLabels configures opt-in label names.
-type RepositoryMonitorOptInLabels struct {
-	// Autofix opts a PR into autofix.
-	// +optional
-	Autofix string `json:"autofix,omitempty"`
-
-	// Automerge opts a PR into automerge.
-	// +optional
-	Automerge string `json:"automerge,omitempty"`
-}
-
-// RepositoryMonitorAdvisoryLabels controls advisory label sync.
-type RepositoryMonitorAdvisoryLabels struct {
-	// Enabled enables advisory label sync.
-	// +optional
-	Enabled bool `json:"enabled,omitempty"`
-}
-
-// RepositoryMonitorValidationSpec configures deterministic validation.
+// RepositoryMonitorValidationSpec configures isolated validation.
 type RepositoryMonitorValidationSpec struct {
-	// Mode selects validation scope.
+	// Image is the digest-pinned repository-specific container image used for validation.
+	// The reviewer chooses the validation command from the checked-out code.
+	// The image must contain /bin/sh and every tool the repository expects the
+	// reviewer to run.
+	// +kubebuilder:validation:MaxLength=2048
+	// +kubebuilder:validation:Pattern=`^[^\s@]+@sha256:[a-f0-9]{64}$`
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Mode is retained only so upgraded clusters preserve the legacy field.
+	// Deprecated: validation scope is selected by the reviewer from repository evidence.
 	// +kubebuilder:validation:Enum=off;changed;full
-	// +kubebuilder:default=changed
 	// +optional
 	Mode string `json:"mode,omitempty"`
 
-	// Commands are validation commands repair jobs must run.
+	// Commands is retained only so upgraded clusters can detect and reject legacy
+	// validation policies instead of silently treating them as disabled.
+	// Deprecated: configure a digest-pinned image and let the reviewer select one command.
 	// +optional
 	Commands []string `json:"commands,omitempty"`
 }

@@ -59,16 +59,16 @@ func (s *Store) CreateSessionControl(ctx context.Context, control *store.Session
 	if pending, pendingErr := s.sessionCleanupPending(ctx, normalized.Namespace, normalized.SessionName); pendingErr != nil {
 		return nil, pendingErr
 	} else if pending {
-		return nil, controlConflict("session %s/%s is being deleted", normalized.Namespace, normalized.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s is being deleted", normalized.Namespace, normalized.SessionName)
 	}
 	if fenced, fenceErr := s.sessionCleanupFencedForUID(ctx, normalized.SessionUID); fenceErr != nil {
 		return nil, fenceErr
 	} else if fenced {
-		return nil, controlConflict("Session UID %q is being deleted or was already deleted", normalized.SessionUID)
+		return nil, store.ConflictErrorf("Session UID %q is being deleted or was already deleted", normalized.SessionUID)
 	}
 	if existingByUID, getErr := s.findSessionControlByUID(ctx, normalized.SessionUID); getErr == nil {
 		if existingByUID.Namespace != normalized.Namespace || existingByUID.Spec.SessionName != normalized.SessionName {
-			return nil, controlConflict("Session UID %q is already owned by %s/%s", normalized.SessionUID, existingByUID.Namespace, existingByUID.Spec.SessionName)
+			return nil, store.ConflictErrorf("Session UID %q is already owned by %s/%s", normalized.SessionUID, existingByUID.Namespace, existingByUID.Spec.SessionName)
 		}
 		return s.completeSessionControlCreation(ctx, existingByUID, normalized, normalizedFence, snapshot)
 	} else if !errors.Is(getErr, store.ErrNotFound) {
@@ -138,7 +138,7 @@ func (s *Store) GetSessionControl(ctx context.Context, namespace, sessionName st
 		return nil, mapKubernetesError("get runtime session control", err)
 	}
 	if object.Spec.SessionName != sessionName {
-		return nil, controlConflict("runtime session control %s/%s has a different immutable Session name", namespace, object.Name)
+		return nil, store.ConflictErrorf("runtime session control %s/%s has a different immutable Session name", namespace, object.Name)
 	}
 	result := sessionControlFromObject(object)
 	return &result, nil
@@ -160,7 +160,7 @@ func (s *Store) AcquireSessionMutationLease(ctx context.Context, request store.A
 	if pending, pendingErr := s.sessionCleanupPending(ctx, request.Namespace, request.SessionName); pendingErr != nil {
 		return nil, pendingErr
 	} else if pending {
-		return nil, controlConflict("session %s/%s is being deleted", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s is being deleted", request.Namespace, request.SessionName)
 	}
 
 	object, err := s.getSessionControlObject(ctx, request.Namespace, request.SessionName)
@@ -169,14 +169,14 @@ func (s *Store) AcquireSessionMutationLease(ctx context.Context, request store.A
 	}
 	control := sessionControlFromObject(object)
 	if control.SessionUID != request.SessionUID {
-		return nil, controlConflict("session %s/%s UID does not match immutable control record", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s UID does not match immutable control record", request.Namespace, request.SessionName)
 	}
 	if _, err := resolveSessionLineage(control.Lineage, *request.Lineage, request.AcquiredAt); err != nil {
 		return nil, err
 	}
 	if control.Lease != nil && control.Lease.TaskUID == request.TaskUID && control.Lease.Attempt == request.Attempt && control.Lease.PromptID == request.PromptID {
 		if control.Lease.RequestDigest != request.RequestDigest {
-			return nil, controlConflict("session lease identity was reused with a different request digest")
+			return nil, store.ConflictErrorf("session lease identity was reused with a different request digest")
 		}
 		if err := s.verifyMirroredSessionLease(ctx, object, *control.Lease); err != nil {
 			return nil, err
@@ -184,13 +184,13 @@ func (s *Store) AcquireSessionMutationLease(ctx context.Context, request store.A
 		return s.completeExistingSessionLineage(ctx, object, control, request, fence, snapshot)
 	}
 	if control.Version != request.ExpectedVersion || control.LeaseGeneration != request.ExpectedLeaseGeneration {
-		return nil, controlConflict("session %s/%s is version %d lease generation %d, expected version %d generation %d", request.Namespace, request.SessionName, control.Version, control.LeaseGeneration, request.ExpectedVersion, request.ExpectedLeaseGeneration)
+		return nil, store.ConflictErrorf("session %s/%s is version %d lease generation %d, expected version %d generation %d", request.Namespace, request.SessionName, control.Version, control.LeaseGeneration, request.ExpectedVersion, request.ExpectedLeaseGeneration)
 	}
 	if control.Availability != store.SessionAvailable {
-		return nil, controlConflict("session %s/%s is reconciliation-blocked: %s", request.Namespace, request.SessionName, control.BlockedReason)
+		return nil, store.ConflictErrorf("session %s/%s is reconciliation-blocked: %s", request.Namespace, request.SessionName, control.BlockedReason)
 	}
 	if control.Lease != nil {
-		return nil, controlConflict("session %s/%s is already leased by task %s", request.Namespace, request.SessionName, control.Lease.TaskUID)
+		return nil, store.ConflictErrorf("session %s/%s is already leased by task %s", request.Namespace, request.SessionName, control.Lease.TaskUID)
 	}
 
 	lease, leaseState, err := s.getSessionLease(ctx, object.Namespace, object.Spec.SessionName, object.Spec.SessionUID)
@@ -205,10 +205,10 @@ func (s *Store) AcquireSessionMutationLease(ctx context.Context, request store.A
 		if sameSessionMutationLease(leaseState, request) && leaseState.Generation == request.ExpectedLeaseGeneration+1 {
 			return s.completeSessionLeaseStatus(ctx, object, control, request, fence, snapshot, lease)
 		}
-		return nil, controlConflict("session %s/%s coordination Lease is already held", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s coordination Lease is already held", request.Namespace, request.SessionName)
 	}
 	if leaseState.Generation != request.ExpectedLeaseGeneration {
-		return nil, controlConflict("session %s/%s Lease generation %d does not match expected %d", request.Namespace, request.SessionName, leaseState.Generation, request.ExpectedLeaseGeneration)
+		return nil, store.ConflictErrorf("session %s/%s Lease generation %d does not match expected %d", request.Namespace, request.SessionName, leaseState.Generation, request.ExpectedLeaseGeneration)
 	}
 
 	updatedLease := lease.DeepCopy()
@@ -245,7 +245,7 @@ func (s *Store) CommitSessionRuntimeGeneration(ctx context.Context, request stor
 		return nil, err
 	}
 	defer s.releaseControllerEpochMutation(snapshot)
-	committedAt := normalizeControlTime(request.CommittedAt)
+	committedAt := store.NormalizeControlTime(request.CommittedAt)
 
 	object, err := s.getSessionControlObject(ctx, request.Namespace, request.SessionName)
 	if err != nil {
@@ -254,19 +254,19 @@ func (s *Store) CommitSessionRuntimeGeneration(ctx context.Context, request stor
 	control := sessionControlFromObject(object)
 	if control.SessionUID != request.SessionUID || control.Availability != store.SessionAvailable ||
 		!sessionLeaseMatchesKey(control.Lease, request.Key) {
-		return nil, controlConflict("session %s/%s no longer matches the active RuntimeSession generation commit fence", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s no longer matches the active RuntimeSession generation commit fence", request.Namespace, request.SessionName)
 	}
 	if err := s.verifyMirroredSessionLease(ctx, object, *control.Lease); err != nil {
 		return nil, err
 	}
 	if control.RuntimeSessionGeneration > request.Generation {
-		return nil, controlConflict("session %s/%s RuntimeSession generation is %d, not %d", request.Namespace, request.SessionName, control.RuntimeSessionGeneration, request.Generation)
+		return nil, store.ConflictErrorf("session %s/%s RuntimeSession generation is %d, not %d", request.Namespace, request.SessionName, control.RuntimeSessionGeneration, request.Generation)
 	}
 	if control.RuntimeSessionGeneration == request.Generation {
 		return &control, nil
 	}
 	if control.Version != request.ExpectedSessionVersion {
-		return nil, controlConflict("session %s/%s is version %d, expected %d", request.Namespace, request.SessionName, control.Version, request.ExpectedSessionVersion)
+		return nil, store.ConflictErrorf("session %s/%s is version %d, expected %d", request.Namespace, request.SessionName, control.Version, request.ExpectedSessionVersion)
 	}
 
 	updated := object.DeepCopy()
@@ -305,7 +305,7 @@ func (s *Store) ReleaseSessionMutationLease(ctx context.Context, request store.R
 	if pending, pendingErr := s.sessionCleanupPending(ctx, request.Namespace, request.SessionName); pendingErr != nil {
 		return nil, pendingErr
 	} else if pending {
-		return nil, controlConflict("session %s/%s is being deleted", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s is being deleted", request.Namespace, request.SessionName)
 	}
 
 	object, err := s.getSessionControlObject(ctx, request.Namespace, request.SessionName)
@@ -314,15 +314,15 @@ func (s *Store) ReleaseSessionMutationLease(ctx context.Context, request store.R
 	}
 	control := sessionControlFromObject(object)
 	if control.SessionUID != request.SessionUID {
-		return nil, controlConflict("session %s/%s UID does not match immutable control record", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s UID does not match immutable control record", request.Namespace, request.SessionName)
 	}
 	if control.LastOperationID == request.OperationID {
 		if control.LastOperationDigest != request.OperationDigest || control.Lease != nil {
-			return nil, controlConflict("session lease release operation %q was already applied with different target values", request.OperationID)
+			return nil, store.ConflictErrorf("session lease release operation %q was already applied with different target values", request.OperationID)
 		}
 	} else {
 		if control.Version != request.ExpectedSessionVersion || !sessionLeaseMatchesKey(control.Lease, request.Key) || control.Lease.RequestDigest != request.LeaseRequestDigest {
-			return nil, controlConflict("session %s/%s no longer matches the pre-prompt lease release fence", request.Namespace, request.SessionName)
+			return nil, store.ConflictErrorf("session %s/%s no longer matches the pre-prompt lease release fence", request.Namespace, request.SessionName)
 		}
 		if err := s.verifyMirroredSessionLease(ctx, object, *control.Lease); err != nil {
 			return nil, err
@@ -352,11 +352,11 @@ func (s *Store) finishPendingPrePromptLeaseRelease(ctx context.Context, control 
 	}
 	turnID, err := key.CanonicalID()
 	if err != nil || control.LastOperationID != prePromptLeaseReleasePrefix+turnID || state.Mode != leaseModeMutation {
-		return nil, sessionLeaseState{}, controlConflict("pending pre-prompt Session lease release does not match the authoritative Lease")
+		return nil, sessionLeaseState{}, store.ConflictErrorf("pending pre-prompt Session lease release does not match the authoritative Lease")
 	}
 	expectedDigest, err := store.SessionLeaseReleaseOperationDigest(turnID, state.RequestDigest)
 	if err != nil || control.LastOperationDigest != expectedDigest {
-		return nil, sessionLeaseState{}, controlConflict("pending pre-prompt Session lease release digest does not match the authoritative Lease")
+		return nil, sessionLeaseState{}, store.ConflictErrorf("pending pre-prompt Session lease release digest does not match the authoritative Lease")
 	}
 	updated := lease.DeepCopy()
 	clearSessionLease(updated, state.Generation)
@@ -384,7 +384,7 @@ func (s *Store) ReconcileSessionControl(ctx context.Context, request store.Recon
 	if pending, pendingErr := s.sessionCleanupPending(ctx, request.Namespace, request.SessionName); pendingErr != nil {
 		return nil, pendingErr
 	} else if pending {
-		return nil, controlConflict("session %s/%s is being deleted", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s is being deleted", request.Namespace, request.SessionName)
 	}
 
 	object, err := s.getSessionControlObject(ctx, request.Namespace, request.SessionName)
@@ -423,10 +423,10 @@ func sessionReconciliationAlreadyCommitted(control store.SessionControl, request
 		return false, nil
 	}
 	if control.LastOperationDigest != request.OperationDigest {
-		return false, controlConflict("session reconciliation operation %q was reused with a different digest", request.OperationID)
+		return false, store.ConflictErrorf("session reconciliation operation %q was reused with a different digest", request.OperationID)
 	}
 	if control.Availability != store.SessionAvailable || control.Lease != nil || control.VerifiedBaseline == nil || !reflect.DeepEqual(*control.VerifiedBaseline, request.VerifiedBaseline) {
-		return false, controlConflict("session reconciliation operation %q was already applied with different target values", request.OperationID)
+		return false, store.ConflictErrorf("session reconciliation operation %q was already applied with different target values", request.OperationID)
 	}
 	return true, nil
 }
@@ -436,7 +436,7 @@ func validateBlockedSessionReconciliationFence(control store.SessionControl, req
 		control.LeaseGeneration != request.ExpectedLeaseGeneration || control.Lease != nil ||
 		control.Availability != store.SessionReconciliationBlocked ||
 		control.RelatedPublicationID != request.ExpectedRelatedPublicationID {
-		return controlConflict("session %s/%s no longer matches the blocked reconciliation fence", request.Namespace, request.SessionName)
+		return store.ConflictErrorf("session %s/%s no longer matches the blocked reconciliation fence", request.Namespace, request.SessionName)
 	}
 	return nil
 }
@@ -457,7 +457,7 @@ func (s *Store) acquireSessionReconciliationLease(ctx context.Context, object *c
 		return err
 	}
 	if leaseState.Generation != request.ExpectedLeaseGeneration {
-		return controlConflict("session reconciliation Lease generation no longer matches")
+		return store.ConflictErrorf("session reconciliation Lease generation no longer matches")
 	}
 	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
 		updatedLease := lease.DeepCopy()
@@ -468,7 +468,7 @@ func (s *Store) acquireSessionReconciliationLease(ctx context.Context, object *c
 		return nil
 	}
 	if leaseState.Mode != leaseModeReconciliation || leaseState.OperationID != request.OperationID || leaseState.OperationHash != request.OperationDigest {
-		return controlConflict("session %s/%s coordination Lease is held by another operation", request.Namespace, request.SessionName)
+		return store.ConflictErrorf("session %s/%s coordination Lease is held by another operation", request.Namespace, request.SessionName)
 	}
 	return nil
 }
@@ -504,7 +504,7 @@ func (s *Store) commitSessionReconciliationStatus(ctx context.Context, request s
 
 func (s *Store) completeSessionControlCreation(ctx context.Context, object *corev1alpha1.RuntimeSessionControl, normalized store.SessionControl, fence store.ControllerEpochFence, snapshot epochSnapshot) (*store.SessionControl, error) {
 	if !sameSessionControlSpec(object, normalized) {
-		return nil, controlConflict("session control %s/%s was reused with a different UID or request digest", normalized.Namespace, normalized.SessionName)
+		return nil, store.ConflictErrorf("session control %s/%s was reused with a different UID or request digest", normalized.Namespace, normalized.SessionName)
 	}
 	_, err := s.ensureSessionLease(ctx, object.Namespace, object.Spec.SessionName, object.Spec.SessionUID, normalized.LeaseGeneration)
 	if err != nil {
@@ -542,7 +542,7 @@ func (s *Store) completeSessionLeaseStatus(ctx context.Context, object *corev1al
 		return nil, err
 	}
 	if !sameSessionMutationLease(state, request) || state.Generation != request.ExpectedLeaseGeneration+1 {
-		return nil, controlConflict("Session mutation Lease does not match requested ownership")
+		return nil, store.ConflictErrorf("Session mutation Lease does not match requested ownership")
 	}
 	fresh, err := s.getSessionControlObject(ctx, request.Namespace, request.SessionName)
 	if err != nil {
@@ -553,10 +553,10 @@ func (s *Store) completeSessionLeaseStatus(ctx context.Context, object *corev1al
 		if sameSessionMutationLeaseValue(*freshControl.Lease, request) && freshControl.LeaseGeneration == state.Generation {
 			return s.completeExistingSessionLineage(ctx, fresh, freshControl, request, fence, snapshot)
 		}
-		return nil, controlConflict("session %s/%s status is already leased by another operation", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s status is already leased by another operation", request.Namespace, request.SessionName)
 	}
 	if freshControl.Version != request.ExpectedVersion || freshControl.LeaseGeneration != request.ExpectedLeaseGeneration || freshControl.Availability != store.SessionAvailable {
-		return nil, controlConflict("session %s/%s changed before Lease status could be committed", request.Namespace, request.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s changed before Lease status could be committed", request.Namespace, request.SessionName)
 	}
 	lineage, err := resolveSessionLineage(freshControl.Lineage, *request.Lineage, request.AcquiredAt)
 	if err != nil {
@@ -604,7 +604,7 @@ func (s *Store) verifyMirroredSessionLease(ctx context.Context, object *corev1al
 	}
 	control := sessionControlFromObject(object)
 	if control.Lineage == nil || lease.ResourceVersion != object.Status.MutationLease.LeaseResourceVersion || state.Mode != leaseModeMutation || state.Generation != expected.Generation || state.TaskUID != expected.TaskUID || state.Attempt != expected.Attempt || state.PromptID != expected.PromptID || state.RequestDigest != expected.RequestDigest || state.LineageDigest != sessionLineageDigest(control.Lineage) {
-		return controlConflict("runtime session status does not match its authoritative mutation Lease")
+		return store.ConflictErrorf("runtime session status does not match its authoritative mutation Lease")
 	}
 	return nil
 }
@@ -619,10 +619,10 @@ func (s *Store) ensureBranchReconciliationApplied(ctx context.Context, request s
 		if claim.LastOperationDigest == request.OperationDigest && claim.Availability == store.BranchClaimAvailable && claim.RelatedPublicationID == "" && claim.BlockedReason == "" && claim.LastVerified.Equal(store.RemoteRefState{SHA: request.VerifiedBaseline.SHA}) {
 			return nil
 		}
-		return controlConflict("branch reconciliation operation %q was already applied with different target values", request.OperationID)
+		return store.ConflictErrorf("branch reconciliation operation %q was already applied with different target values", request.OperationID)
 	}
 	if claim.Version != request.ExpectedBranchClaimVersion || claim.Generation != request.ExpectedBranchClaimGeneration || !claim.LastVerified.Equal(request.ExpectedBranchBaseline) || claim.Availability != store.BranchClaimReconciliationBlocked || claim.RelatedPublicationID != request.ExpectedRelatedPublicationID || claim.RepositoryID != request.VerifiedBaseline.RepositoryID || claim.Ref != request.VerifiedBaseline.Ref {
-		return controlConflict("branch claim %q no longer matches the blocked reconciliation fence", claim.ID)
+		return store.ConflictErrorf("branch claim %q no longer matches the blocked reconciliation fence", claim.ID)
 	}
 	updated := object.DeepCopy()
 	verified := remoteRefToAPI(store.RemoteRefState{SHA: request.VerifiedBaseline.SHA})
@@ -646,7 +646,7 @@ func (s *Store) clearReconciliationSessionLease(ctx context.Context, object *cor
 		return nil
 	}
 	if state.Mode != leaseModeReconciliation || state.OperationID != request.OperationID || state.OperationHash != request.OperationDigest {
-		return controlConflict("Session reconciliation Lease is held by a different operation")
+		return store.ConflictErrorf("Session reconciliation Lease is held by a different operation")
 	}
 	updated := lease.DeepCopy()
 	clearSessionLease(updated, state.Generation)
@@ -663,7 +663,7 @@ func (s *Store) getSessionControlObject(ctx context.Context, namespace, sessionN
 		return nil, mapKubernetesError("get runtime session control", err)
 	}
 	if object.Spec.SessionName != sessionName {
-		return nil, controlConflict("runtime session control %s/%s has a different immutable Session name", namespace, object.Name)
+		return nil, store.ConflictErrorf("runtime session control %s/%s has a different immutable Session name", namespace, object.Name)
 	}
 	return object, nil
 }
@@ -677,7 +677,7 @@ func (s *Store) ensureSessionLease(ctx context.Context, namespace, sessionName, 
 			return nil, parseErr
 		}
 		if state.Generation != generation {
-			return nil, controlConflict("Session Lease generation %d does not match initial generation %d", state.Generation, generation)
+			return nil, store.ConflictErrorf("Session Lease generation %d does not match initial generation %d", state.Generation, generation)
 		}
 		return lease, nil
 	} else if !apierrors.IsNotFound(err) {
@@ -706,7 +706,7 @@ func (s *Store) ensureSessionLease(ctx context.Context, namespace, sessionName, 
 				return nil, parseErr
 			}
 			if state.Generation != generation {
-				return nil, controlConflict("Session Lease generation %d does not match initial generation %d", state.Generation, generation)
+				return nil, store.ConflictErrorf("Session Lease generation %d does not match initial generation %d", state.Generation, generation)
 			}
 			return lease, nil
 		}
@@ -764,13 +764,13 @@ func sessionLeaseFromObject(lease *coordinationv1.Lease, sessionName, sessionUID
 			state.ExpiresAt = &expiresAt
 		}
 		if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != sessionMutationLeaseHolder(state.TaskUID, state.Attempt, state.PromptID) {
-			return sessionLeaseState{}, controlConflict("Session mutation Lease holder identity does not match its immutable annotations")
+			return sessionLeaseState{}, store.ConflictErrorf("Session mutation Lease holder identity does not match its immutable annotations")
 		}
 	case leaseModeReconciliation:
 		state.OperationID = annotations[annotationOperationID]
 		state.OperationHash = annotations[annotationOperationDigest]
 		if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != sessionReconciliationLeaseHolder(state.OperationID) {
-			return sessionLeaseState{}, controlConflict("Session reconciliation Lease holder identity does not match its immutable annotations")
+			return sessionLeaseState{}, store.ConflictErrorf("Session reconciliation Lease holder identity does not match its immutable annotations")
 		}
 	default:
 		return sessionLeaseState{}, fmt.Errorf("session Lease %s/%s has unsupported mode %q", lease.Namespace, lease.Name, state.Mode)
@@ -900,7 +900,7 @@ func sessionLineageClaimDigest(claim store.ClaimSessionLineageRequest) string {
 		ContractVersion: claim.ContractVersion, LineageGeneration: claim.LineageGeneration,
 		RuntimeIdentity: claim.RuntimeIdentity, ConfigDigest: claim.ConfigDigest,
 	})
-	return canonicalBytesDigest(append([]byte("orka.session-lineage.v2\x00"), canonical...))
+	return store.CanonicalBytesDigest(append([]byte("orka.session-lineage.v2\x00"), canonical...))
 }
 
 func sessionLineageDigest(lineage *store.SessionLineage) string {
@@ -996,10 +996,10 @@ func sessionLineageToAPI(lineage *store.SessionLineage) *corev1alpha1.RuntimeSes
 func resolveSessionLineage(existing *store.SessionLineage, claim store.ClaimSessionLineageRequest, establishedAt time.Time) (*store.SessionLineage, error) {
 	if existing == nil {
 		if !claim.EstablishIfAbsent {
-			return nil, controlConflict("session %s/%s is nonempty or otherwise unclassified and has no Kubernetes-authoritative lineage", claim.Namespace, claim.SessionName)
+			return nil, store.ConflictErrorf("session %s/%s is nonempty or otherwise unclassified and has no Kubernetes-authoritative lineage", claim.Namespace, claim.SessionName)
 		}
 		if claim.LineageGeneration != 1 {
-			return nil, controlConflict("new session %s/%s lineage must start at generation 1", claim.Namespace, claim.SessionName)
+			return nil, store.ConflictErrorf("new session %s/%s lineage must start at generation 1", claim.Namespace, claim.SessionName)
 		}
 		lineage := &store.SessionLineage{
 			Namespace: claim.Namespace, SessionName: claim.SessionName,
@@ -1015,96 +1015,22 @@ func resolveSessionLineage(existing *store.SessionLineage, claim store.ClaimSess
 	}
 	switch {
 	case existing.Namespace != claim.Namespace || existing.SessionName != claim.SessionName:
-		return nil, controlConflict("session lineage belongs to a different namespace or Session name")
+		return nil, store.ConflictErrorf("session lineage belongs to a different namespace or Session name")
 	case existing.NamespaceUID != claim.NamespaceUID:
-		return nil, controlConflict("session %s/%s lineage belongs to a different namespace UID", claim.Namespace, claim.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s lineage belongs to a different namespace UID", claim.Namespace, claim.SessionName)
 	case existing.SessionUID != claim.SessionUID:
-		return nil, controlConflict("session %s/%s lineage belongs to a different Session UID", claim.Namespace, claim.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s lineage belongs to a different Session UID", claim.Namespace, claim.SessionName)
 	case existing.ContractVersion != claim.ContractVersion:
-		return nil, controlConflict("session %s/%s lineage contract is %s, not %s", claim.Namespace, claim.SessionName, existing.ContractVersion, claim.ContractVersion)
+		return nil, store.ConflictErrorf("session %s/%s lineage contract is %s, not %s", claim.Namespace, claim.SessionName, existing.ContractVersion, claim.ContractVersion)
 	case existing.RuntimeIdentity != claim.RuntimeIdentity:
-		return nil, controlConflict("session %s/%s lineage runtime identity is %q, not %q", claim.Namespace, claim.SessionName, existing.RuntimeIdentity, claim.RuntimeIdentity)
+		return nil, store.ConflictErrorf("session %s/%s lineage runtime identity is %q, not %q", claim.Namespace, claim.SessionName, existing.RuntimeIdentity, claim.RuntimeIdentity)
 	case existing.ConfigDigest != claim.ConfigDigest:
-		return nil, controlConflict("session %s/%s lineage configuration digest does not match", claim.Namespace, claim.SessionName)
+		return nil, store.ConflictErrorf("session %s/%s lineage configuration digest does not match", claim.Namespace, claim.SessionName)
 	case existing.LineageGeneration != claim.LineageGeneration:
-		return nil, controlConflict("session %s/%s lineage generation is %d, not %d", claim.Namespace, claim.SessionName, existing.LineageGeneration, claim.LineageGeneration)
+		return nil, store.ConflictErrorf("session %s/%s lineage generation is %d, not %d", claim.Namespace, claim.SessionName, existing.LineageGeneration, claim.LineageGeneration)
 	default:
 		return existing, nil
 	}
-}
-
-func normalizeSessionControlForCreate(control *store.SessionControl, fence store.ControllerEpochFence) (store.SessionControl, store.ControllerEpochFence, error) {
-	if control == nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("session control is required")
-	}
-	normalized := *control
-	normalized.Namespace = strings.TrimSpace(normalized.Namespace)
-	normalized.SessionName = strings.TrimSpace(normalized.SessionName)
-	normalized.SessionUID = strings.TrimSpace(normalized.SessionUID)
-	for field, value := range map[string]string{
-		sessionControlFieldNamespace: normalized.Namespace,
-		sessionControlFieldName:      normalized.SessionName,
-		sessionControlFieldUID:       normalized.SessionUID,
-	} {
-		if err := store.ValidateControlIdentifier(field, value); err != nil {
-			return store.SessionControl{}, store.ControllerEpochFence{}, err
-		}
-	}
-	if err := store.ValidateCanonicalDigest("session control request digest", normalized.RequestDigest); err != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.Availability == "" {
-		normalized.Availability = store.SessionAvailable
-	}
-	if normalized.Availability != store.SessionAvailable && normalized.Availability != store.SessionReconciliationBlocked {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("unsupported session availability %q", normalized.Availability)
-	}
-	if normalized.Lease != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("new session control must not contain an active lease")
-	}
-	if normalized.Lineage != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("new session control lineage must be established with mutation Lease acquisition")
-	}
-	if normalized.LeaseGeneration < 0 {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("session lease generation must not be negative")
-	}
-	normalized.BlockedReason = strings.TrimSpace(normalized.BlockedReason)
-	normalized.RelatedPromptAttemptID = strings.TrimSpace(normalized.RelatedPromptAttemptID)
-	normalized.RelatedPublicationID = strings.TrimSpace(normalized.RelatedPublicationID)
-	if normalized.Availability == store.SessionAvailable && (normalized.BlockedReason != "" || normalized.RelatedPromptAttemptID != "" || normalized.RelatedPublicationID != "") {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("available session control must not contain reconciliation block metadata")
-	}
-	if normalized.Availability == store.SessionReconciliationBlocked && normalized.BlockedReason == "" {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("reconciliation-blocked session requires a reason")
-	}
-	if err := store.ValidateControlReason("session blocked reason", normalized.BlockedReason); err != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.VerifiedBaseline != nil {
-		copyBaseline := *normalized.VerifiedBaseline
-		normalized.VerifiedBaseline = &copyBaseline
-		if err := validateVerifiedBaseline(copyBaseline); err != nil {
-			return store.SessionControl{}, store.ControllerEpochFence{}, err
-		}
-	}
-	normalizedFence, err := normalizeEpochFence(fence)
-	if err != nil {
-		return store.SessionControl{}, store.ControllerEpochFence{}, err
-	}
-	if normalized.Version != 0 && normalized.Version != 1 {
-		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("new session control version must be zero or one")
-	}
-	now := normalizeControlTime(normalized.CreatedAt)
-	normalized.CreatedAt = now
-	if normalized.UpdatedAt.IsZero() {
-		normalized.UpdatedAt = now
-	} else {
-		normalized.UpdatedAt = normalized.UpdatedAt.UTC()
-	}
-	normalized.ControllerEpochName = normalizedFence.Name
-	normalized.ControllerEpoch = normalizedFence.Epoch
-	normalized.Version = 1
-	return normalized, normalizedFence, nil
 }
 
 func normalizeAcquireSessionMutationLeaseRequest(request *store.AcquireSessionMutationLeaseRequest) error {
@@ -1148,8 +1074,8 @@ func normalizeAcquireSessionMutationLeaseRequest(request *store.AcquireSessionMu
 		return store.ValidationErrorf("session lineage namespace, name, and UID must match the mutation Lease request")
 	}
 	request.Lineage = &lineage
-	request.AcquiredAt = normalizeControlTime(request.AcquiredAt)
-	request.ExpiresAt = normalizeOptionalControlTime(request.ExpiresAt)
+	request.AcquiredAt = store.NormalizeControlTime(request.AcquiredAt)
+	request.ExpiresAt = store.NormalizeOptionalControlTime(request.ExpiresAt)
 	if request.ExpiresAt != nil && !request.ExpiresAt.After(request.AcquiredAt) {
 		return store.ValidationErrorf("session lease expiry must be after acquisition")
 	}
@@ -1188,7 +1114,7 @@ func normalizeReleaseSessionMutationLeaseRequest(request *store.ReleaseSessionMu
 	if request.OperationDigest != expectedDigest {
 		return store.ValidationErrorf("session lease release operation digest does not match its Lease request digest")
 	}
-	request.ReleasedAt = normalizeControlTime(request.ReleasedAt)
+	request.ReleasedAt = store.NormalizeControlTime(request.ReleasedAt)
 	return nil
 }
 
@@ -1235,18 +1161,8 @@ func normalizeReconcileSessionControlRequest(request *store.ReconcileSessionCont
 	if err := store.ValidateCanonicalDigest("session reconciliation operation digest", request.OperationDigest); err != nil {
 		return err
 	}
-	request.ReconciledAt = normalizeControlTime(request.ReconciledAt)
+	request.ReconciledAt = store.NormalizeControlTime(request.ReconciledAt)
 	return nil
-}
-
-func validateVerifiedBaseline(baseline store.VerifiedBranchBaseline) error {
-	if err := store.ValidateControlIdentifier("verified repository ID", strings.TrimSpace(baseline.RepositoryID)); err != nil {
-		return err
-	}
-	if err := store.ValidateFullBranchRef(strings.TrimSpace(baseline.Ref)); err != nil {
-		return err
-	}
-	return store.ValidateGitObjectID("verified branch SHA", strings.TrimSpace(baseline.SHA))
 }
 
 func verifiedBaselineToAPI(value *store.VerifiedBranchBaseline) *corev1alpha1.ControlVerifiedBranchBaseline {
@@ -1261,4 +1177,27 @@ func verifiedBaselineFromAPI(value *corev1alpha1.ControlVerifiedBranchBaseline) 
 		return nil
 	}
 	return &store.VerifiedBranchBaseline{RepositoryID: value.RepositoryID, Ref: value.Ref, SHA: value.SHA}
+}
+
+// normalizeSessionControlForCreate applies the shared session control contract
+// and additionally rejects lineage on create (lineage is established with
+// mutation Lease acquisition) and trims the related record IDs.
+func normalizeSessionControlForCreate(control *store.SessionControl, fence store.ControllerEpochFence) (store.SessionControl, store.ControllerEpochFence, error) {
+	if control == nil {
+		return store.NormalizeSessionControlForCreate(nil, fence)
+	}
+	if control.Lineage != nil {
+		return store.SessionControl{}, store.ControllerEpochFence{}, store.ValidationErrorf("new session control lineage must be established with mutation Lease acquisition")
+	}
+	trimmed := *control
+	trimmed.RelatedPromptAttemptID = strings.TrimSpace(trimmed.RelatedPromptAttemptID)
+	trimmed.RelatedPublicationID = strings.TrimSpace(trimmed.RelatedPublicationID)
+	return store.NormalizeSessionControlForCreate(&trimmed, fence)
+}
+
+// validateVerifiedBaseline tolerates surrounding whitespace on the SHA before
+// applying the shared verified baseline contract.
+func validateVerifiedBaseline(baseline store.VerifiedBranchBaseline) error {
+	baseline.SHA = strings.TrimSpace(baseline.SHA)
+	return store.ValidateVerifiedBaseline(baseline)
 }

@@ -3,7 +3,6 @@ package kube
 import (
 	"crypto/sha256"
 	"encoding/base32"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -71,51 +70,6 @@ func validateKubernetesNamespace(namespace string) error {
 	return nil
 }
 
-func normalizeControllerEpochName(name string) (string, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = store.DefaultControllerEpochName
-	}
-	if err := store.ValidateControlIdentifier("controller epoch name", name); err != nil {
-		return "", err
-	}
-	if name != store.DefaultControllerEpochName {
-		return "", store.ValidationErrorf("first-release control store supports only controller epoch %q", store.DefaultControllerEpochName)
-	}
-	return name, nil
-}
-
-func normalizeEpochFence(fence store.ControllerEpochFence) (store.ControllerEpochFence, error) {
-	name, err := normalizeControllerEpochName(fence.Name)
-	if err != nil {
-		return store.ControllerEpochFence{}, err
-	}
-	fence.Name = name
-	fence.HolderID = strings.TrimSpace(fence.HolderID)
-	if err := store.ValidateControlIdentifier("controller epoch holder ID", fence.HolderID); err != nil {
-		return store.ControllerEpochFence{}, err
-	}
-	if fence.Epoch < 1 {
-		return store.ControllerEpochFence{}, store.ValidationErrorf("controller epoch must be at least 1")
-	}
-	return fence, nil
-}
-
-func normalizeControlTime(value time.Time) time.Time {
-	if value.IsZero() {
-		return time.Now().UTC()
-	}
-	return value.UTC()
-}
-
-func normalizeOptionalControlTime(value *time.Time) *time.Time {
-	if value == nil {
-		return nil
-	}
-	normalized := value.UTC()
-	return &normalized
-}
-
 func metaTime(value time.Time) *metav1.Time {
 	if value.IsZero() {
 		return nil
@@ -159,10 +113,6 @@ func labelIfValid(labels map[string]string, key, value string) {
 	labels[key] = value
 }
 
-func controlConflict(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", store.ErrConflict, fmt.Sprintf(format, args...))
-}
-
 func mapKubernetesError(action string, err error) error {
 	if err == nil {
 		return nil
@@ -186,11 +136,6 @@ func setMutationStatus(status *corev1alpha1.ControlRecordMutationStatus, fence s
 	status.Version = version
 	status.CreatedAt = metaTime(createdAt)
 	status.UpdatedAt = metaTime(updatedAt)
-}
-
-func canonicalBytesDigest(value []byte) string {
-	sum := sha256.Sum256(value)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func parsePositiveInt64(field, value string) (int64, error) {

@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +39,18 @@ func TestRedactedPromptErrorDetailStripsC1ControlsBeforeRedaction(t *testing.T) 
 	}
 	if !strings.Contains(got, "upstream rejected") || !strings.Contains(got, "[REDACTED]") || strings.ContainsRune(got, '\u0085') {
 		t.Fatalf("redactedPromptErrorDetail() = %q, want redacted prose without control runes", got)
+	}
+}
+
+func TestRedactedPromptErrorDetailReassemblesLineWrappedCredential(t *testing.T) {
+	t.Parallel()
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+	// A credential wrapped across a line break must reassemble into one
+	// contiguous token for the redactor, not survive as two fragments.
+	err := errors.New("upstream rejected " + key[:11] + "\n" + key[11:] + " for the model")
+	got := redactedPromptErrorDetail(err)
+	if strings.Contains(got, key[:11]) || strings.Contains(got, key[11:]) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("redactedPromptErrorDetail() = %q, want line-wrapped credential redacted", got)
 	}
 }
 
@@ -957,7 +972,7 @@ func (f upstreamFailureFixture) recordInference(t *testing.T, status int, detail
 	t.Helper()
 	// The real handler begins in-flight accounting at route authorization
 	// and releases it when it returns.
-	f.proxy.beginInferenceRequest(providerRequestInference)
+	testBeginInferenceRequest(f.proxy)
 	defer f.proxy.releaseInferenceRequest(providerRequestInference)
 	seq := testAllocateInferenceSeq(f.proxy)
 	if err := f.proxy.consumeInferenceRequest(f.promptID, providerRequestInference, f.now); err != nil {
@@ -1344,8 +1359,9 @@ func TestWorkspaceDeltaPathAllowedRecursiveGlobs(t *testing.T) {
 }
 
 func TestWorkspaceDeltaRejectsSessionCredentials(t *testing.T) {
+	providerCredential := []byte("provider-session-secret")
 	state := &sessionState{
-		providerProxy: &providerProxySession{credential: []byte("provider-session-secret")},
+		providerProxy: &providerProxySession{credential: providerCredential},
 		mcpProxy:      &mcpProxySession{credential: []byte("mcp-session-secret")},
 	}
 	if !workspaceDeltaContainsSessionCredential([]byte("prefix provider-session-secret suffix"), state) {
@@ -1356,6 +1372,13 @@ func TestWorkspaceDeltaRejectsSessionCredentials(t *testing.T) {
 	}
 	if workspaceDeltaContainsSessionCredential([]byte("safe workspace content"), state) {
 		t.Fatal("safe artifact was rejected")
+	}
+	artifact := tarBytes(t, tarEntry{
+		name: "files/dir/" + string(providerCredential) + ".bin",
+		body: []byte{'a', 0, 'b'},
+	})
+	if !workspaceDeltaContainsSessionCredential(artifact, state) {
+		t.Fatal("provider credential in a binary file path was not detected")
 	}
 }
 
@@ -1370,20 +1393,127 @@ func TestWorkspaceDeltaRepositoryControlAndContentPolicies(t *testing.T) {
 	}
 
 	artifact := tarBytes(t, tarEntry{name: "files/config.txt", body: []byte("api_key=0123456789abcdef")})
-	violation, err := workspaceDeltaContentPolicyViolation(artifact, harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectSecretLikeContent: true})
+	violation, err := workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectSecretLikeContent: true}, nil)
 	if err != nil || !strings.Contains(violation, "secret-like") {
 		t.Fatalf("secret policy = %q, %v", violation, err)
 	}
 	artifact = tarBytes(t, tarEntry{name: "files/binary.bin", body: []byte{'a', 0, 'b'}})
-	violation, err = workspaceDeltaContentPolicyViolation(artifact, harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectBinaryFiles: true})
+	violation, err = workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectBinaryFiles: true}, nil)
 	if err != nil || !strings.Contains(violation, "binary") {
 		t.Fatalf("binary policy = %q, %v", violation, err)
 	}
 	artifact = tarBytes(t, tarEntry{name: "meta/symlinks.json", body: []byte(`{"symlinks":[{"path":"link","target":"api_key=0123456789abcdef"}]}`)})
-	violation, err = workspaceDeltaContentPolicyViolation(artifact, harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectSecretLikeContent: true})
+	violation, err = workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectSecretLikeContent: true}, nil)
 	if err != nil || !strings.Contains(violation, "secret-like") {
 		t.Fatalf("symlink secret policy = %q, %v", violation, err)
 	}
+}
+
+type baselineExemptionFixture struct {
+	t          *testing.T
+	root       string
+	baseline   *workspacedelta.Snapshot
+	limits     harnessv2.WorkspaceDeltaLimits
+	secretLine string
+	content    string
+}
+
+func newBaselineExemptionFixture(t *testing.T) *baselineExemptionFixture {
+	t.Helper()
+	f := &baselineExemptionFixture{
+		t:          t,
+		root:       t.TempDir(),
+		limits:     harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectSecretLikeContent: true},
+		secretLine: "password = 'SuperSecretPassword-0123456789'",
+	}
+	f.content = "const mongoose = require('mongoose')\n\n" + f.secretLine + "\n\nmodule.exports = mongoose\n\nfunction helper() {}\n"
+	f.write("mongoose-db.js", f.content)
+	return f
+}
+
+func (f *baselineExemptionFixture) write(name, content string) {
+	f.t.Helper()
+	if err := os.WriteFile(filepath.Join(f.root, name), []byte(content), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+	baseline, err := workspacedelta.Capture(f.root, (&Server{}).baselineCaptureOptions())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.baseline = baseline
+}
+
+func (f *baselineExemptionFixture) check(name, body string) string {
+	f.t.Helper()
+	exempts := func(path string, content []byte) bool {
+		return workspaceDeltaBaselineExempts(f.baseline, path, content)
+	}
+	violation, err := workspaceDeltaContentPolicyViolationContext(context.Background(), tarBytes(f.t, tarEntry{name: name, body: []byte(body)}), f.limits, exempts)
+	if err != nil {
+		f.t.Fatalf("policy check %s: %v", name, err)
+	}
+	return violation
+}
+
+func (f *baselineExemptionFixture) expectExempt(name, body, what string) {
+	f.t.Helper()
+	if violation := f.check(name, body); violation != "" {
+		f.t.Fatalf("%s was rejected: %q", what, violation)
+	}
+}
+
+func (f *baselineExemptionFixture) expectRejected(name, body, what string) {
+	f.t.Helper()
+	if violation := f.check(name, body); !strings.Contains(violation, strings.TrimPrefix(name, "files/")) {
+		f.t.Fatalf("%s was not rejected: %q", what, violation)
+	}
+}
+
+func TestWorkspaceDeltaSecretPolicyExemptsBaselineFlaggedFiles(t *testing.T) {
+	f := newBaselineExemptionFixture(t)
+	live := "'" + strings.Repeat("live", 6) + "'"
+
+	t.Run("unchanged and distant edits stay publishable", func(t *testing.T) {
+		f.expectExempt("files/mongoose-db.js", f.content, "baseline-flagged file")
+		f.expectExempt("files/mongoose-db.js", f.content+"\nfunction added() { return helper() }\n", "distant edit")
+		f.expectExempt("files/mongoose-db.js", "// edited\n"+f.content, "leading comment")
+	})
+	t.Run("credential changes are rejected", func(t *testing.T) {
+		f.expectRejected("files/mongoose-db.js", f.content+"api_key = '"+strings.Repeat("zq9", 8)+"'\n", "appended credential")
+		f.expectRejected("files/mongoose-db.js", strings.Replace(f.content, f.secretLine, "password = "+live, 1), "replaced credential")
+		f.expectRejected("files/mongoose-db.js", "const edited = true\n"+f.content, "adjacent code edit")
+		f.expectRejected("files/mongoose-db.js", f.content+"\n"+f.content, "relocated credential copy")
+		f.expectRejected("files/mongoose-db.js", strings.Replace(f.content, f.secretLine+"\n", "const combined = "+live+" +\n"+f.secretLine+"\n", 1), "prefixed credential")
+		f.expectRejected("files/new-config.js", f.content, "newly secret-like file")
+	})
+	t.Run("continuations on following lines are rejected", func(t *testing.T) {
+		for _, continuation := range []string{
+			"  + " + live + "\n",
+			"  /* note */ + " + live + "\n",
+			"    " + strings.Repeat("live", 6) + "\n",
+			"\n  + " + live + "\n",
+			"// note\n  + " + live + "\n",
+			"/*\n*/\n  + " + live + "\n",
+			"  or " + live + "\n",
+			"\n// first note\n\n// second note\n+ " + live + "\n",
+		} {
+			f.expectRejected("files/mongoose-db.js", strings.Replace(f.content, f.secretLine+"\n", f.secretLine+"\n"+continuation, 1), "continuation "+strconv.Quote(continuation))
+		}
+	})
+	t.Run("multi-line expressions are covered", func(t *testing.T) {
+		multiline := "const mongoose = require('mongoose')\n" + f.secretLine + " + build(\n)\nmodule.exports = mongoose\n"
+		f.write("multi.js", multiline)
+		f.expectExempt("files/multi.js", multiline, "multi-line known expression")
+		f.expectRejected("files/multi.js", strings.Replace(multiline, ")\nmodule.exports", ")\n.concat("+live+")\nmodule.exports", 1), "extended multi-line credential")
+		f.expectRejected("files/multi.js", strings.Replace(multiline, " + build(\n)", " +\n  String(\n  "+live+"\n  )", 1), "literal inserted inside a known expression")
+	})
+	t.Run("symlink manifest is never exempt", func(t *testing.T) {
+		artifact := tarBytes(t, tarEntry{name: "meta/symlinks.json", body: []byte(`{"symlinks":[{"path":"link","target":"api_key=0123456789abcdef"}]}`)})
+		violation, err := workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, f.limits, func(string, []byte) bool { return true })
+		if err != nil || !strings.Contains(violation, "secret-like") {
+			t.Fatalf("symlink manifest exemption leaked: %q, %v", violation, err)
+		}
+	})
 }
 
 func TestProviderUpstreamFailureTerminalEventRedactsCredentials(t *testing.T) {
@@ -1401,4 +1531,15 @@ func TestProviderUpstreamFailureTerminalEventRedactsCredentials(t *testing.T) {
 	if settledResult.Err != nil {
 		assertNoLeakedCredential(t, "settled result error", settledResult.Err.Error())
 	}
+}
+
+// testBeginInferenceRequest mirrors the in-flight inference accounting that
+// authorizeRequest performs for an inference-class route.
+func testBeginInferenceRequest(s *providerProxySession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflightInference == 0 {
+		s.drainedInference = make(chan struct{})
+	}
+	s.inflightInference++
 }

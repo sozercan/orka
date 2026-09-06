@@ -353,9 +353,14 @@ export function TaskCreateForm() {
     if (timeout) body.timeout = timeout
 
     try {
-      await createTask.mutateAsync(body)
+      const created = await createTask.mutateAsync(body)
       toast.success('Task created')
-      navigate({ to: '/tasks' })
+      const createdName = created?.metadata?.name
+      if (createdName) {
+        navigate({ to: '/tasks/$taskId', params: { taskId: createdName } })
+      } else {
+        navigate({ to: '/tasks' })
+      }
     } catch (err) {
       toast.error(`Failed to create task: ${err instanceof Error ? err.message : 'Unknown error'}`)
     }

@@ -321,3 +321,8 @@ func (m *SessionManager) DeleteSession(ctx context.Context, namespace, name stri
 func (m *SessionManager) ListSessions(ctx context.Context, namespace string) ([]store.SessionMetadata, error) {
 	return m.store.ListSessions(ctx, namespace)
 }
+
+// ListSessionsPage lists one name-ordered page of sessions in a namespace.
+func (m *SessionManager) ListSessionsPage(ctx context.Context, namespace, afterName string, limit int, excludeType string) ([]store.SessionMetadata, bool, error) {
+	return m.store.ListSessionsPage(ctx, namespace, afterName, limit, excludeType)
+}

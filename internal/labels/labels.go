@@ -69,6 +69,8 @@ const (
 	AnnotationRetryCount                    = "orka.ai/retry-count"
 	AnnotationOriginalPrompt                = "orka.ai/original-prompt"
 	AnnotationParentTaskName                = "orka.ai/parent-task-name"
+	AnnotationParentTaskUID                 = "orka.ai/parent-task-uid"
+	AnnotationDelegationEffectID            = "orka.ai/delegation-effect-id"
 	AnnotationForkSourceTask                = "orka.ai/fork-source-task"
 	AnnotationForkSourceSeq                 = "orka.ai/fork-source-seq"
 	AnnotationForkContextTruncated          = "orka.ai/fork-context-truncated"
@@ -85,6 +87,7 @@ const (
 	AnnotationMonitorItemKind               = "orka.ai/monitor-item-kind"
 	AnnotationMonitorItemNumber             = "orka.ai/monitor-item-number"
 	AnnotationMonitorHeadSHA                = "orka.ai/monitor-head-sha"
+	AnnotationRepositoryValidationImage     = "orka.ai/repository-validation-image"
 	AnnotationAgentReadOnly                 = "orka.ai/agent-read-only"
 	AnnotationAgentRuntimeAuthOnly          = "orka.ai/agent-runtime-auth-only"
 	AnnotationSecurityReviewAttempt         = "orka.ai/security-review-attempt"
@@ -99,6 +102,8 @@ const (
 	AnnotationTraceState                    = "orka.ai/tracestate"
 	AnnotationTraceBaggage                  = "orka.ai/baggage"
 )
+
+const AnnotationRepositoryValidationCommandDigest = "orka.ai/repository-validation-command-digest"
 
 const LabelWorkspaceAttachment = "workspace.orka.ai/attachment-for"
 

@@ -908,17 +908,36 @@ func (h *Handlers) ListSessions(c fiber.Ctx) error {
 		return err
 	}
 
+	pagination, err := ParsePagination(c.Query("limit", ""), c.Query("continue", ""))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+
 	ctx := c.Context()
-	sessions, err := h.sessionStore.ListSessions(ctx, namespace)
+	// The session cursor is a session name, not a Kubernetes cache token,
+	// so the cache sentinel normalization must not apply: a session named
+	// exactly like the sentinel is still a valid place to resume from.
+	sessionCursor := strings.TrimSpace(c.Query("continue", ""))
+	// The store applies the name cursor, gateway exclusion, ordering, and
+	// limit itself, so each page reads only its own rows.
+	// ParsePagination already caps Limit at MaxLimit; the explicit guard
+	// makes the narrowing conversion provably bounded.
+	limit := pagination.Limit
+	pageLimit := int(MaxLimit)
+	if limit <= MaxLimit {
+		pageLimit = int(limit)
+	}
+	sessions, more, err := h.sessionStore.ListSessionsPage(ctx, namespace, sessionCursor, pageLimit, store.SessionTypeGateway)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list sessions: %v", err))
 	}
 
 	items := make([]fiber.Map, 0, len(sessions))
+	continueToken := ""
+	if more && len(sessions) > 0 {
+		continueToken = sessions[len(sessions)-1].Name
+	}
 	for _, s := range sessions {
-		if s.SessionType == store.SessionTypeGateway {
-			continue
-		}
 		items = append(items, fiber.Map{
 			"id":           s.Name,
 			"name":         s.Name,
@@ -935,7 +954,7 @@ func (h *Handlers) ListSessions(c fiber.Ctx) error {
 
 	response := ListResponse{
 		Items:    items,
-		Metadata: ListMeta{},
+		Metadata: ListMeta{Continue: continueToken},
 	}
 
 	return c.JSON(response)

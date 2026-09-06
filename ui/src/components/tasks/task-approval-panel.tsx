@@ -10,6 +10,7 @@ import { useTaskApprovals, useDecideApproval } from '@/hooks/use-execution-event
 import { ApiError } from '@/lib/api-client'
 import type { Approval } from '@/schemas/execution-event'
 import type { TaskPhase } from '@/schemas/task'
+import { formatTimestamp } from '@/lib/time'
 
 function statusStyle(status: string): { className: string; live: boolean; label: string } {
   switch (status) {
@@ -39,13 +40,6 @@ function ApprovalStatusBadge({ status }: { status: string }) {
       {label}
     </Badge>
   )
-}
-
-function formatTimestamp(ts?: string): string {
-  if (!ts) return ''
-  const d = new Date(ts)
-  if (Number.isNaN(d.getTime())) return ts
-  return d.toLocaleString(undefined, { hour12: false })
 }
 
 function ApprovalCard({
@@ -118,12 +112,12 @@ function ApprovalCard({
 
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
           {approval.createdAt && (
-            <span>Requested <span className="tabular-nums">{formatTimestamp(approval.createdAt)}</span></span>
+            <span>Requested <span className="tabular-nums">{formatTimestamp(approval.createdAt, { empty: '', hour12: false })}</span></span>
           )}
           {approval.expiresAt && (
             <span className="inline-flex items-center gap-1">
               <Clock className="h-3 w-3" aria-hidden="true" />
-              Expires <span className="tabular-nums">{formatTimestamp(approval.expiresAt)}</span>
+              Expires <span className="tabular-nums">{formatTimestamp(approval.expiresAt, { empty: '', hour12: false })}</span>
             </span>
           )}
           {approval.timeout && <span>Timeout {approval.timeout}</span>}
@@ -133,7 +127,7 @@ function ApprovalCard({
         {!isPending && (approval.decisionActor || approval.decisionReason || approval.decisionTime) && (
           <div className="rounded-md bg-muted px-3 py-2 text-xs">
             {approval.decisionActor && <div>Decided by <span className="font-medium">{approval.decisionActor}</span></div>}
-            {approval.decisionTime && <div className="tabular-nums text-muted-foreground">{formatTimestamp(approval.decisionTime)}</div>}
+            {approval.decisionTime && <div className="tabular-nums text-muted-foreground">{formatTimestamp(approval.decisionTime, { empty: '', hour12: false })}</div>}
             {approval.decisionReason && <div className="mt-1 break-words">{approval.decisionReason}</div>}
           </div>
         )}

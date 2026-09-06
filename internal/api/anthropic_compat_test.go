@@ -1831,18 +1831,12 @@ func TestRunNonStreamingToolLoop_IterationLimit(t *testing.T) {
 	config := DefaultChatConfig()
 	config.MaxIterations = 2
 
-	scheme := runtime.NewScheme()
-	_ = corev1alpha1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	_ = NewAnthropicCompatHandler(fakeClient, "default", false, config, NewProviderResolver(fakeClient, config), nil)
-
 	mock := &mockAnthropicProvider{
 		responses: []*llm.CompletionResponse{
 			// Iteration 0: tool call
-			{StopReason: oaiStopReasonToolUse, ToolCalls: []llm.ToolCall{{ID: "tc_1", Name: "web_search", Arguments: json.RawMessage(`{"query":"a"}`)}}},
+			{StopReason: oaiStopReasonToolUse, ToolCalls: []llm.ToolCall{{ID: "tc_1", Name: "test_tool", Arguments: json.RawMessage(`{}`)}}},
 			// Iteration 1: tool call
-			{StopReason: oaiStopReasonToolUse, ToolCalls: []llm.ToolCall{{ID: "tc_2", Name: "web_search", Arguments: json.RawMessage(`{"query":"b"}`)}}},
+			{StopReason: oaiStopReasonToolUse, ToolCalls: []llm.ToolCall{{ID: "tc_2", Name: "test_tool", Arguments: json.RawMessage(`{}`)}}},
 			// Iteration 2: hits limit, summary call
 			{Content: "Summary of work done.", StopReason: "end_turn"},
 		},
@@ -1850,9 +1844,10 @@ func TestRunNonStreamingToolLoop_IterationLimit(t *testing.T) {
 	req := &llm.CompletionRequest{
 		Model:    "test-model",
 		Messages: []llm.Message{{Role: "user", Content: "Do many things"}},
+		Tools:    []llm.Tool{{Name: "test_tool"}},
 	}
 
-	resp, err := runNonStreamingToolLoop(context.Background(), mock, req, "test-model", ChatConfig{MaxIterations: 20, ToolTimeout: 30 * time.Second}, nil)
+	resp, err := runNonStreamingToolLoop(context.Background(), mock, req, "test-model", config, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1861,6 +1856,21 @@ func TestRunNonStreamingToolLoop_IterationLimit(t *testing.T) {
 	}
 	if mock.callIdx != 3 {
 		t.Errorf("expected 3 LLM calls (2 iterations + 1 summary), got %d", mock.callIdx)
+	}
+	if len(mock.requests) != 3 {
+		t.Fatalf("expected 3 recorded requests, got %d", len(mock.requests))
+	}
+	for i := range 2 {
+		if len(mock.requests[i].Tools) != 1 || mock.requests[i].Tools[0].Name != "test_tool" {
+			t.Errorf("request %d tools = %#v, want test_tool", i+1, mock.requests[i].Tools)
+		}
+	}
+	if len(mock.requests[2].Tools) != 0 {
+		t.Errorf("summary request tools = %#v, want none", mock.requests[2].Tools)
+	}
+	summaryMessages := mock.requests[2].Messages
+	if len(summaryMessages) == 0 || !strings.Contains(summaryMessages[len(summaryMessages)-1].Content, "maximum number of iterations") {
+		t.Errorf("summary request does not contain the iteration-limit instruction: %#v", summaryMessages)
 	}
 }
 

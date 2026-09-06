@@ -46,6 +46,7 @@ export default defineConfig({
         'src/test/**',
         'src/**/*.test.{ts,tsx}',
         'src/vite-env.d.ts',
+        // Thin wrappers only; route logic and future routes stay in coverage.
         'src/routes/index.tsx',
         'src/routes/chat.tsx',
         'src/routes/tasks/index.tsx',

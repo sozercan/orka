@@ -53,25 +53,6 @@ func TaskAttributes(taskName, namespace, tenant, agentName, userSub string) []at
 	return attrs
 }
 
-// ToolAttributes returns safe Orka-native tool attributes. resultSize is emitted
-// only when it is non-negative, allowing callers to omit it before execution.
-func ToolAttributes(name, kind string, resultSize int, errType string) []attribute.KeyValue {
-	attrs := make([]attribute.KeyValue, 0, 4)
-	if name != "" {
-		attrs = append(attrs, attribute.String(AttrToolName, name))
-	}
-	if kind != "" {
-		attrs = append(attrs, attribute.String(AttrToolKind, kind))
-	}
-	if resultSize >= 0 {
-		attrs = append(attrs, attribute.Int(AttrToolResultSizeBytes, resultSize))
-	}
-	if errType != "" {
-		attrs = append(attrs, attribute.String("error.type", errType))
-	}
-	return attrs
-}
-
 // DelegateAttributes returns safe parent/child task relationship attributes.
 func DelegateAttributes(parentTaskID, childTaskID string) []attribute.KeyValue {
 	attrs := make([]attribute.KeyValue, 0, 2)

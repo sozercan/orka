@@ -54,6 +54,8 @@ export const chatConfigSchema = z.object({
   maxTasksPerTurn: z.number(),
   maxConcurrent: z.number(),
   availableTools: z.array(z.string()),
+  // Set for context-token callers, for whom the server refuses the implicit default provider.
+  requireExplicitProvider: z.boolean().optional(),
 })
 
 export type ChatConfig = z.infer<typeof chatConfigSchema>

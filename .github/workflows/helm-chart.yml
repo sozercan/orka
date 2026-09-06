@@ -222,8 +222,7 @@ jobs:
           }
 
           # Each static mode must render exactly one namespaced, create-only
-          # controller TokenRequest rule, pinned to the exact intended resource
-          # set (serviceaccounts/token + pods/portforward) and nothing broader.
+          # controller TokenRequest rule, granting only serviceaccounts/token.
           assert_single_tokenrequest_rule() {
             local rendered_rbac=$1 expected_name=$2
             if ! ruby -ryaml -e '
@@ -248,7 +247,7 @@ jobs:
                 token_request_grants[0][0].dig("metadata", "name") == expected_name &&
                 token_request_grants[0][0].dig("metadata", "namespace") == expected_namespace &&
                 Array(token_request_grants[0][1]["apiGroups"]) == [""] &&
-                Array(token_request_grants[0][1]["resources"]).sort == ["pods/portforward", "serviceaccounts/token"] &&
+                Array(token_request_grants[0][1]["resources"]) == ["serviceaccounts/token"] &&
                 Array(token_request_grants[0][1]["verbs"]) == ["create"]
               exit(valid ? 0 : 1)
             ' "${rendered_rbac}" "${expected_name}" "${NAMESPACE}"; then

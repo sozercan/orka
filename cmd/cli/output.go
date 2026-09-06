@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -83,15 +84,74 @@ func printGenericTable(cmd *cobra.Command, value any) error {
 		fmt.Fprintln(cmd.OutOrStdout(), "No resources found.") //nolint:errcheck
 		return nil
 	}
-	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tNAMESPACE\tSTATUS\tAGE") //nolint:errcheck
+	rows := make([][]string, 0, len(items))
 	for _, item := range items {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", dash(genericRowName(item)), dash(genericRowNamespace(item)), dash(genericRowStatus(item)), dash(formatAge(genericRowTimestamp(item)))) //nolint:errcheck
+		rows = append(rows, []string{
+			genericRowName(item),
+			genericRowNamespace(item),
+			genericRowStatus(item),
+			genericRowTimestamp(item),
+		})
+	}
+	headers := []string{"NAME", "NAMESPACE", "STATUS", "AGE"}
+	columns := genericTableColumns(headers, rows)
+	for _, row := range rows {
+		row[3] = formatAge(row[3])
+	}
+	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, strings.Join(pickColumns(headers, columns), "\t")) //nolint:errcheck
+	for _, row := range rows {
+		cells := pickColumns(row, columns)
+		for i := range cells {
+			cells[i] = dash(cells[i])
+		}
+		fmt.Fprintln(w, strings.Join(cells, "\t")) //nolint:errcheck
 	}
 	return w.Flush()
 }
 
+// genericTableColumns keeps the NAME column and every other column that at
+// least one row fills in, so resources without a namespace, status, or
+// timestamp (built-in tools, model IDs, secret metadata) do not print
+// dash-only columns.
+func genericTableColumns(headers []string, rows [][]string) []int {
+	columns := []int{0}
+	for col := 1; col < len(headers); col++ {
+		for _, row := range rows {
+			if col < len(row) && strings.TrimSpace(row[col]) != "" {
+				columns = append(columns, col)
+				break
+			}
+		}
+	}
+	return columns
+}
+
+func pickColumns(row []string, columns []int) []string {
+	picked := make([]string, 0, len(columns))
+	for _, col := range columns {
+		if col < len(row) {
+			picked = append(picked, row[col])
+		} else {
+			picked = append(picked, "")
+		}
+	}
+	return picked
+}
+
 const genericRowTitleLimit = 60
+
+// sanitizeTerminalText strips control and format runes from forge-supplied
+// text before it reaches the terminal: an untrusted issue or PR title must
+// not carry ANSI/OSC escapes into an operator's display.
+func sanitizeTerminalText(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, value)
+}
 
 // genericRowName labels a row by its resource name, falling back to the
 // "#number title" form used by forge-backed records (monitor items,
@@ -106,7 +166,7 @@ func genericRowName(item map[string]any) string {
 	}
 	if number := firstString(item, "number"); number != "" {
 		label := "#" + number
-		if title := strings.TrimSpace(firstString(item, "title")); title != "" {
+		if title := strings.TrimSpace(sanitizeTerminalText(firstString(item, "title"))); title != "" {
 			if len(title) > genericRowTitleLimit {
 				// Cut on a rune boundary so a multibyte character crossing
 				// the limit cannot become invalid UTF-8 in the table.
@@ -141,6 +201,30 @@ func genericRowStatus(item map[string]any) string {
 	status := firstString(item, "phase", "status", "state")
 	if status == "" {
 		status = nestedString(item, "status", "phase")
+	}
+	if status == "" {
+		// The restricted flat projection served to context-token callers
+		// carries readiness at the top level.
+		if ready, ok := item["ready"].(bool); ok {
+			if ready {
+				status = "Ready"
+			} else {
+				status = "NotReady"
+			}
+		}
+	}
+	if status == "" {
+		// Resources such as Providers expose readiness as status.ready
+		// instead of a phase.
+		if statusMap, ok := item["status"].(map[string]any); ok {
+			if ready, ok := statusMap["ready"].(bool); ok {
+				if ready {
+					status = "Ready"
+				} else {
+					status = "NotReady"
+				}
+			}
+		}
 	}
 	if workflow := firstString(item, "workflowPhase"); workflow != "" && workflow != status {
 		if status == "" {

@@ -1,5 +1,6 @@
 ---
 slug: /execution-events
+description: "The event stream behind task timelines, traces, forks, and approvals."
 ---
 
 # Execution events, session timelines, traces, forks, and approvals
@@ -130,8 +131,8 @@ Unpaired completion/failure events are preserved in `rawUnpaired` with warnings 
 CLI:
 
 ```bash
-orka task trace <task>
-orka task trace <task> -o json
+orka task trace '<task>'
+orka task trace '<task>' -o json
 ```
 
 ## Fork/checkpoint MVP
@@ -163,7 +164,7 @@ MVP behavior:
 CLI:
 
 ```bash
-orka task fork <task> --after 5 --agent reviewer --prompt "Continue from here"
+orka task fork '<task>' --after 5 --agent reviewer --prompt "Continue from here"
 ```
 
 ## Durable approvals MVP
@@ -203,9 +204,9 @@ Content-Type: application/json
 CLI:
 
 ```bash
-orka task approvals <task>
-orka task approve <task> <approvalID> --reason "looks safe"
-orka task decline <task> <approvalID> --reason "not safe"
+orka task approvals '<task>'
+orka task approve '<task>' '<approvalID>' --reason "looks safe"
+orka task decline '<task>' '<approvalID>' --reason "not safe"
 ```
 
 The first recommended high-risk action to integrate with these events is PR creation/merge. The API/read model is in place before broad worker policy integration.
@@ -230,8 +231,6 @@ Available metrics include:
 - `orka_execution_event_stream_errors_total{scope,reason}`
 - `orka_execution_event_redactions_total{stream_type,event_type}`
 - `orka_execution_event_truncations_total{stream_type,event_type}`
-- `orka_execution_event_derived_latency_seconds{measurement,result}`
-- `orka_execution_event_derived_failures_total{category,event_type}`
 
 Example PromQL:
 
@@ -243,7 +242,6 @@ sum(orka_execution_event_stream_connections_current) by (scope)
 sum(rate(orka_execution_event_stream_reconnects_total[15m])) by (scope)
 sum(rate(orka_execution_event_stream_errors_total[5m])) by (scope, reason)
 sum(rate(orka_execution_event_redactions_total[1h])) by (event_type)
-histogram_quantile(0.95, sum(rate(orka_execution_event_derived_latency_seconds_bucket[5m])) by (le, measurement))
 ```
 
 ## Troubleshooting

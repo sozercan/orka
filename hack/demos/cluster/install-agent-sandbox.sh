@@ -26,8 +26,9 @@
 set -Eeuo pipefail
 
 cluster_name="${ORKA_DEMO_CLUSTER:-orka-demo}"
-agent_sandbox_version="${ORKA_AGENT_SANDBOX_VERSION:-v0.4.6}"
-demo_namespace="${DEMO_NAMESPACE:-demo-magic}"
+# Must match the sigs.k8s.io/agent-sandbox module version in go.mod.
+agent_sandbox_version="${ORKA_AGENT_SANDBOX_VERSION:-v1.0.0}"
+demo_namespace="${DEMO_NAMESPACE:-orka-system}"
 orka_namespace="${ORKA_NAMESPACE:-orka-system}"
 controller_deployment="${ORKA_CONTROLLER_DEPLOYMENT:-orka-controller-manager}"
 sandbox_default_template="${ORKA_SANDBOX_DEFAULT_TEMPLATE:-orka-live-template}"
@@ -56,9 +57,23 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 template_file="${script_dir}/templates/orka-live-template.yaml"
+# shellcheck source=scripts/lib/kind-local-registry.sh
+. "${repo_root}/scripts/lib/kind-local-registry.sh"
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+cleanup_agent_sandbox_v05_webhook_resources() {
+  [[ "${agent_sandbox_version}" == v1.* ]] || return 0
+
+  log "Removing obsolete agent-sandbox v0.5 conversion-webhook resources"
+  kubectl delete -n agent-sandbox-system \
+    service/agent-sandbox-webhook-service \
+    secret/agent-sandbox-webhook-certs \
+    role/agent-sandbox-controller \
+    rolebinding/agent-sandbox-controller \
+    --ignore-not-found
+}
 
 command -v kubectl >/dev/null 2>&1 || die "missing required command: kubectl"
 command -v jq      >/dev/null 2>&1 || die "missing required command: jq"
@@ -72,12 +87,35 @@ fi
 # Select context: prefer kind-<cluster_name> if that kind cluster exists,
 # otherwise use the current context (lets Demo 60 share an existing cluster,
 # e.g. the Substrate demo cluster).
+# registry_cluster is the kind cluster behind the selected context, or empty
+# when the context is not a local kind cluster; the local registry can only be
+# wired to that cluster's nodes.
+registry_cluster=""
 if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "${cluster_name}"; then
   log "Selecting kubectl context kind-${cluster_name}"
   kubectl config use-context "kind-${cluster_name}" >/dev/null
+  registry_cluster="${cluster_name}"
 else
-  log "kind cluster ${cluster_name} not found; using current context $(kubectl config current-context)"
+  current_context="$(kubectl config current-context)"
+  log "kind cluster ${cluster_name} not found; using current context ${current_context}"
+  if [[ "${current_context}" == kind-* ]] && command -v kind >/dev/null 2>&1 \
+     && kind get clusters 2>/dev/null | grep -qx "${current_context#kind-}"; then
+    registry_cluster="${current_context#kind-}"
+  fi
 fi
+
+# ensure_kind_registry starts and wires the local registry to the selected
+# kind cluster once; every image push (runtime or router) goes through it.
+registry_ready=0
+ensure_kind_registry() {
+  if [[ "${registry_ready}" == "1" ]]; then
+    return 0
+  fi
+  [[ -n "${registry_cluster}" ]] \
+    || die "context $(kubectl config current-context) is not a local kind cluster; images cannot be published to a local registry it can pull from (set ORKA_SANDBOX_RUNTIME_IMAGE to a pre-published image and run without AGENTIC=1, or target a kind cluster)"
+  orka_kind_registry_start "${registry_cluster}"
+  registry_ready=1
+}
 
 # Agentic layer: build + push the runtime + router images to the kind registry
 # (normal pods pull via localhost:<port>). Done BEFORE the template is applied
@@ -85,15 +123,27 @@ fi
 if [[ "${AGENTIC}" == "1" ]]; then
   node_arch="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || echo amd64)"
 
-  log "Building sandbox-runtime image ${runtime_image} (arch ${node_arch}; real codex + git + gh)"
-  docker build --platform "linux/${node_arch}" -t "${runtime_image}" \
-    -f "${repo_root}/hack/demos/images/sandbox-runtime/Dockerfile" "${repo_root}"
-  docker push "${runtime_image}"
+  if [[ -z "${ORKA_SANDBOX_RUNTIME_IMAGE:-}" ]]; then
+    # cluster-up.sh wires the kind node to the repo's local registry helper
+    # (scripts/lib/kind-local-registry.sh); push through the same helper so
+    # the node can actually pull what we built, and pin the digest it
+    # returns. The registry must be wired to the cluster the selected context
+    # points at, not the default demo cluster name, or the pinned image is
+    # unpullable when Demo 60 shares an existing cluster.
+    ensure_kind_registry
+    local_runtime_image="orka-sandbox-runtime:${sandbox_runtime_tag}"
+    log "Building sandbox-runtime image ${local_runtime_image} (arch ${node_arch}; real codex + git + gh)"
+    docker build --platform "linux/${node_arch}" -t "${local_runtime_image}" \
+      -f "${repo_root}/hack/demos/images/sandbox-runtime/Dockerfile" "${repo_root}"
+    runtime_image="$(orka_kind_registry_push "${local_runtime_image}" "orka/sandbox-runtime")"
+    log "sandbox-runtime image pinned as ${runtime_image}"
+  fi
 fi
 
 log "Installing agent-sandbox ${agent_sandbox_version} CRDs + controllers"
-kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${agent_sandbox_version}/manifest.yaml"
+kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${agent_sandbox_version}/sandbox.yaml"
 kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${agent_sandbox_version}/extensions.yaml"
+cleanup_agent_sandbox_v05_webhook_resources
 
 log "Ensuring namespace ${demo_namespace}"
 kubectl create namespace "${demo_namespace}" --dry-run=client -o yaml | kubectl apply -f -
@@ -145,18 +195,34 @@ if [[ "${AGENTIC}" == "1" ]]; then
   # Service. The base agent-sandbox release does NOT ship it; its source lives
   # in the agent-sandbox Go module's python client. Build + deploy it.
   router_src="$(go env GOMODCACHE)/sigs.k8s.io/agent-sandbox@${agent_sandbox_version}/clients/python/agentic-sandbox-client/sandbox-router"
-  router_image="localhost:${KIND_REGISTRY_PORT}/orka-sandbox-router:${sandbox_router_tag}"
+  local_router_image="orka-sandbox-router:${sandbox_router_tag}"
+  router_image=""
   if [[ -d "${router_src}" ]]; then
-    log "Building sandbox-router image ${router_image}"
+    log "Building sandbox-router image ${local_router_image}"
     router_build_dir="$(mktemp -d)"
     cp -R "${router_src}/." "${router_build_dir}/" && chmod -R u+w "${router_build_dir}"
-    docker build --platform "linux/${node_arch}" -t "${router_image}" "${router_build_dir}"
-    docker push "${router_image}"
+    docker build --platform "linux/${node_arch}" -t "${local_router_image}" "${router_build_dir}"
+    ensure_kind_registry
+    router_image="$(orka_kind_registry_push "${local_router_image}" "orka/sandbox-router")"
+    log "sandbox-router image pinned as ${router_image}"
     rm -rf "${router_build_dir}"
 
     log "Deploying sandbox-router into ${demo_namespace}"
-    awk -v image="${router_image}" '{ gsub(/\$\{ROUTER_IMAGE\}/, image); print }' \
-      "${router_src}/sandbox_router.yaml" \
+    # The legacy Python router refuses to start without ROUTER_AUTH_TOKEN
+    # unless ALLOW_UNAUTHENTICATED_ROUTER is explicitly "true". The demo
+    # cluster is a local kind sandbox with no external exposure, so flip
+    # the flag the same way scripts/live-agent-sandbox-e2e.sh does.
+    awk -v image="${router_image}" '
+      {
+        gsub(/\$\{ROUTER_IMAGE\}/, image)
+        if ($0 ~ /name: ALLOW_UNAUTHENTICATED_ROUTER/) { allow = 1 }
+        if (allow == 1 && $0 ~ /value: "false"/) {
+          sub(/value: "false"/, "value: \"true\"")
+          allow = 0
+        }
+        print
+      }
+    ' "${router_src}/sandbox_router.yaml" \
       | kubectl -n "${demo_namespace}" apply -f -
     kubectl -n "${demo_namespace}" rollout status deployment/sandbox-router-deployment --timeout=180s
   else

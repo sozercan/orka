@@ -36,6 +36,30 @@ type ProviderSessionProjection struct {
 	AdditionalArgs []string
 	Environment    map[string]string
 	NewSessionMeta acp.Meta
+	// AgentDiagnosticFilter recognizes provider CLI diagnostics the adapter
+	// wrote into the ACP agent message stream instead of its own log. Nil
+	// forwards every chunk.
+	AgentDiagnosticFilter *AgentDiagnosticFilter
+}
+
+// AgentDiagnosticFilter recognizes assistant text chunks that are provider
+// CLI diagnostics rather than model output. Recognized chunks are withheld
+// from the harness event stream and the terminal assistant text and logged by
+// the supervisor instead. The recognizer sees only the chunk text; the
+// supervisor anchors it on prompt state it can prove, so a model chunk that
+// merely repeats a diagnostic sentence is forwarded: Startup diagnostics are
+// withheld only when the session received them from the child
+// (acp.PromptEvent.ReceivedAt, stamped before any buffering) before the
+// provider proxy began relaying the prompt's first non-error inference
+// response. Model output can only be derived from those bytes, while the CLI
+// emits its startup diagnostics ahead of its first inference request.
+//
+// The recognizer returns a summary the supervisor may log. Chunk text is
+// child-controlled and the child holds session credentials, so the summary
+// must be built only from values the supervisor already knows (such as the
+// session's own exclusion list), never from the chunk itself.
+type AgentDiagnosticFilter struct {
+	Startup func(text string) (summary string, ok bool)
 }
 
 type ArtifactUploader interface {

@@ -15,7 +15,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func cleanupArtifactsDir(t *testing.T) {
@@ -289,5 +291,25 @@ func TestMissingArtifactsRejectsTraversalFilename(t *testing.T) {
 	prepareArtifactsDir(t)
 	if _, err := MissingArtifacts([]string{"../outside.txt"}); err == nil {
 		t.Fatal("MissingArtifacts() error = nil, want invalid filename")
+	}
+}
+
+func TestDoPostWithContentTypePermanentRejectionDoesNotRetry(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+	}))
+	defer srv.Close()
+	start := time.Now()
+	err := doPostWithContentType(srv.URL, []byte("blob"), "", "application/octet-stream")
+	if err == nil || !strings.Contains(err.Error(), "rejected permanently") {
+		t.Fatalf("error = %v, want a permanent rejection", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1", got)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("permanent rejection slept through the retry window")
 	}
 }

@@ -70,14 +70,38 @@ type Options struct {
 	Limits                  Limits
 	AdditionalExcludedNames []string
 	AdditionalReservedNames []string
+	// ContentFlagger, when set, is evaluated against each regular file's
+	// content during Capture. Flagged paths are queryable through
+	// Snapshot.BaselineContentFlagged, letting callers distinguish content
+	// that was already present in the trusted pre-prompt baseline from
+	// content introduced afterwards. It never alters the manifest or the
+	// options digest. Capture calls it from several goroutines at once, so
+	// it must be safe for concurrent use.
+	ContentFlagger func(content []byte) bool
+	// ContentFingerprinter, when set, records opaque fingerprints of the
+	// flagged fragments of each regular file (for example digests of its
+	// secret-like lines) so a later delta can tell pre-existing flagged
+	// content from content the agent introduced. Only fingerprints are kept.
+	// Like ContentFlagger it must be safe for concurrent use.
+	ContentFingerprinter func(content []byte) []string
 }
 
 type normalizedOptions struct {
-	limits        Limits
-	excludedNames []string
-	reservedNames []string
-	excludedSet   map[string]struct{}
-	reservedSet   map[string]struct{}
+	limits               Limits
+	excludedNames        []string
+	reservedNames        []string
+	excludedSet          map[string]struct{}
+	reservedSet          map[string]struct{}
+	contentFlagger       func(content []byte) bool
+	contentFingerprinter func(content []byte) []string
+}
+
+// withoutContentPolicy returns a copy of the options with the baseline-only
+// content heuristics cleared.
+func (o normalizedOptions) withoutContentPolicy() normalizedOptions {
+	o.contentFlagger = nil
+	o.contentFingerprinter = nil
+	return o
 }
 
 // DefaultLimits returns the package's bounded first-release defaults.
@@ -120,6 +144,8 @@ func normalizeOptions(options Options) (normalizedOptions, error) {
 	return normalizedOptions{
 		limits: limits, excludedNames: excluded, reservedNames: reserved,
 		excludedSet: excludedSet, reservedSet: reservedSet,
+		contentFlagger:       options.ContentFlagger,
+		contentFingerprinter: options.ContentFingerprinter,
 	}, nil
 }
 

@@ -58,87 +58,6 @@ func (h *Handlers) GetRuntimePool(c fiber.Ctx) error {
 	return c.JSON(pool)
 }
 
-func (h *Handlers) CreateRuntimePool(c fiber.Ctx) error {
-	if err := rejectContextTokenResourceMutation(c, "runtime pool"); err != nil {
-		return err
-	}
-	var pool corev1alpha1.RuntimePool
-	if err := c.Bind().JSON(&pool); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid runtime pool manifest")
-	}
-	name := strings.TrimSpace(pool.Name)
-	if name == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "metadata.name is required")
-	}
-	namespace, err := h.resolveNamespace(c, pool.Namespace)
-	if err != nil {
-		return err
-	}
-	if err := h.authorizeRuntimeResourceAction(c, "create", "runtimepools", namespace, name); err != nil {
-		return err
-	}
-	pool.TypeMeta = metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "RuntimePool"}
-	pool.Namespace = namespace
-	pool.ResourceVersion = ""
-	pool.UID = ""
-	pool.Status = corev1alpha1.RuntimePoolStatus{}
-	if err := h.client.Create(c.Context(), &pool); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return fiber.NewError(fiber.StatusConflict, "runtime pool already exists")
-		}
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create runtime pool: %v", err))
-	}
-	return c.Status(fiber.StatusCreated).JSON(&pool)
-}
-
-func (h *Handlers) UpdateRuntimePool(c fiber.Ctx) error {
-	if err := rejectContextTokenResourceMutation(c, "runtime pool"); err != nil {
-		return err
-	}
-	existing, err := h.fetchRuntimePool(c, c.Params("name"))
-	if err != nil {
-		return err
-	}
-	if err := h.authorizeRuntimeResourceAction(c, "update", "runtimepools", existing.Namespace, existing.Name); err != nil {
-		return err
-	}
-	var desired corev1alpha1.RuntimePool
-	if err := c.Bind().JSON(&desired); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid runtime pool manifest")
-	}
-	existing.Spec = desired.Spec
-	if err := h.client.Update(c.Context(), existing); err != nil {
-		if apierrors.IsConflict(err) {
-			return fiber.NewError(fiber.StatusConflict, "runtime pool was updated concurrently")
-		}
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to update runtime pool: %v", err))
-	}
-	return c.JSON(existing)
-}
-
-func (h *Handlers) DeleteRuntimePool(c fiber.Ctx) error {
-	if err := rejectContextTokenResourceMutation(c, "runtime pool"); err != nil {
-		return err
-	}
-	pool, err := h.fetchRuntimePool(c, c.Params("name"))
-	if err != nil {
-		return err
-	}
-	if err := h.authorizeRuntimeResourceAction(c, "delete", "runtimepools", pool.Namespace, pool.Name); err != nil {
-		return err
-	}
-	if err := h.client.Delete(c.Context(), pool); err != nil && !apierrors.IsNotFound(err) {
-		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to delete runtime pool: %v", err))
-	}
-	return c.SendStatus(fiber.StatusNoContent)
-}
-
-// authorizeRuntimeResourceAction enforces Kubernetes RBAC for RuntimePool and
-// AgentRuntime reads and writes, like the Task and gateway paths: a
-// TokenReview-authenticated identity must pass a SubjectAccessReview for the
-// exact verb, resource, and name before the controller client acts on its
-// behalf. It is a no-op for non-TokenReview auth (e.g. context tokens, which
-// carry their own scope checks).
 func (h *Handlers) authorizeRuntimeResourceAction(c fiber.Ctx, verb, resource, namespace, name string) error {
 	return authorizeKubernetesResourceAction(
 		c.Context(), h.clientset, GetUserInfo(c), namespace, verb, corev1alpha1.GroupVersion.Group, resource, name,
@@ -220,7 +139,7 @@ func (h *Handlers) CreateAgentRuntime(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.authorizeRuntimeResourceAction(c, "create", "agentruntimes", namespace, strings.TrimSpace(runtime.Name)); err != nil {
+	if err := h.authorizeRuntimeResourceAction(c, "create", "agentruntimes", namespace, ""); err != nil {
 		return err
 	}
 	runtime.TypeMeta = metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "AgentRuntime"}

@@ -29,7 +29,10 @@ func BuildWithLimitsContext(ctx context.Context, baseline *Snapshot, postRoot st
 	if err != nil {
 		return Result{}, err
 	}
-	post, err := capture(ctx, postRoot, baseline.options, false)
+	// Content flags and fingerprints describe the trusted baseline only;
+	// re-running those heuristics over every post-prompt file would cost a
+	// full secret scan of the workspace on each delta.
+	post, err := capture(ctx, postRoot, baseline.options.withoutContentPolicy(), false)
 	if err != nil {
 		return Result{}, err
 	}
@@ -242,7 +245,7 @@ func retainChangedContents(ctx context.Context, postRoot string, post *Snapshot,
 		if err != nil {
 			return pathError("retain changed content", change.Path, err)
 		}
-		captured, err := captureRegular(ctx, filePath, change.Path, initial, false, retentionOptions, true, retainedBytes, seen)
+		captured, err := captureRegular(ctx, filePath, change.Path, initial, false, retentionOptions, true, retainedBytes, seen, nil)
 		if err != nil {
 			return err
 		}

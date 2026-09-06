@@ -176,6 +176,11 @@ func (t *ChatCreateAgentTool) Execute(ctx context.Context, args json.RawMessage)
 	}
 	parseCoordinationConfig(a, agent)
 
+	if chatGetStringArg(a, "initialPrompt") != "" && tc.AuthorizeAgentInitialTask != nil {
+		if err := tc.AuthorizeAgentInitialTask(ctx, agent); err != nil {
+			return ChatToolErrorResult(err.Type, err.Message, err.Suggestion)
+		}
+	}
 	if result, ok := authorizeAgentCreate(ctx, tc, agent); !ok {
 		return result, nil
 	}

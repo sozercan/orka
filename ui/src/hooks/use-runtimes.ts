@@ -1,45 +1,22 @@
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api-client'
+import { pageParams, walkAllPages, type ListResponse } from '@/lib/list-api'
 import { agentRuntimeListSchema, runtimePoolListSchema } from '@/schemas/runtime'
 import { useUIStore } from '@/stores/ui'
 
-interface RuntimeListPage<T> {
-  items: T[]
-  metadata?: { continue?: string; remainingItemCount?: number }
-}
-
 interface RuntimeListPageSchema<T> {
-  parse(value: unknown): RuntimeListPage<T>
+  parse(value: unknown): ListResponse<T>
 }
 
-async function fetchAllRuntimePages<T>(
+function fetchAllRuntimePages<T>(
   path: '/runtime-pools' | '/agent-runtimes',
   namespace: string,
   schema: RuntimeListPageSchema<T>,
-): Promise<RuntimeListPage<T>> {
-  const items: T[] = []
-  const seenCursors = new Set<string>()
-  let metadata: RuntimeListPage<T>['metadata']
-  let cursor: string | undefined
-
-  do {
-    const params: Record<string, string> = { namespace, limit: '100' }
-    if (cursor) params.continue = cursor
-
-    const page = schema.parse(await api.get<unknown>(path, params))
-    items.push(...page.items)
-    metadata = page.metadata
-
-    const nextCursor = metadata?.continue
-    if (!nextCursor) break
-    if (seenCursors.has(nextCursor)) {
-      throw new Error(`runtime list pagination repeated continuation cursor for ${path}`)
-    }
-    seenCursors.add(nextCursor)
-    cursor = nextCursor
-  } while (cursor)
-
-  return { items, metadata }
+) {
+  return walkAllPages<T>(
+    async (continueToken) => schema.parse(await api.get<unknown>(path, pageParams({ namespace, limit: '100' }, continueToken))),
+    { subject: 'runtime list', path },
+  )
 }
 
 export function useRuntimePools(refetchInterval: number | false = 5000) {

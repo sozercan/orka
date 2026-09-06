@@ -188,6 +188,34 @@ grep -F 'wait_pool_serving "${pool}"' "${script}" >/dev/null
 
 printf '%s\n' 'ok - profile-specific RuntimePools are parked and resumed in capacity-safe order'
 
+mutation_allowed_body="$(awk '/^runtimepool_mutations_allowed\(\) \{/,/^\}$/' "${script}")"
+require_mutation_body="$(awk '/^require_runtimepool_mutation_scope\(\) \{/,/^\}$/' "${script}")"
+[[ -n "${mutation_allowed_body}" && -n "${require_mutation_body}" ]] || {
+  echo "shared RuntimePool mutation guards are missing" >&2
+  exit 1
+}
+eval "${mutation_allowed_body}"
+eval "${require_mutation_body}"
+namespace="shared-namespace"
+namespace_shared=1
+shared_pool_mutation_allowed=0
+warn() { :; }
+if runtimepool_mutations_allowed || require_runtimepool_mutation_scope; then
+  echo "shared namespace permitted RuntimePool mutation without an isolated-cluster opt-in" >&2
+  exit 1
+fi
+shared_pool_mutation_allowed=1
+runtimepool_mutations_allowed
+require_runtimepool_mutation_scope
+namespace_shared=0
+shared_pool_mutation_allowed=0
+runtimepool_mutations_allowed
+require_runtimepool_mutation_scope
+grep -F 'Shared watch namespace: skipping controller restart and RuntimePool parking, resume, and replacement checks' "${script}" >/dev/null
+grep -F 'RELEASE_GATE=1 requires an isolated namespace or ACP_E2E_ALLOW_SHARED_POOL_MUTATION=1 on a dedicated cluster' "${script}" >/dev/null
+
+printf '%s\n' 'ok - shared namespaces fail closed for RuntimePool mutations unless a dedicated cluster is explicit'
+
 
 profile_valid_body="$(awk '/^pool_profile_projection_valid\(\) \{/,/^\}$/' "${script}")"
 profile_fingerprint_body="$(awk '/^pool_profile_projection_fingerprint\(\) \{/,/^\}$/' "${script}")"

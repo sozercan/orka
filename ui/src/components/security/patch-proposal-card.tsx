@@ -1,15 +1,7 @@
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import type { PatchProposal } from '@/schemas/security'
-
-function timeAgo(ts?: string) {
-  if (!ts) return '-'
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(ts).getTime()) / 1000))
-  if (seconds < 60) return `${seconds}s ago`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  return `${Math.floor(seconds / 86400)}d ago`
-}
+import { timeAgo } from '@/lib/time'
 
 export function PatchProposalCard({ proposal }: { proposal: PatchProposal }) {
   return (

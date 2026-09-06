@@ -139,6 +139,93 @@ func TestServerReceiptPersistenceFailureRetainsTurnAndClosesReadiness(t *testing
 	}
 }
 
+func TestServerCloseWaitsForTerminalReceiptPersistence(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.AllowUnauthenticated = true
+	cfg.AdmissionLedgerPath = filepath.Join(t.TempDir(), "admission-ledger.db")
+	server, err := NewServer(cfg, NewFakeAdapter(FakeBehaviorSuccess))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	request := validWrapperStartTurnRequest()
+	durable, err := validateDurableTurnAdmission(request)
+	if err != nil {
+		t.Fatalf("validate durable admission: %v", err)
+	}
+	if _, _, err := server.ledger.AdmitTurn(
+		context.Background(), string(request.TurnID), durable.taskUID, durable.attempt, durable.requestDigest,
+		string(request.RuntimeSessionID), request.CorrelationID,
+	); err != nil {
+		t.Fatalf("admit durable turn: %v", err)
+	}
+	if err := server.ledger.MarkTurnAccepted(context.Background(), string(request.TurnID)); err != nil {
+		t.Fatalf("mark durable turn accepted: %v", err)
+	}
+	turn, err := server.turnRegistry.admit(request, server.now)
+	if err != nil {
+		t.Fatalf("admit active turn: %v", err)
+	}
+	turn.appendFrame(server.frame(
+		turn, harness.FrameTurnCompleted, "turn completed", &harness.TurnCompleted{Result: "ok"},
+	))
+
+	turn.mu.Lock()
+	turnLocked := true
+	defer func() {
+		if turnLocked {
+			turn.mu.Unlock()
+		}
+	}()
+	finishDone := make(chan struct{})
+	go func() {
+		defer close(finishDone)
+		server.finishTurn(turn)
+	}()
+	eventually(t, 2*time.Second, func() bool {
+		if server.ledgerMu.TryLock() {
+			server.ledgerMu.Unlock()
+			return false
+		}
+		return true
+	})
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- server.Close()
+	}()
+	eventually(t, 2*time.Second, func() bool {
+		if server.ledgerMu.TryRLock() {
+			server.ledgerMu.RUnlock()
+			return false
+		}
+		return true
+	})
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close completed before terminal persistence was released: %v", err)
+	default:
+	}
+
+	turn.mu.Unlock()
+	turnLocked = false
+	select {
+	case <-finishDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("finishTurn did not complete after terminal persistence was released")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not complete after terminal persistence finished")
+	}
+	if server.ledger != nil {
+		t.Fatal("Close retained the admission ledger")
+	}
+}
+
 func TestServerAcceptanceFailureReconcilesAdmissionWithIndependentContext(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.AllowUnauthenticated = true

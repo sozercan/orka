@@ -365,3 +365,7 @@ func assertInFlightExternalEffectWithOneLease(
 		t.Fatalf("external effect = state %s attempts %d, want InFlight with one lease claim", effect.State, effect.Attempts)
 	}
 }
+
+// acpExternalEffectLease is the ledger lease a brokered custom-Tool effect
+// call must fit inside, including the settlement margin.
+const acpExternalEffectLease = maxACPExternalEffectCallDuration + externalEffectLeaseSettlementMargin

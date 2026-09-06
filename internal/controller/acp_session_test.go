@@ -484,11 +484,11 @@ func TestPrepareRuntimeWorkspaceDoesNotCollapseMissingSessionIdentity(t *testing
 	dispatcher := &ACPDispatcher{}
 	firstTask := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{UID: types.UID("empty-task-a")}}
 	secondTask := &corev1alpha1.Task{ObjectMeta: metav1.ObjectMeta{UID: types.UID("empty-task-b")}}
-	first, err := dispatcher.prepareRuntimeWorkspace(context.Background(), firstTask, store.ControllerEpochFence{}, &acpTaskSession{})
+	first, err := dispatcher.prepareRuntimeWorkspace(context.Background(), firstTask, store.ControllerEpochFence{}, &acpTaskSession{}, time.Now().UTC(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := dispatcher.prepareRuntimeWorkspace(context.Background(), secondTask, store.ControllerEpochFence{}, &acpTaskSession{})
+	second, err := dispatcher.prepareRuntimeWorkspace(context.Background(), secondTask, store.ControllerEpochFence{}, &acpTaskSession{}, time.Now().UTC(), false)
 	if err != nil {
 		t.Fatal(err)
 	}

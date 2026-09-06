@@ -27,6 +27,8 @@ Modes:
 Common environment:
   ACP_E2E_NAMESPACE                  Unique test namespace
   ACP_E2E_KEEP_RESOURCES=1           Preserve Kubernetes resources after the run
+  ACP_E2E_ALLOW_SHARED_POOL_MUTATION=1
+                                      Allow destructive pool checks in a known-isolated shared namespace
   ACP_E2E_REPO                       Public GitHub read repository URL
   ACP_E2E_REF                        Immutable read repository commit SHA
   ACP_E2E_CODEX_MODEL                Codex model (default: gpt-5.4)
@@ -333,6 +335,11 @@ chmod 700 "${temp_root}"
 namespace_create_attempted=0
 namespace_created=0
 namespace_shared=0
+shared_pool_mutation_allowed=0
+shared_mutation_checks_skipped=0
+if bool_env "${ACP_E2E_ALLOW_SHARED_POOL_MUTATION:-0}"; then
+  shared_pool_mutation_allowed=1
+fi
 namespace_uid=""
 api_forward_pid=""
 api_token_file="${temp_root}/api-token"
@@ -364,6 +371,18 @@ record_runtime_namespace() {
     [[ "${existing}" == "${candidate}" ]] && return 0
   done
   runtime_namespaces_seen+=("${candidate}")
+}
+
+runtimepool_mutations_allowed() {
+  [[ "${namespace_shared:-0}" -ne 1 || "${shared_pool_mutation_allowed:-0}" -eq 1 ]]
+}
+
+require_runtimepool_mutation_scope() {
+  if runtimepool_mutations_allowed; then
+    return 0
+  fi
+  warn "refusing RuntimePool or controller mutation in shared namespace ${namespace}; use an isolated namespace or explicitly allow shared pool mutation only on a dedicated cluster"
+  return 1
 }
 
 namespace_probe_state=""
@@ -872,6 +891,7 @@ delete_test_agents() {
 }
 
 stop_and_delete_test_runtimepools() {
+  require_runtimepool_mutation_scope || return 1
   local pools_file="${temp_root}/cleanup-runtimepools.json"
   local inventory_file="${temp_root}/cleanup-runtimepools.tsv"
   local name uid runtime_ns current_uid
@@ -1852,6 +1872,7 @@ pool_stopped() {
 
 park_runtimepool() {
   local pool="$1"
+  require_runtimepool_mutation_scope || return 1
   log "Parking RuntimePool/${pool} between profile-specific ACP checks"
   k -n "${namespace}" patch runtimepool "${pool}" --type=merge \
     -p '{"spec":{"desiredReplicas":0}}' >/dev/null
@@ -1862,6 +1883,7 @@ park_provider_runtimepools_except() {
   local provider="$1"
   local keep_pool="$2"
   local pools pool
+  require_runtimepool_mutation_scope || return 1
   pools="$(k -n "${namespace}" get runtimepool -o json | jq -r \
     --arg provider "${provider}" --arg keep "${keep_pool}" \
     '.items[] | select(.metadata.name != $keep and .spec.runtime.profile.providerKind == $provider) | .metadata.name')"
@@ -1874,6 +1896,7 @@ park_provider_runtimepools_except() {
 
 resume_runtimepool() {
   local pool="$1"
+  require_runtimepool_mutation_scope || return 1
   log "Resuming RuntimePool/${pool} for continuation recovery checks"
   k -n "${namespace}" patch runtimepool "${pool}" --type=merge \
     -p '{"spec":{"desiredReplicas":1}}' >/dev/null
@@ -2196,6 +2219,12 @@ assert_task_succeeded_read() {
     fi
     if [[ -n "${expected_text}" ]] && ! grep -Fq -- "${expected_text}" <<<"${result}"; then
       die "Task/${task} result did not contain independently observed repository content"
+    fi
+    # Provider CLIs have leaked startup diagnostics into the agent message
+    # stream before (Codex WebSocket fallback, Copilot tool exclusions); the
+    # supervisor must keep them out of the result text.
+    if grep -Eq 'Info: (Disabled tools|Unknown tool name in the tool excludedlist)|Warning: Falling back from WebSockets' <<<"${result}"; then
+      die "Task/${task} result contains provider CLI diagnostics"
     fi
   fi
   mark_task_validated "${task}"
@@ -2639,6 +2668,7 @@ run_explicit_cancel_check() {
 }
 
 run_controller_restart_check() {
+  require_runtimepool_mutation_scope || return 1
   local provider="$1"
   local model="$2"
   local agent="$3"
@@ -2698,6 +2728,7 @@ run_controller_restart_check() {
 replacement_session_uid=""
 replacement_session_generation=""
 run_pool_replacement_check() {
+  require_runtimepool_mutation_scope || return 1
   local provider="$1"
   local model="$2"
   local agent="$3"
@@ -2738,6 +2769,7 @@ run_pool_replacement_check() {
 }
 
 run_scale_to_zero_recovery_check() {
+  require_runtimepool_mutation_scope || return 1
   local provider="$1"
   local model="$2"
   local agent="$3"
@@ -3266,6 +3298,7 @@ settle_write_task_for_remote_cleanup() {
 
   pool="$(jq -r '.status.execution.runtimePoolName // ""' "${task_probe_file}")" || return 1
   if [[ -n "${pool}" ]]; then
+    require_runtimepool_mutation_scope || return 1
     probe_runtimepool "${pool}" || return 1
     [[ "${runtimepool_probe_state}" == "present" ]] || return 1
     log "Parking write RuntimePool/${pool} after terminal publication"
@@ -3426,6 +3459,12 @@ else
 fi
 namespace_uid="$(k get namespace "${namespace}" -o jsonpath='{.metadata.uid}')"
 [[ -n "${namespace_uid}" ]] || die "test namespace UID is unavailable"
+if [[ "${namespace_shared}" -eq 1 && "${shared_pool_mutation_allowed}" -eq 1 ]]; then
+  warn "shared namespace RuntimePool mutation was explicitly enabled; this is safe only on a dedicated cluster"
+fi
+if [[ "${release_gate}" -eq 1 ]] && ! runtimepool_mutations_allowed; then
+  die "RELEASE_GATE=1 requires an isolated namespace or ACP_E2E_ALLOW_SHARED_POOL_MUTATION=1 on a dedicated cluster"
+fi
 
 if [[ "${release_gate}" -eq 1 ]]; then
   create_api_identity
@@ -3449,15 +3488,22 @@ codex_pool="${read_smoke_pool}"
 
 assert_unsafe_workspace_rejected "${codex_agent}"
 run_concurrency_check "${codex_agent}" codex "${codex_model}" "${codex_pool}"
-park_runtimepool "${codex_pool}"
+if runtimepool_mutations_allowed; then
+  park_runtimepool "${codex_pool}"
+fi
 codex_tool_agent="$(sanitize_name "acp-codex-tools-${run_id}")"
 apply_agent codex "${codex_model}" "${codex_tool_agent}" 12 true
 run_timeout_check codex "${codex_model}" "${codex_tool_agent}"
 run_explicit_cancel_check codex "${codex_model}" "${codex_tool_agent}"
-run_controller_restart_check codex "${codex_model}" "${codex_tool_agent}" "${restart_nonce}"
-park_provider_runtimepools_except codex "${codex_pool}"
-resume_runtimepool "${codex_pool}"
-run_pool_replacement_check codex "${codex_model}" "${codex_agent}" "${codex_pool}" "${codex_session}" "${session_nonce}"
+if runtimepool_mutations_allowed; then
+  run_controller_restart_check codex "${codex_model}" "${codex_tool_agent}" "${restart_nonce}"
+  park_provider_runtimepools_except codex "${codex_pool}"
+  resume_runtimepool "${codex_pool}"
+  run_pool_replacement_check codex "${codex_model}" "${codex_agent}" "${codex_pool}" "${codex_session}" "${session_nonce}"
+else
+  shared_mutation_checks_skipped=1
+  log "Shared watch namespace: skipping controller restart and RuntimePool parking, resume, and replacement checks"
+fi
 
 if [[ "${release_gate}" -eq 1 ]]; then
   run_scale_to_zero_recovery_check codex "${codex_model}" "${codex_agent}" "${codex_pool}" "${codex_session}" "${session_nonce}"
@@ -3517,5 +3563,9 @@ if [[ "${release_gate}" -eq 1 ]]; then
   fi
   log "ACP v2 RELEASE GATE PASSED on context ${context}"
 else
-  log "ACP v2 smoke validation passed on context ${context}; release-only publication, remote verification, Task result/fork, and scale-to-zero gates were skipped. Set RELEASE_GATE=1 for release acceptance."
+  if [[ "${shared_mutation_checks_skipped}" -eq 1 ]]; then
+    log "ACP v2 shared-namespace smoke validation passed on context ${context}; controller restart and RuntimePool lifecycle/replacement checks were skipped. Use an isolated namespace for complete smoke acceptance."
+  else
+    log "ACP v2 smoke validation passed on context ${context}; release-only publication, remote verification, Task result/fork, and scale-to-zero gates were skipped. Set RELEASE_GATE=1 for release acceptance."
+  fi
 fi

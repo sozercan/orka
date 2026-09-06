@@ -302,8 +302,8 @@ func enableControllerTelemetryForE2E(snapshot otelControllerSnapshot) {
 		"OTEL_EXPORTER_OTLP_ENDPOINT":        otelCollectorServiceAddr(),
 		"OTEL_EXPORTER_OTLP_INSECURE":        "true",
 		"OTEL_EXPORTER_OTLP_PROTOCOL":        "grpc",
-		"OTEL_EXPORTER_OTLP_TIMEOUT":         "5s",
-		"OTEL_EXPORTER_OTLP_METRICS_TIMEOUT": "5s",
+		"OTEL_EXPORTER_OTLP_TIMEOUT":         "5000",
+		"OTEL_EXPORTER_OTLP_METRICS_TIMEOUT": "5000",
 		"OTEL_RESOURCE_ATTRIBUTES":           "orka.e2e.test=otel-genai",
 	})
 

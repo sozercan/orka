@@ -1,8 +1,9 @@
 ---
 slug: /agent-runtimes
+description: "How Orka runs coding agents: ACP RuntimePools, sessions, and the pool lifecycle."
 ---
 
-# Agent Runtimes
+# Agent runtimes
 
 `type: agent` Tasks use the ACP core runtime and the `orka.harness.v2` session protocol. Built-in Codex, Claude, Copilot, and OpenCode profiles run in controller-owned `RuntimePool` resources; there is no per-Task agent Job and no fallback runtime path.
 
@@ -59,12 +60,23 @@ The first-release defaults are:
 
 Pool lifecycle is:
 
-```text
-Stopped -> Starting -> Serving
-Serving -> Draining -> Quiescent -> Stopping -> Stopped
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Stopped
+    Stopped --> Starting: a Task needs this pool
+    Starting --> Serving: Pod ready
+    Serving --> Draining: replacement or scale-down
+    Draining --> Quiescent: last session finished
+    Quiescent --> Stopping
+    Stopping --> Stopped
 ```
 
-`Degraded` and `Ambiguous` close admission. Every mutating request is fenced by the controller epoch, pool UID/generation, exact runtime instance and supervisor boot ID, RuntimeSession UID/generation, operation ID, request digest, and expiry.
+`Serving` is the only lifecycle that admits a new RuntimeSession, and only while
+`status.admissionState` is also `Accepting`. Two more lifecycles are not shown above because the
+controller can enter them from anywhere: **`Degraded`** (something is wrong — rollout failed,
+scheduling failed, quota denied) and **`Ambiguous`** (the controller cannot prove what the pool is
+doing). Both close admission, so new work waits instead of landing on a pool nobody can vouch for.
 
 Capacity reservations live in `RuntimePool.status` and use Kubernetes
 `resourceVersion` compare-and-swap. The dispatcher claims a resident/prompt slot
@@ -75,39 +87,60 @@ Inspect pools with:
 
 ```bash
 orka runtime-pool list
-orka runtime-pool get <pool-name> -o yaml
+orka runtime-pool get '<pool-name>' -o yaml
 kubectl get runtimepools
 ```
 
 ## ACP v2 Task lifecycle
 
-The durable Task execution state is independent from the top-level compatibility phase:
+The durable Task execution state is independent from the top-level compatibility phase. It is
+drawn in full under [Task lifecycle](architecture.md#task-lifecycle). Two states are worth calling
+out here:
 
-```text
-Queued -> Reserved -> SessionStarting -> Planned -> Submitting
-       -> Accepted -> Running -> Settling
-       -> Succeeded | Failed | Cancelled | OutcomeUnknown
+- `SubmittedUnknown` records a loss in the submit acknowledgement window — Orka sent the prompt and
+  never learned whether the runtime received it.
+- `OutcomeUnknown` is terminal for that attempt. Do not treat it as a generic retryable failure;
+  the whole point is that a retry might run your prompt a second time.
+
+For built-in runtimes, the RuntimeSession lifecycle is:
+
+```mermaid
+stateDiagram-v2
+    [*] --> creating
+    creating --> idle
+    idle --> prompt_running: prompt admitted
+    prompt_running --> validating: prompt settled
+    validating --> idle: read Task, or no changes
+    validating --> preparing_publication: write Task with changes
+
+    preparing_publication --> publication_prepared
+    publication_prepared --> finalizing: publication reconciled
+    finalizing --> deleting
+
+    idle --> deleting
+    deleting --> deleted
+    deleted --> [*]
+
+    prompt_running --> cancelling: cancellation requested
+    cancelling --> poisoned
+    poisoned --> deleting
 ```
 
-`SubmittedUnknown` records a loss in the submit acknowledgement window. `OutcomeUnknown` is terminal for that attempt and must not be treated as a generic retryable failure.
+Reading it:
 
-Within the pool, a RuntimeSession moves through:
-
-```text
-creating -> idle -> prompt_running -> validating
-         -> finalizing -> idle
-```
-
-A write Task with changes additionally uses:
-
-```text
-validating -> preparing_publication -> publication_prepared
-           -> publishing -> verifying -> finalizing
-```
-
-Cancellation moves an active session through `cancelling`. A session that cannot prove process cleanup, workspace integrity, or publication safety becomes `poisoned` and is deleted; the pool may be recycled.
-
-Only an `idle` RuntimeSession can accept a prompt or be evicted. Validation, publication, finalization, and Session lease release complete before terminal Task status is exposed.
+- **Only an `idle` session can accept a prompt or be evicted.** Everything else is busy holding
+  state that must not be interrupted.
+- The session freezes the validated workspace delta and waits in `publication_prepared`.
+  The controller and clean-room Publisher prepare the commit, push, and verify the remote,
+  recording progress in a `Publication`. The controller then asks the supervisor to finalize
+  the session using the terminal publication receipt.
+- **`poisoned`** is the escape hatch for uncertainty. A session that cannot prove it cleaned up its
+  processes, that its workspace is intact, or that publication was safe is poisoned and deleted
+  rather than reused. The pool may be recycled with it. Any state above can reach `poisoned`; the
+  arrows are omitted so the main flow stays readable.
+- Validation, publication, finalization, and the release of the Session lease all complete before
+  the Task shows a terminal status. A `Succeeded` Task means the work is done and verified, not
+  merely started.
 
 ## Durable control authority
 
@@ -125,6 +158,57 @@ SQLite is not a second ACP control authority. It persists transcript and
 SessionTurn payloads, deferred outbox projections, and artifacts
 behind the Kubernetes fences. Cross-store finalization binds the exact outbox
 projection before releasing the Session lease.
+
+### What a fence is, and why every request carries one
+
+A **fence** is a set of identifiers attached to every mutating request. The receiver compares
+them against what it believes to be true and rejects anything that does not match exactly.
+
+The problem it solves: a controller can be network-partitioned, lose leadership, come back, and
+try to finish work it started — while a *new* controller is already doing that work. Without a
+fence, the old controller's late request looks identical to a legitimate one. With a fence, its
+stale controller epoch does not match and the request is refused.
+
+The identifiers nest, from the widest scope to the narrowest:
+
+```mermaid
+flowchart TD
+    Epoch["<b>controllerEpoch</b><br/>which controller is in charge"]
+    Pool["<b>runtimePoolUID</b> + <b>runtimePoolGeneration</b><br/>which pool, at which version of its spec"]
+    Inst["<b>runtimeInstanceID</b> + <b>supervisorBootID</b><br/>which Pod, and which boot of the process inside it"]
+    Profile["<b>runtimeProfileDigest</b><br/>which immutable image + profile is running"]
+    Sess["<b>runtimeSessionUID</b> + <b>runtimeSessionGeneration</b><br/>which session, at which version"]
+    Op["<b>operationID</b> + <b>requestDigest</b> + <b>expiresAt</b><br/>this one request, unmodified, still in date"]
+
+    Epoch --> Pool --> Inst --> Profile --> Sess --> Op
+
+    style Epoch fill:#f3f0ff,stroke:#7048e8
+    style Op fill:#fff4e6,stroke:#d9822b
+```
+
+| Field | Rejects | Because |
+| --- | --- | --- |
+| `controllerEpoch` | a controller that lost leadership | a new controller has taken over |
+| `runtimePoolUID` / `runtimePoolGeneration` | a request for a deleted or reconfigured pool | the pool it was written for no longer exists in that shape |
+| `runtimeInstanceID` / `supervisorBootID` | a request aimed at a Pod that has since restarted | the process that held the session state is gone |
+| `runtimeProfileDigest` | a request assuming a different image or profile | the runtime is not the one the request was planned against |
+| `runtimeSessionUID` / `runtimeSessionGeneration` | a request for a session that was recreated | the new session is not the old one, even under the same name |
+| `operationID` | reuse of an operation ID with a different request digest | one operation ID identifies one immutable request |
+| `requestDigest` | a request whose body was altered in transit | the digest covers the whole request |
+| `expiresAt` | a request that sat in a queue too long | the world may have moved on |
+
+Session-scoped fields are omitted for pool-wide operations such as drain, which have no session.
+
+Identical retries with the same `operationID` and `requestDigest` replay the recorded response
+without repeating the effect, provided the fences and expiry are still valid. These replays
+return HTTP 200; reusing the operation ID with a different digest returns `digest_conflict`
+with HTTP 409.
+
+If an authenticated drain request or status probe fails during rollout or scale-down, the
+controller marks the `RuntimePool` as `Degraded`, closes admission, and preserves the old Pod.
+Later reconciles recheck the drain, and replacement or scale-down requires authenticated
+quiescence. Prompt or publication outcomes that cannot be proven may put a Task in
+`OutcomeUnknown`; see [Task lifecycle](architecture.md#task-lifecycle).
 
 ## Create an Agent
 
@@ -340,13 +424,21 @@ immutable images:
 ```text
 --controller-mode=harness-v2
 --acp-runtime-namespace=orka-runtimes
---acp-provider-proxy-namespace=vekil-system
+--acp-provider-proxy-namespace=orka-system
 --acp-provider-proxy-base-url=http://provider-auth-proxy.orka-system.svc:8080
 --acp-codex-runtime-image=<repository>@sha256:<digest>
 --acp-claude-runtime-image=<repository>@sha256:<digest>
 --acp-copilot-runtime-image=<repository>@sha256:<digest>
 --acp-opencode-runtime-image=<repository>@sha256:<digest>
 ```
+
+:::warning[The two provider-proxy flags must name the same namespace]
+`--acp-provider-proxy-base-url` is the address runtime Pods call.
+`--acp-provider-proxy-namespace` is what the generated NetworkPolicy allows them to reach.
+If they disagree, every provider call is dropped by default-deny egress with no useful error.
+The flag defaults to `vekil-system`, but the Helm chart overrides it to the release namespace
+(`orka-system` on a default install), which is where the chart puts `provider-auth-proxy`.
+:::
 
 Mutable image tags are rejected for built-in pools. For Kustomize deployment,
 apply `config/acp-production`; `config/default` alone omits the required

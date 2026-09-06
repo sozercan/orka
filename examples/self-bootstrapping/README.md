@@ -17,8 +17,8 @@ Update `spec.providerRef.name` in `coordinator-agent.yaml` to match the Provider
 
 ### Via YAML
 ```bash
-kubectl apply -f examples/self-bootstrapping/coordinator-agent.yaml
-kubectl apply -f examples/self-bootstrapping/coordinator-task.yaml
+kubectl -n orka-system apply -f examples/self-bootstrapping/coordinator-agent.yaml
+kubectl -n orka-system apply -f examples/self-bootstrapping/coordinator-task.yaml
 ```
 
 ### Via Chat (One-Shot)
@@ -29,7 +29,7 @@ The chat can bootstrap the coordinator and let it create the specialists it need
 
 ### Via CLI
 ```bash
-orka task create --agent coordinator "Build a TODO REST API in Go with CRUD endpoints and tests"
+orka -n orka-system task create --agent coordinator "Build a TODO REST API in Go with CRUD endpoints and tests"
 ```
 
 ## Key Concepts

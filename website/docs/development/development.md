@@ -1,18 +1,25 @@
 ---
 slug: /development
+description: "Building, running, and regenerating Orka locally."
 ---
 
 # Development
 
 ## Prerequisites
 
-- Go 1.25.3+
-- Bun (for UI build)
-- Docker 17.03+
-- kubectl (version compatible with your cluster)
-- Access to a Kubernetes cluster
+| Tool | Version | Notes |
+| --- | --- | --- |
+| Go | 1.26.2 or newer | `go.mod` sets `go 1.26.2` and pins `toolchain go1.27.0`, so Go downloads 1.27.0 for you. CI builds on 1.27. |
+| Bun | current | Builds the React dashboard, which is embedded into the controller binary. |
+| Docker | with BuildKit | The Dockerfiles use BuildKit syntax. Docker Desktop and any modern Docker Engine have it on by default. |
+| kubectl | matching your cluster | |
+| A Kubernetes cluster | | [kind](https://kind.sigs.k8s.io/) is fine for development. |
 
-## Build Commands
+## Build commands
+
+For the local run, replace `/path/outside-the-repository` with a private, writable
+directory for the persistent database and snapshot key. `RUN_STORE_PATH` overrides
+the controller's `/data/orka.db` default.
 
 ```bash
 # Generate Go types, the installer manifest, and the Helm staging chart
@@ -28,10 +35,11 @@ make build-cli
 # Run locally with one persistent AES-256 snapshot key
 openssl rand 32 > /path/outside-the-repository/orka-snapshot-key
 chmod 600 /path/outside-the-repository/orka-snapshot-key
-make run RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE=/path/outside-the-repository/orka-snapshot-key
+make run RUN_STORE_PATH=/path/outside-the-repository/orka.db \
+  RUN_AGENT_EXECUTION_SNAPSHOT_KEY_FILE=/path/outside-the-repository/orka-snapshot-key
 ```
 
-## Helm Chart Generation and Releases
+## Helm chart generation and releases
 
 Orka uses a staged chart flow. The editable Helm generator and static chart inputs live under `cmd/build/helmify/`; canonical Kubernetes resources live under `config/`. Generated and promoted outputs are committed so pull requests and release preparation review the exact manifests that will ship.
 
@@ -60,7 +68,7 @@ make promote-staging-manifest
 
 The first target updates release inputs and regenerates staging. The second copies the reviewed staging installer and chart into `deploy/` and `charts/orka/`. Normally `.github/workflows/release-pr.yml` runs both and opens the release-preparation PR. A matching `v*` tag packages and publishes those committed root snapshots; tag workflows do not regenerate or promote manifests.
 
-CRDs are generated into `config/crd/bases/`, while `config/crd/kustomization.yaml` selects the production APIs packaged in the installer and chart. The development-only fake workspace CRDs and RBAC are kept in the separate `config/development/fake-workspace-provider` package. Helm makes production CRDs available on fresh install but does not update them during upgrades. Apply the CRDs from the exact target chart before upgrading the controller, as documented in `charts/orka/README.md`.
+CRDs are generated into `config/crd/bases/`, while `config/crd/kustomization.yaml` selects the production APIs packaged in the installer and chart. The development-only fake workspace CRDs and RBAC are kept in the separate `config/development/fake-workspace-provider` package. Helm makes production CRDs available on fresh install but does not update them during upgrades. Apply the CRDs from the exact target chart before upgrading the controller — see [Upgrading](../operations/upgrading.md).
 
 ## Testing
 
@@ -78,7 +86,7 @@ make test-e2e
 
 See [Testing](testing.md) for full test structure and patterns.
 
-### CI Validation
+### CI validation
 
 The repository has additional GitHub Actions workflows in addition to the normal test matrix:
 
@@ -160,7 +168,7 @@ Run disabled-telemetry hot-path benchmarks with:
 go test ./internal/llm ./internal/tools ./internal/worker -run '^$' -bench 'Telemetry|Tracing|ExecuteTool|ToolExecutor' -benchmem
 ```
 
-## UI Development
+## UI development
 
 ```bash
 make ui-install         # Install UI dependencies (bun)
@@ -171,7 +179,7 @@ make ui-test            # Run UI unit tests
 make ui-test-coverage   # Run UI tests with coverage
 ```
 
-## Docker Images
+## Docker images
 
 ```bash
 # Build images
@@ -197,22 +205,22 @@ make docker-push-workspace-publisher
 make docker-push-all
 ```
 
-## Local Development with Kind
+## Local development with Kind
 
 ```bash
 kind create cluster
 make docker-build-all
 # Push/load the images, then use immutable runtime digests for deployment.
 make deploy \
-  IMG=<repo>@sha256:<controller-digest> \
-  ACP_CODEX_RUNTIME_IMG=<registry>/acp-codex@sha256:<digest> \
-  ACP_CLAUDE_RUNTIME_IMG=<registry>/acp-claude@sha256:<digest> \
-  ACP_COPILOT_RUNTIME_IMG=<registry>/acp-copilot@sha256:<digest> \
-  ACP_OPENCODE_RUNTIME_IMG=<registry>/acp-opencode@sha256:<digest> \
-  WORKSPACE_PUBLISHER_IMG=<repo>@sha256:<publisher-digest>
+  IMG='<repo>@sha256:<controller-digest>' \
+  ACP_CODEX_RUNTIME_IMG='<registry>/acp-codex@sha256:<digest>' \
+  ACP_CLAUDE_RUNTIME_IMG='<registry>/acp-claude@sha256:<digest>' \
+  ACP_COPILOT_RUNTIME_IMG='<registry>/acp-copilot@sha256:<digest>' \
+  ACP_OPENCODE_RUNTIME_IMG='<registry>/acp-opencode@sha256:<digest>' \
+  WORKSPACE_PUBLISHER_IMG='<repo>@sha256:<publisher-digest>'
 ```
 
-### Demo Cluster + Recordings
+### Demo cluster + recordings
 
 For interactive presentations and asciinema recordings of `hack/demos/`,
 a one-shot bootstrap is available:
@@ -230,7 +238,7 @@ and pick a short or long request body via
 `DEMO_REQUEST_PRESET=quiet-flag|readme-fix|vekil-metrics`. See
 `hack/demos/RECORDING.md` for the full design.
 
-## Generate Installer YAML
+## Generate installer YAML
 
 The installer manifest is generated into `manifest_staging/deploy/orka.yaml` by
 the staged manifest flow:
@@ -242,9 +250,9 @@ make manifests
 See [Helm Chart Generation and Releases](#helm-chart-generation-and-releases)
 for how staging output is promoted into `deploy/` at release time.
 
-## Build Gotchas
+## Build gotchas
 
-### UI Embedding
+### UI embedding
 
 `make build` embeds the React UI into the controller binary via `//go:embed`. The UI must be built first:
 
@@ -255,7 +263,7 @@ make build       # Now the Go build will succeed
 
 If the UI isn't built, the `ensure-ui-embed` Makefile target creates a stub `internal/uiembed/dist/index.html` so the Go build doesn't fail — but the embedded UI won't work.
 
-### CLI Version Injection
+### CLI version injection
 
 `make build-cli` injects Git version info via `-ldflags`:
 
@@ -263,7 +271,7 @@ If the UI isn't built, the `ensure-ui-embed` Makefile target creates a stub `int
 make build-cli   # Produces bin/orka with embedded version
 ```
 
-### Metrics Disabled by Default
+### Metrics disabled by default
 
 The controller's `--metrics-bind-address` defaults to `0` (disabled). Set it explicitly to enable Prometheus metrics:
 
@@ -271,11 +279,11 @@ The controller's `--metrics-bind-address` defaults to `0` (disabled). Set it exp
 --metrics-bind-address=:8443
 ```
 
-### HTTP/2 Disabled by Default
+### HTTP/2 disabled by default
 
 HTTP/2 is disabled for metrics and webhook servers due to CVEs ([GHSA-qppj-fm5r-hxr3](https://github.com/advisories/GHSA-qppj-fm5r-hxr3), [GHSA-4374-p667-p6c8](https://github.com/advisories/GHSA-4374-p667-p6c8)). Use `--enable-http2=true` only if needed.
 
-### Leader Election
+### Leader election
 
 Leader election ID is hardcoded as `03b49a10.orka.ai`, and its Lease is stored
 in the controller's required non-empty watch namespace. Static `harness-v1` and

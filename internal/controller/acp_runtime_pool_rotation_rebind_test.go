@@ -18,7 +18,7 @@ import (
 )
 
 //nolint:gocyclo // The regression verifies frozen binding and no-replay invariants in one durable attempt lifecycle.
-func TestQueueACPRuntimeTaskKeepsFrozenPoolAfterRuntimeImageRotation(t *testing.T) {
+func TestQueueACPRuntimeTaskRebindsPreSubmissionAttemptAfterRuntimeImageRotation(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -147,18 +147,18 @@ func TestQueueACPRuntimeTaskKeepsFrozenPoolAfterRuntimeImageRotation(t *testing.
 	if after.State != corev1alpha1.TaskExecutionStateQueued {
 		t.Fatalf("execution state = %s, want Queued", after.State)
 	}
-	if after.RuntimePoolName != before.RuntimePoolName || after.RuntimePoolUID != before.RuntimePoolUID {
-		t.Fatalf("queued Task escaped its frozen RuntimePool after live image rotation: before=%#v after=%#v", before, after)
+	if after.RuntimePoolName != newPlan.PoolName || after.RuntimePoolUID != string(newPoolFixture.UID) {
+		t.Fatalf("queued Task did not move to the approved RuntimePool after image rotation: before=%#v after=%#v", before, after)
 	}
 	if queuedAfter.Labels[acpRuntimeTaskPoolLabel] != after.RuntimePoolName {
 		t.Fatalf("pool label = %q, want %q", queuedAfter.Labels[acpRuntimeTaskPoolLabel], after.RuntimePoolName)
 	}
-	frozenPool := &corev1alpha1.RuntimePool{}
-	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: after.RuntimePoolName}, frozenPool); err != nil {
+	approvedPool := &corev1alpha1.RuntimePool{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: after.RuntimePoolName}, approvedPool); err != nil {
 		t.Fatal(err)
 	}
-	if frozenPool.Spec.Runtime.Image != oldImage || string(frozenPool.UID) != after.RuntimePoolUID {
-		t.Fatalf("frozen pool binding = image %q UID %q, status = %#v", frozenPool.Spec.Runtime.Image, frozenPool.UID, after)
+	if approvedPool.Spec.Runtime.Image != newImage || string(approvedPool.UID) != after.RuntimePoolUID {
+		t.Fatalf("approved pool binding = image %q UID %q, status = %#v", approvedPool.Spec.Runtime.Image, approvedPool.UID, after)
 	}
 	if queuedAfter.Status.Attempts != queuedBefore.Status.Attempts || after.Attempt != before.Attempt || after.PromptID != before.PromptID || after.RequestDigest != before.RequestDigest {
 		t.Fatalf("rebind changed durable attempt identity: before=%#v after=%#v attempts=%d/%d", before, after, queuedBefore.Status.Attempts, queuedAfter.Status.Attempts)

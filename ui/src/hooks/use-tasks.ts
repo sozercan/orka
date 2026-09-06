@@ -1,49 +1,62 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ApiError, api, isForbiddenError, isNotFoundError } from '@/lib/api-client'
+import { isPaginationProtocolError, pageParams, pollUnlessForbidden, retryUnlessForbidden, maxListWalkPages, walkAllPages, type ListResponse } from '@/lib/list-api'
+import { useAuthStore } from '@/stores/auth'
 import { useUIStore } from '@/stores/ui'
 import type { ExecutionEvent, Task, TaskEventsResponse } from '@/schemas/task'
 
-interface ListResponse<T> {
-  items: T[]
-  metadata: { continue?: string; remainingItemCount?: number }
-}
-
 function fetchTaskListPage(namespace: string, limit: string, continueToken?: string) {
-  const params: Record<string, string> = { namespace, limit }
-  if (continueToken) params.continue = continueToken
-  return api.get<ListResponse<Task>>('/tasks', params)
+  return api.get<ListResponse<Task>>('/tasks', pageParams({ namespace, limit }, continueToken))
 }
 
 export function useTaskList(limit = '25', refetchInterval: number | false = 10000) {
   const namespace = useUIStore((s) => s.namespace)
+  const token = useAuthStore((s) => s.token)
   return useQuery({
     queryKey: ['tasks', namespace, limit],
     queryFn: () => fetchTaskListPage(namespace, limit),
-    refetchInterval,
+    enabled: Boolean(token),
+    retry: retryUnlessForbidden,
+    refetchInterval: pollUnlessForbidden(refetchInterval),
+  })
+}
+
+// Page-by-page task listing for the Tasks view: the first page loads on its
+// own and every later page follows metadata.continue on demand, so a
+// namespace with more tasks than one page is never silently truncated.
+export function useTaskListPages(limit = '25', refetchInterval: number | false = 10000) {
+  const namespace = useUIStore((s) => s.namespace)
+  const token = useAuthStore((s) => s.token)
+  return useInfiniteQuery({
+    queryKey: ['tasks', 'pages', namespace, limit],
+    queryFn: ({ pageParam }) => fetchTaskListPage(namespace, limit, pageParam || undefined),
+    initialPageParam: '',
+    getNextPageParam: (lastPage) => lastPage.metadata?.continue || undefined,
+    enabled: Boolean(token),
+    retry: retryUnlessForbidden,
+    refetchInterval: pollUnlessForbidden(refetchInterval),
   })
 }
 
 export function useTaskListAll(pageLimit = '100', refetchInterval: number | false = 10000) {
   const namespace = useUIStore((s) => s.namespace)
+  const token = useAuthStore((s) => s.token)
   return useQuery({
     queryKey: ['tasks', 'all', namespace, pageLimit],
-    queryFn: async () => {
-      const items: Task[] = []
-      const seen = new Set<string>()
-      let metadata: ListResponse<Task>['metadata'] = {}
-      let continueToken: string | undefined
-      do {
-        const page = await fetchTaskListPage(namespace, pageLimit, continueToken)
-        items.push(...page.items)
-        metadata = page.metadata ?? {}
-        const next = metadata.continue
-        if (next && seen.has(next)) throw new Error('task list pagination repeated continuation cursor')
-        if (next) seen.add(next)
-        continueToken = next
-      } while (continueToken)
-      return { items, metadata }
-    },
-    refetchInterval,
+    enabled: Boolean(token),
+    // Bounded by maxListWalkPages; views built on this walk are summaries and
+    // must surface `truncated`.
+    queryFn: () => walkAllPages(
+      (continueToken) => fetchTaskListPage(namespace, pageLimit, continueToken),
+      { subject: 'task list', maxPages: maxListWalkPages },
+    ),
+    // A 403 is permanent for this identity, and a repeated continuation
+    // cursor is a server-side protocol fault: neither improves on retry, so
+    // stop retrying (and, for 403, polling) instead of generating denied or
+    // looping requests and audit noise.
+    retry: (failureCount, error) =>
+      !isForbiddenError(error) && !isPaginationProtocolError(error) && failureCount < 3,
+    refetchInterval: pollUnlessForbidden(refetchInterval),
   })
 }
 

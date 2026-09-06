@@ -58,8 +58,8 @@ webhooks:
     matchConditions:
       - name: reserved-acp-workspace-lease-name
         expression: >-
-          request.name.startsWith('acp-suspend-quota-') ||
-          request.name.startsWith('acp-retention-fence-') ||
+          request.?name.orValue('').startsWith('acp-suspend-quota-') ||
+          request.?name.orValue('').startsWith('acp-retention-fence-') ||
           (request.operation == 'CREATE' &&
           (object.metadata.?generateName.orValue('').startsWith('acp-suspend-quota-') ||
           object.metadata.?generateName.orValue('').startsWith('acp-retention-fence-')))

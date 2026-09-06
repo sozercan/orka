@@ -81,18 +81,6 @@ func (s *Store) GetSessionLineage(ctx context.Context, namespace, sessionName st
 	return lineage, nil
 }
 
-// DeleteSessionLineage implements store.SessionLineageStore.
-func (s *Store) DeleteSessionLineage(ctx context.Context, namespace, sessionName string) error {
-	if strings.TrimSpace(namespace) == "" || strings.TrimSpace(sessionName) == "" {
-		return store.ValidationErrorf("session lineage namespace and session name are required")
-	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM session_lineages
-		WHERE namespace = ? AND session_name = ?`, namespace, sessionName); err != nil {
-		return fmt.Errorf("delete session lineage: %w", err)
-	}
-	return nil
-}
-
 const sessionLineageSelectSQL = `SELECT namespace, session_name, namespace_uid, session_uid,
 	contract_version, lineage_generation, runtime_identity, config_digest, version,
 	created_at, updated_at

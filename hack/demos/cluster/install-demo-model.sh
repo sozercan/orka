@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 cluster_name="${ORKA_DEMO_CLUSTER:-orka-demo}"
-demo_namespace="${DEMO_NAMESPACE:-demo-magic}"
+demo_namespace="${DEMO_NAMESPACE:-orka-system}"
 vekil_ns="${VEKIL_NAMESPACE:-vekil-system}"
 
 provider_ref="${DEMO_PROVIDER_REF:-vekil-proxy}"

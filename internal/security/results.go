@@ -25,18 +25,21 @@ const (
 	maxFindingsResultBytes    = 512 << 10
 	maxValidationResultBytes  = 256 << 10
 	maxPatchResultBytes       = 64 << 10
-	maxPatchSummaryBytes      = 16 << 10
-	maxPatchChangedFiles      = 64
-	maxPatchTestsRun          = 64
-	maxReviewContextBytes     = 256 << 10
-	maxThreatModelBytes       = 768 << 10
-	maxFindingTextBytes       = 64 << 10
-	maxFindingSummaryBytes    = 16 << 10
-	maxFindingEvidenceRefs    = 32
-	maxFindingsPerSlice       = 3
-	maxValidationListItems    = 64
-	maxValidationItemBytes    = 8 << 10
-	maxValidationEvidenceRefs = 32
+	// MaxPatchSummaryArtifactBytes bounds a pre-existing patch summary
+	// artifact before it is decoded; it matches the terminal-result cap.
+	MaxPatchSummaryArtifactBytes = maxPatchResultBytes
+	maxPatchSummaryBytes         = 16 << 10
+	maxPatchChangedFiles         = 64
+	maxPatchTestsRun             = 64
+	maxReviewContextBytes        = 256 << 10
+	maxThreatModelBytes          = 768 << 10
+	maxFindingTextBytes          = 64 << 10
+	maxFindingSummaryBytes       = 16 << 10
+	maxFindingEvidenceRefs       = 32
+	maxFindingsPerSlice          = 3
+	maxValidationListItems       = 64
+	maxValidationItemBytes       = 8 << 10
+	maxValidationEvidenceRefs    = 32
 )
 
 // AgentResultBinding is controller-owned identity that every SecurityScan
@@ -525,7 +528,31 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 	if strings.TrimSpace(expected.FindingID) == "" || result.FindingID != expected.FindingID {
 		return nil, fmt.Errorf("patch result findingId does not match the expected finding")
 	}
-	summary := strings.TrimSpace(stripUnsafeTextRunes(result.Summary))
+	return NormalizePatchSummaryArtifact(PatchSummaryArtifact{
+		SchemaVersion: SchemaVersionPatchSummary,
+		FindingID:     result.FindingID,
+		Summary:       result.Summary,
+		ChangedFiles:  result.ChangedFiles,
+		TestsRun:      result.TestsRun,
+		Risk:          result.Risk,
+	})
+}
+
+// NormalizePatchSummaryArtifact applies the bounded, credential-rejecting
+// validation every durable patch summary must pass, whether it arrived as a
+// harness-v2 terminal result or as a pre-existing artifact written through the
+// upload API. Summary text, changed-file paths, and test commands are
+// agent-controlled and persist in artifacts, status, and PR bodies, so a
+// credential-shaped value in any of them fails closed; the value itself is
+// deliberately kept out of the error.
+func NormalizePatchSummaryArtifact(artifact PatchSummaryArtifact) (*PatchSummaryArtifact, error) {
+	if artifact.SchemaVersion != SchemaVersionPatchSummary {
+		return nil, fmt.Errorf("unsupported patch summary schemaVersion %d", artifact.SchemaVersion)
+	}
+	if strings.TrimSpace(artifact.FindingID) == "" {
+		return nil, fmt.Errorf("patch summary findingId is required")
+	}
+	summary := strings.TrimSpace(stripUnsafeTextRunes(artifact.Summary))
 	if summary == "" {
 		return nil, fmt.Errorf("patch summary is required")
 	}
@@ -542,15 +569,15 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 	if LooksLikeSecret(summary) {
 		return nil, fmt.Errorf("patch summary contains a credential-shaped value")
 	}
-	if len(result.ChangedFiles) == 0 {
+	if len(artifact.ChangedFiles) == 0 {
 		return nil, fmt.Errorf("patch changedFiles is required")
 	}
-	if len(result.ChangedFiles) > maxPatchChangedFiles {
+	if len(artifact.ChangedFiles) > maxPatchChangedFiles {
 		return nil, fmt.Errorf("patch changedFiles exceeds %d entries", maxPatchChangedFiles)
 	}
-	changed := make([]string, 0, len(result.ChangedFiles))
-	seen := make(map[string]struct{}, len(result.ChangedFiles))
-	for _, file := range result.ChangedFiles {
+	changed := make([]string, 0, len(artifact.ChangedFiles))
+	seen := make(map[string]struct{}, len(artifact.ChangedFiles))
+	for _, file := range artifact.ChangedFiles {
 		file = strings.TrimSpace(strings.ReplaceAll(stripUnsafeTextRunes(file), "\\", "/"))
 		for strings.HasPrefix(file, "./") {
 			file = strings.TrimPrefix(file, "./")
@@ -569,20 +596,24 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 		seen[file] = struct{}{}
 		changed = append(changed, file)
 	}
-	if len(result.TestsRun) > maxPatchTestsRun {
+	if len(artifact.TestsRun) > maxPatchTestsRun {
 		return nil, fmt.Errorf("patch testsRun exceeds %d entries", maxPatchTestsRun)
 	}
-	for i := range result.TestsRun {
-		command := strings.TrimSpace(stripUnsafeTextRunes(result.TestsRun[i].Command))
+	var testsRun []PatchTestRun
+	if len(artifact.TestsRun) > 0 {
+		testsRun = make([]PatchTestRun, len(artifact.TestsRun))
+	}
+	for i, run := range artifact.TestsRun {
+		command := strings.TrimSpace(stripUnsafeTextRunes(run.Command))
 		if command == "" || len(command) > maxValidationItemBytes {
 			return nil, fmt.Errorf("patch testsRun contains an invalid command")
 		}
 		if LooksLikeSecret(command) {
 			return nil, fmt.Errorf("patch testsRun contains a credential-shaped command")
 		}
-		result.TestsRun[i].Command = command
+		testsRun[i] = PatchTestRun{Command: command, ExitCode: run.ExitCode}
 	}
-	risk := strings.ToLower(strings.TrimSpace(result.Risk))
+	risk := strings.ToLower(strings.TrimSpace(artifact.Risk))
 	switch risk {
 	case "low", "medium", "high":
 	default:
@@ -590,10 +621,10 @@ func ParsePatchResult(data []byte, expected PatchResultExpectation) (*PatchSumma
 	}
 	return &PatchSummaryArtifact{
 		SchemaVersion: SchemaVersionPatchSummary,
-		FindingID:     result.FindingID,
+		FindingID:     artifact.FindingID,
 		Summary:       summary,
 		ChangedFiles:  changed,
-		TestsRun:      result.TestsRun,
+		TestsRun:      testsRun,
 		Risk:          risk,
 	}, nil
 }

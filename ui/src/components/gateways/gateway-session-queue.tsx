@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { GatewayEvent } from '@/schemas/gateway'
 import { GatewayStatusBadge } from './gateway-tables'
+import { formatTimestamp } from '@/lib/time'
 
 const ACTIVE_QUEUE_STATES = new Set<GatewayEvent['state']>([
   'Accepted',
@@ -95,7 +96,7 @@ export function GatewaySessionQueue({ events, loading }: { events: GatewayEvent[
                             {event.bindingName && <span>Binding {event.bindingName}</span>}
                             <span className="inline-flex items-center gap-1">
                               <Clock3 className="h-3.5 w-3.5" />
-                              {formatTimestamp(event.receivedAt)}
+                              {formatTimestamp(event.receivedAt, { empty: '' })}
                             </span>
                           </div>
                         </div>
@@ -148,7 +149,3 @@ function timestampValue(value: string) {
   return Number.isNaN(timestamp) ? Number.MAX_SAFE_INTEGER : timestamp
 }
 
-function formatTimestamp(value: string) {
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
-}

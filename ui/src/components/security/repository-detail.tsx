@@ -8,15 +8,8 @@ import { useAllFindings, useDroppedFindings, useRepositoryScan, useReviewSlices,
 import { ThreatModelEditor } from './threat-model-editor'
 import { RecommendedFindings } from './recommended-findings'
 import { FindingTable } from './finding-table'
-
-function timeAgo(ts?: string) {
-  if (!ts) return 'Never'
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(ts).getTime()) / 1000))
-  if (seconds < 60) return `${seconds}s ago`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  return `${Math.floor(seconds / 86400)}d ago`
-}
+import { repositoryDisplayName } from '@/lib/repository-name'
+import { timeAgo } from '@/lib/time'
 
 export function RepositoryDetail({ repositoryName }: { repositoryName: string }) {
   const { data: repo, isLoading } = useRepositoryScan(repositoryName)
@@ -47,7 +40,7 @@ export function RepositoryDetail({ repositoryName }: { repositoryName: string })
   return (
     <div className="space-y-4">
       <PageHeader
-        title={`${repo.spec.owner}/${repo.spec.repository}`}
+        title={repositoryDisplayName(repo.spec, repo.metadata.name)}
         description={repo.spec.repoURL}
         action={
           <>
@@ -88,7 +81,7 @@ export function RepositoryDetail({ repositoryName }: { repositoryName: string })
         </Card>
         <Card>
           <CardHeader><CardTitle className="text-base">Last Successful Scan</CardTitle></CardHeader>
-          <CardContent>{timeAgo(repo.status?.lastSuccessfulScanAt)}</CardContent>
+          <CardContent>{timeAgo(repo.status?.lastSuccessfulScanAt, { empty: 'Never' })}</CardContent>
         </Card>
         <Card>
           <CardHeader><CardTitle className="text-base">Threat Model Version</CardTitle></CardHeader>
@@ -135,7 +128,7 @@ export function RepositoryDetail({ repositoryName }: { repositoryName: string })
                 <div key={item.id} className="rounded-md border border-border p-2">
                   <div className="flex items-center justify-between gap-2">
                     <Badge variant="secondary">{item.layer || 'unknown'}</Badge>
-                    <span className="text-xs text-muted-foreground">{timeAgo(item.createdAt)}</span>
+                    <span className="text-xs text-muted-foreground">{timeAgo(item.createdAt, { empty: 'Never' })}</span>
                   </div>
                   <div className="mt-2 text-xs text-muted-foreground">{item.reason}</div>
                 </div>
@@ -183,7 +176,7 @@ export function RepositoryDetail({ repositoryName }: { repositoryName: string })
                   </div>
                   <div className="mt-1 text-muted-foreground">{run.summary || run.taskName}</div>
                   <div className="mt-2 text-xs text-muted-foreground">
-                    Started {timeAgo(run.startedAt)} · Commits {run.commitCount ?? 0} · Slices {run.sliceCount ?? 0} · Accepted {run.acceptedFindings ?? 0} · Dropped {run.droppedFindings ?? 0} · Policy {run.scannerPolicyVersion || 'default'}
+                    Started {timeAgo(run.startedAt, { empty: 'Never' })} · Commits {run.commitCount ?? 0} · Slices {run.sliceCount ?? 0} · Accepted {run.acceptedFindings ?? 0} · Dropped {run.droppedFindings ?? 0} · Policy {run.scannerPolicyVersion || 'default'}
                   </div>
                 </div>
               ))}

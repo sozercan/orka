@@ -361,3 +361,20 @@ func TestContinueHarnessV1BrokeredToolCallStampsAuthenticatedTaskIdentity(t *tes
 		t.Fatalf("stamped executions = %d, want 1", stamped)
 	}
 }
+
+// HarnessV1BrokeredToolExecutorFunc adapts a function to HarnessV1BrokeredToolExecutor for tests.
+type HarnessV1BrokeredToolExecutorFunc func(
+	context.Context,
+	string,
+	*corev1alpha1.Tool,
+	harness.ToolCallRequest,
+) (json.RawMessage, error)
+
+func (f HarnessV1BrokeredToolExecutorFunc) ExecuteHarnessV1BrokeredTool(
+	ctx context.Context,
+	namespace string,
+	tool *corev1alpha1.Tool,
+	request harness.ToolCallRequest,
+) (json.RawMessage, error) {
+	return f(ctx, namespace, tool, request)
+}

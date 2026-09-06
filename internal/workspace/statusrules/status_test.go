@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orka-agents/orka/internal/workspace"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
@@ -152,35 +151,6 @@ func TestValidationFailedStatus(t *testing.T) {
 	}
 }
 
-func TestApplyReadyResult(t *testing.T) {
-	update := &Update{}
-	ApplyReadyResult(update, &workspace.ReadyResult{
-		Placement: workspace.Placement{
-			WorkerNamespace: "substrate-system",
-			WorkerPool:      "pool-a",
-			WorkerPodName:   "actor-pod",
-			PodIP:           "10.0.0.1",
-		},
-		Density: workspace.Density{
-			WorkerCount:         -1,
-			ActorCount:          5,
-			RunningActorCount:   -2,
-			SuspendedActorCount: 3,
-			ActorsPerWorker:     "2.50",
-		},
-		ResumeLatency: 2 * time.Second,
-	})
-	if update.Placement == nil || update.Placement.WorkerNamespace != "substrate-system" || update.Placement.WorkerPool != "pool-a" || update.Placement.WorkerPodName != "actor-pod" {
-		t.Fatalf("placement = %#v", update.Placement)
-	}
-	if update.Density == nil || update.Density.WorkerCount != 0 || update.Density.ActorCount != 5 || update.Density.RunningActorCount != 0 || update.Density.SuspendedActorCount != 3 || update.Density.ActorsPerWorker != "2.50" {
-		t.Fatalf("density = %#v", update.Density)
-	}
-	if update.ResumeLatency == nil || update.ResumeLatency.Duration != 2*time.Second {
-		t.Fatalf("resume latency = %#v", update.ResumeLatency)
-	}
-}
-
 func TestStatusPolicyHelpers(t *testing.T) {
 	if !IsSupportedProvider(corev1alpha1.WorkspaceProviderSubstrate) || IsSupportedProvider("provider-native") {
 		t.Fatalf("provider support helper returned unexpected result")
@@ -204,15 +174,6 @@ func TestStatusPolicyHelpers(t *testing.T) {
 }
 
 func TestStatusPolicyDefaults(t *testing.T) {
-	if got, ok := StatusReusePolicy(""); !ok || got != corev1alpha1.WorkspaceReusePolicyNone {
-		t.Fatalf("StatusReusePolicy(empty) = %q, %t; want none true", got, ok)
-	}
-	if got, ok := StatusReusePolicy(corev1alpha1.WorkspaceReusePolicySession); !ok || got != corev1alpha1.WorkspaceReusePolicySession {
-		t.Fatalf("StatusReusePolicy(session) = %q, %t; want session true", got, ok)
-	}
-	if _, ok := StatusReusePolicy("forever"); ok {
-		t.Fatalf("StatusReusePolicy accepted unsupported policy")
-	}
 	if got, ok := StatusCleanupPolicy("", corev1alpha1.WorkspaceCleanupPolicyDelete); !ok || got != corev1alpha1.WorkspaceCleanupPolicyDelete {
 		t.Fatalf("StatusCleanupPolicy(empty, delete) = %q, %t; want delete true", got, ok)
 	}

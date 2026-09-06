@@ -49,6 +49,8 @@ type ToolExecutor struct {
 	watchNamespace            string
 	enforceNamespaceIsolation bool
 	resultStore               store.ResultStore
+	gatewayEventStore         store.GatewayEventStore
+	userInfo                  *UserInfo
 	registry                  *tools.Registry
 	allowedToolNames          map[string]struct{}
 	authorizeTaskCreate       func(context.Context, *corev1alpha1.Task) error
@@ -218,6 +220,7 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolCall llm.ToolCall) (stri
 		},
 		IncrementTasks: func() { e.tasksCreated++ },
 	}
+	authorizeExternalToolContext(tc, e.userInfo, e.gatewayEventStore)
 	toolCtx = tools.WithToolContext(toolCtx, tc)
 
 	// Marshal args to JSON for the Tool interface

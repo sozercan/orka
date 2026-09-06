@@ -235,17 +235,32 @@ type acpSessionLineageIdentity struct {
 }
 
 func acpSessionLineageConfigDigest(plan ACPRuntimePlan) (string, error) {
-	if err := harnessv2.ValidateProfileDigest(plan.Digest); err != nil {
-		return "", fmt.Errorf("session lineage runtime profile digest: %w", err)
-	}
 	if plan.Workspace == nil || plan.Workspace.ReusePolicy != corev1alpha1.WorkspaceReusePolicySession {
+		if err := harnessv2.ValidateProfileDigest(plan.Digest); err != nil {
+			return "", fmt.Errorf("session lineage runtime profile digest: %w", err)
+		}
 		return string(plan.Digest), nil
 	}
-	runtimeImage := strings.TrimSpace(plan.Image)
+	return acpSessionLineageConfigurationDigest(
+		string(plan.Digest),
+		plan.Image,
+		plan.Workspace.BindingDigest,
+	)
+}
+
+func acpSessionLineageConfigurationDigest(
+	runtimeProfileDigest string,
+	runtimeImage string,
+	workspaceBindingDigest string,
+) (string, error) {
+	if err := harnessv2.ValidateProfileDigest(harnessv2.ProfileDigest(runtimeProfileDigest)); err != nil {
+		return "", fmt.Errorf("session lineage runtime profile digest: %w", err)
+	}
+	runtimeImage = strings.TrimSpace(runtimeImage)
 	if !digestPinnedImagePattern.MatchString(runtimeImage) {
 		return "", fmt.Errorf("session lineage runtime image must be pinned by sha256 digest")
 	}
-	workspaceBindingDigest := strings.TrimSpace(plan.Workspace.BindingDigest)
+	workspaceBindingDigest = strings.TrimSpace(workspaceBindingDigest)
 	if err := store.ValidateCanonicalDigest("session lineage workspace binding digest", workspaceBindingDigest); err != nil {
 		return "", err
 	}
@@ -258,7 +273,7 @@ func acpSessionLineageConfigDigest(plan ACPRuntimePlan) (string, error) {
 		RuntimeImage           string `json:"runtimeImage"`
 		WorkspaceBindingDigest string `json:"workspaceBindingDigest"`
 	}{
-		RuntimeProfileDigest:   string(plan.Digest),
+		RuntimeProfileDigest:   runtimeProfileDigest,
 		RuntimeImage:           runtimeImage,
 		WorkspaceBindingDigest: workspaceBindingDigest,
 	})

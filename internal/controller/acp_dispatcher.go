@@ -97,6 +97,7 @@ type ACPDispatcher struct {
 	ReservationTTL           time.Duration
 	RateLimitRetryInterval   time.Duration
 	AdmissionGate            *ACPAdmissionGate
+	ACPRuntimeImages         ACPRuntimeImages
 	runtimeContextFactory    func(context.Context, *corev1alpha1.Task) (context.Context, context.CancelFunc)
 
 	// SubstrateRouterURL and SubstrateActorDNSSuffix route Substrate-backed
@@ -509,6 +510,9 @@ func (d *ACPDispatcher) reapIdlePools(ctx context.Context, tasks []corev1alpha1.
 		}
 		pool = latest
 		if pool.Spec.DesiredReplicas == 0 {
+			if err := d.reapStoppedSupersededPlainPool(ctx, pool, activeByPool[key], now); err != nil {
+				return err
+			}
 			if err := d.reapStoppedWorkspacePool(ctx, pool, activeByPool[key], now); err != nil {
 				return err
 			}
@@ -552,6 +556,30 @@ func (d *ACPDispatcher) reapIdlePools(ctx context.Context, tasks []corev1alpha1.
 		if err := d.Client.Patch(ctx, pool, patch); err != nil && !apierrors.IsConflict(err) {
 			return err
 		}
+	}
+	return nil
+}
+
+func (d *ACPDispatcher) reapStoppedSupersededPlainPool(
+	ctx context.Context,
+	pool *corev1alpha1.RuntimePool,
+	activeTasks int,
+	now time.Time,
+) error {
+	if !acpRuntimePoolImageSuperseded(pool, d.ACPRuntimeImages) || activeTasks > 0 ||
+		pool.Status.Lifecycle != corev1alpha1.RuntimePoolLifecycleStopped ||
+		pool.Status.ObservedGeneration != pool.Generation || pool.Status.ActiveInstance != nil ||
+		pool.Status.Capacity.QueuedTasks > 0 || pool.Status.Capacity.FinalizingSessions > 0 ||
+		len(pool.Status.Capacity.Reservations) > 0 {
+		return nil
+	}
+	lastDemand, err := time.Parse(time.RFC3339Nano, pool.Annotations[acpRuntimeLastDemandAnnotation])
+	if err != nil || now.Sub(lastDemand) < 2*d.IdlePoolTTL {
+		return nil
+	}
+	if err := d.Client.Delete(ctx, pool, deleteCurrentObjectPreconditions(pool)...); err != nil &&
+		!apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+		return err
 	}
 	return nil
 }
@@ -960,6 +988,7 @@ func (d *ACPDispatcher) loadVerifiedACPDispatchExecution(
 		attempt.SnapshotDigest != bound.snapshot.Digest || attempt.ExecutionState != store.PromptExecutionReserved {
 		return nil, errors.New("reserved ACP PromptAttempt does not exactly match the immutable Task binding, snapshot, and request")
 	}
+	bound.promptAttempt = attempt
 	bound.frozenTask.Status = *task.Status.DeepCopy()
 	return bound, nil
 }
@@ -968,20 +997,43 @@ func validateFrozenACPDispatchTarget(
 	task *corev1alpha1.Task,
 	target acpDispatchTarget,
 	bound *verifiedAgentExecution,
+	deliveryPlan ACPRuntimePlan,
 ) error {
 	if task == nil || task.Status.Execution == nil || target.pool == nil || bound == nil || bound.binding == nil {
 		return errors.New("frozen ACP Task, RuntimePool target, and execution binding are required")
 	}
-	if target.pool.Name != bound.plan.PoolName || target.pool.Spec.Runtime.Image != bound.plan.Image ||
+	if target.pool.Name != deliveryPlan.PoolName || target.pool.Spec.Runtime.Image != deliveryPlan.Image ||
 		target.pool.Spec.Runtime.Profile.Digest != bound.body.ProfileDigest ||
 		task.Status.Execution.RuntimePoolName != target.pool.Name ||
 		task.Status.Execution.RuntimePoolUID != string(target.pool.UID) {
 		return errors.New("reserved RuntimePool does not exactly match the immutable execution snapshot")
 	}
-	if !acpRuntimePoolWorkspaceMatchesPlan(target.pool, bound.plan) {
+	if !acpRuntimePoolWorkspaceMatchesPlan(target.pool, deliveryPlan) {
 		return errors.New("reserved RuntimePool execution workspace binding does not exactly match the immutable execution snapshot")
 	}
 	return nil
+}
+
+func validateFrozenACPDispatchPlan(
+	task *corev1alpha1.Task,
+	target acpDispatchTarget,
+	bound *verifiedAgentExecution,
+	current ACPRuntimePlan,
+) error {
+	currentErr := validateFrozenACPDispatchTarget(task, target, bound, current)
+	if currentErr == nil {
+		return nil
+	}
+	if bound != nil {
+		// Queue reconciliation moves an unbound Reserved attempt to the current
+		// image only after the selected pool stops admitting it. If dispatch
+		// already claimed that exact serving pool, its frozen plan remains the
+		// authority for this attempt and avoids stranding it between rotations.
+		if frozenErr := validateFrozenACPDispatchTarget(task, target, bound, bound.plan); frozenErr == nil {
+			return nil
+		}
+	}
+	return currentErr
 }
 
 //nolint:gocyclo // The explicit state-machine branches are easier to audit together.
@@ -1004,7 +1056,16 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		return err
 	}
 	task = bound.frozenTask
-	if err := validateFrozenACPDispatchTarget(task, target, bound); err != nil {
+	delivery, err := acpRuntimeDeliveryPlanForAttempt(
+		bound.plan, task.Status.Execution, bound.promptAttempt, d.ACPRuntimeImages, target.pool,
+	)
+	if err != nil {
+		if frozenErr := validateFrozenACPDispatchTarget(task, target, bound, bound.plan); frozenErr != nil {
+			return err
+		}
+		delivery.plan = bound.plan
+	}
+	if err := validateFrozenACPDispatchPlan(task, target, bound, delivery.plan); err != nil {
 		return err
 	}
 	if reservationLease != nil {
@@ -1146,8 +1207,17 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		runtimeFence.RuntimeSessionGeneration = sessionExecution.Binding.Generation
 		leaseGeneration = sessionExecution.LeaseGeneration
 	} else {
+		reservedAttempt, err := d.Store.GetPromptAttempt(ctx, attemptID)
+		if err != nil {
+			return fmt.Errorf("load reserved PromptAttempt for task-scoped RuntimeSession generation: %w", err)
+		}
+		taskScopedGeneration, err := taskScopedRuntimeSessionGeneration(reservedAttempt)
+		if err != nil {
+			return err
+		}
 		runtimeFence.RuntimeSessionUID = harnessv2.RuntimeSessionUID(taskRuntimeSessionUID(task))
-		runtimeFence.RuntimeSessionGeneration = 1
+		runtimeFence.RuntimeSessionGeneration = taskScopedGeneration
+		leaseGeneration = int64(taskScopedGeneration)
 	}
 	sessionTrace.setRuntimeSession(string(runtimeFence.RuntimeSessionUID), runtimeFence.RuntimeSessionGeneration)
 	if err := d.transitionAttempt(ctx, attemptID, fence, store.PromptExecutionReserved, store.PromptExecutionSessionStarting, "session-starting", nil); err != nil {
@@ -1207,7 +1277,27 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		return nil
 	}
 
-	preparedWorkspace, err := d.prepareRuntimeWorkspace(runtimeCtx, task, fence, sessionExecution)
+	plannedAttempt, err := d.Store.GetPromptAttempt(ctx, attemptID)
+	if err != nil {
+		return fmt.Errorf("load planned PromptAttempt for RuntimeSession creation: %w", err)
+	}
+	if plannedAttempt.ExecutionState != store.PromptExecutionPlanned || plannedAttempt.UpdatedAt.IsZero() {
+		return fmt.Errorf("planned PromptAttempt lacks a durable RuntimeSession creation timestamp")
+	}
+	plannedAt := plannedAttempt.UpdatedAt.UTC()
+	taskScopedRuntimeSessionReused := false
+	if sessionExecution == nil {
+		var requeued bool
+		taskScopedRuntimeSessionReused, requeued, err = d.reconcilePlannedTaskScopedRuntimeSession(
+			ctx, runtimeClient, task, attemptID, fence, runtimeFence,
+		)
+		if err != nil || requeued {
+			return err
+		}
+	}
+	preparedWorkspace, err := d.prepareRuntimeWorkspace(
+		runtimeCtx, task, fence, sessionExecution, plannedAt, taskScopedRuntimeSessionReused,
+	)
 	if err != nil {
 		if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 			return deadlineErr
@@ -1219,6 +1309,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 	}
 	baseline := preparedWorkspace.baseline
 	workspace := preparedWorkspace.spec
+	createIssuedAt := preparedWorkspace.createIssuedAt
 	// The resume expectation is stamped AFTER the binding digest was
 	// computed: it asserts a transient lineage property (a committed durable
 	// checkpoint must exist), not workspace identity, so it never changes
@@ -1310,10 +1401,27 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			return d.requeuePreSubmissionTask(ctx, task, attemptID, fence, err)
 		}
 	}
-	createOperation := "create-session"
-	createExpiresAt := time.Now().UTC().Add(max(runtimeSessionCreateTimeout(target), artifactcap.MaxCapabilityTTL))
+	createOperation := "create-session-v" + strconv.FormatInt(plannedAttempt.Version, 10)
+	createExpiresAt := runtimeSessionCreateExpiresAt(createIssuedAt, target)
 	if sessionExecution != nil {
 		createOperation = "create-session-g" + strconv.FormatUint(runtimeFence.RuntimeSessionGeneration, 10)
+	}
+	runtimeSessionCreationRequired := sessionExecution == nil && !taskScopedRuntimeSessionReused ||
+		sessionExecution != nil && !sessionExecution.Reused
+	renewalExpiresAt := runtimeSessionCreateRenewalExpiresAt(createIssuedAt, createExpiresAt, workspaceAuthorization != nil)
+	if runtimeSessionCreationRequired && runtimeSessionCreateAuthorizationNeedsRenewal(renewalExpiresAt, time.Now().UTC()) {
+		if sessionExecution != nil {
+			if err := d.rotateExpiredSessionBoundRuntimeSessionCreation(
+				ctx, task, attemptID, fence, sessionExecution, &runtimeFence,
+			); err != nil {
+				return err
+			}
+			return nil
+		}
+		return d.requeuePreSubmissionTask(
+			ctx, task, attemptID, fence,
+			errors.New("task-scoped RuntimeSession creation authorization expired before submission"),
+		)
 	}
 	createRequest := harnessv2.CreateRuntimeSessionRequest{
 		Protocol:         harnessv2.ProtocolVersion,
@@ -1326,7 +1434,8 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		return err
 	}
 	runtimeSessionRetirementRequired := sessionExecution == nil || workspace.Intent == harnessv2.WorkspaceIntentWrite
-	runtimeSessionCleanupPending := sessionExecution != nil && workspace.Intent == harnessv2.WorkspaceIntentWrite
+	runtimeSessionCleanupPending := taskScopedRuntimeSessionReused ||
+		sessionExecution != nil && workspace.Intent == harnessv2.WorkspaceIntentWrite
 	runtimeSessionSettlementRequired := false
 	runtimePublicationFinalizationRequired := false
 	runtimePublicationFinalized := false
@@ -1378,14 +1487,16 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		return nil
 	}
 	defer func() {
-		if !runtimeSessionCleanupPending {
+		// A pre-submission requeue preserves this exact binding for adoption.
+		// Retiring its runtime session here would strand the retry on a tombstone.
+		if !runtimeSessionCleanupPending || sessionExecution != nil && sessionExecution.requeued {
 			return
 		}
 		if cleanupErr := cleanupRuntimeSession("task_scoped_terminal"); cleanupErr != nil && retErr == nil {
 			retErr = fmt.Errorf("delete task-scoped RuntimeSession: %w", cleanupErr)
 		}
 	}()
-	if sessionExecution == nil || !sessionExecution.Reused {
+	if runtimeSessionCreationRequired {
 		if sessionExecution != nil {
 			sessionExecution.Binding.RecreationRequired = true
 			d.setRuntimeSessionBinding(sessionExecution.Binding)
@@ -1404,11 +1515,80 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 			if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 				return deadlineErr
 			}
-			if sessionExecution != nil && runtimeSessionCreationMayHaveApplied(err) {
-				admitted, reconcileErr := waitForRuntimeSessionAdmission(
-					context.WithoutCancel(ctx), runtimeClient, createRequest.RuntimeSessionID,
-					runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, 10*time.Second,
+			digestConflict := runtimeSessionCreateDigestConflict(err)
+			if sessionExecution == nil && digestConflict {
+				// The runtime already processed a create for this exact attempt
+				// identity: this reconcile rebuilt the request (fresh expiry and
+				// workspace capability) after an earlier send. Adopt the session
+				// the earlier send created when the runtime still reports it
+				// admissible instead of failing a usable attempt.
+				// Bound adoption by the remaining creation budget once the
+				// runtime reports when the earlier send entered Creating.
+				adopted, adoptErr := reconcileRuntimeSessionCreateDigestConflict(
+					runtimeCtx, runtimeClient, createRequest.RuntimeSessionID,
+					runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, runtimeSessionCreateTimeout(target),
 				)
+				if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
+					return deadlineErr
+				}
+				if runtimeContextError(runtimeCtx) != nil {
+					return d.settlePreSubmissionCancellation(
+						ctx, task, attemptID, fence, "cancelled-before-submission", "Cancelled", "task cancelled before prompt submission",
+					)
+				}
+				if adoptErr != nil {
+					logf.FromContext(ctx).Info(
+						"ACP RuntimeSession adoption after create digest conflict failed",
+						"namespace", task.Namespace, "task", task.Name,
+						"runtimeSessionGeneration", runtimeFence.RuntimeSessionGeneration,
+						"inconclusive", errors.Is(adoptErr, errRuntimeSessionAdoptionInconclusive), "diagnostic", adoptErr.Error(),
+					)
+				}
+				if adopted {
+					logf.FromContext(ctx).Info(
+						"ACP RuntimeSession adopted after create digest conflict",
+						"namespace", task.Namespace, "task", task.Name,
+						"runtimeSessionGeneration", runtimeFence.RuntimeSessionGeneration,
+					)
+					created = true
+				} else {
+					// The runtime holds a record for this create identity but no
+					// admissible session: the record is a deletion tombstone, the
+					// session settled in an unusable state, or it never became
+					// admissible within its own creation budget. The deferred
+					// task-scoped cleanup retires whatever is resident.
+					retrying, handleErr := d.handlePrePromptClientError(ctx, task, attemptID, fence, err)
+					if !retrying {
+						endSessionTrace(err)
+					}
+					return handleErr
+				}
+			} else if sessionExecution != nil && runtimeSessionCreationMayHaveApplied(err) {
+				var admitted bool
+				var reconcileErr error
+				if digestConflict {
+					admitted, reconcileErr = reconcileRuntimeSessionCreateDigestConflict(
+						runtimeCtx, runtimeClient, createRequest.RuntimeSessionID,
+						runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, runtimeSessionCreateTimeout(target),
+					)
+					if reconcileErr == nil && !admitted {
+						// The record is a deletion tombstone: this generation can
+						// never be recreated, and planned-session reconciliation
+						// only advances the generation for reused sessions, so a
+						// requeue would rebuild the same conflict forever. An
+						// inconclusive window is an error and requeues below.
+						retrying, handleErr := d.handlePrePromptClientError(ctx, task, attemptID, fence, err)
+						if !retrying {
+							endSessionTrace(err)
+						}
+						return handleErr
+					}
+				} else {
+					admitted, reconcileErr = waitForRuntimeSessionAdmission(
+						context.WithoutCancel(ctx), runtimeClient, createRequest.RuntimeSessionID,
+						runtimeFence.RuntimeSessionUID, runtimeFence.RuntimeSessionGeneration, 10*time.Second,
+					)
+				}
 				if handled, deadlineErr := d.handlePreSubmissionContextDone(ctx, runtimeCtx, task, attemptID, fence); handled {
 					return deadlineErr
 				}
@@ -1477,11 +1657,11 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 				return nil
 			}
 		}
-		if reservationLease != nil {
-			if err := reservationLease.setSlots(ctx, 0); err != nil {
-				_ = cleanupRuntimeSession("capacity_reservation_lost")
-				return d.requeuePreSubmissionTask(ctx, task, attemptID, fence, err)
-			}
+	}
+	if reservationLease != nil {
+		if err := reservationLease.setSlots(ctx, 0); err != nil {
+			_ = cleanupRuntimeSession("capacity_reservation_lost")
+			return d.requeuePreSubmissionTask(ctx, task, attemptID, fence, err)
 		}
 	}
 
@@ -1928,7 +2108,7 @@ func (d *ACPDispatcher) executeReservedTask(ctx context.Context, task *corev1alp
 		if sessionExecution != nil {
 			d.forgetRuntimeSessionBinding(sessionExecution.Binding.SessionUID)
 		}
-		return d.failTaskForDelivery(ctx, task, status, "workspace validation failed")
+		return d.failTaskForDelivery(ctx, task, status, status.Message)
 	}
 	runtimePublicationFinalizationRequired = delta.Delta.State == harnessv2.WorkspaceDeltaPrepared
 	if err := d.publishTaskResultReference(ctx, task); err != nil {
@@ -2456,6 +2636,9 @@ func runtimeSessionStatusForUID(
 	return status, nil, nil
 }
 
+// waitForRuntimeSessionAdmission resolves an ambiguous create-session write:
+// the request may still be in flight at the runtime, so an absent session is
+// polled for until the timeout.
 func waitForRuntimeSessionAdmission(
 	ctx context.Context,
 	runtimeClient *harnessv2.Client,
@@ -2464,15 +2647,56 @@ func waitForRuntimeSessionAdmission(
 	generation uint64,
 	timeout time.Duration,
 ) (bool, error) {
+	return waitForRuntimeSessionAdmissionState(ctx, runtimeClient, sessionID, sessionUID, generation, timeout, false)
+}
+
+// errRuntimeSessionAdoptionInconclusive reports that the runtime did not
+// confirm, within the adoption window, whether the session an earlier send
+// created is admissible: status stayed unavailable or the session was still
+// creating when the window closed. Callers must not read it as absence.
+var errRuntimeSessionAdoptionInconclusive = errors.New("RuntimeSession adoption is inconclusive")
+
+// reconcileRuntimeSessionCreateDigestConflict resolves a digest_conflict answer
+// to create-session. The runtime already holds an operation record for this
+// exact create identity, so an earlier send of the same attempt was processed
+// there: the session is adopted when the runtime reports the exact generation
+// admissible, waited for while it is still creating, and reported absent
+// without polling when the record is a deletion tombstone, because a
+// tombstoned generation can never reappear. (false, nil) therefore means
+// confirmed absence; an unfinished window returns
+// errRuntimeSessionAdoptionInconclusive.
+func reconcileRuntimeSessionCreateDigestConflict(
+	ctx context.Context,
+	runtimeClient *harnessv2.Client,
+	sessionID harnessv2.RuntimeSessionID,
+	sessionUID harnessv2.RuntimeSessionUID,
+	generation uint64,
+	timeout time.Duration,
+) (bool, error) {
+	return waitForRuntimeSessionAdmissionState(ctx, runtimeClient, sessionID, sessionUID, generation, timeout, true)
+}
+
+func waitForRuntimeSessionAdmissionState(
+	ctx context.Context,
+	runtimeClient *harnessv2.Client,
+	sessionID harnessv2.RuntimeSessionID,
+	sessionUID harnessv2.RuntimeSessionUID,
+	generation uint64,
+	timeout time.Duration,
+	absentIsFinal bool,
+) (bool, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	var lastStatusErr error
+	creationDeadlineSet := false
 	for {
 		_, observed, err := runtimeSessionStatusForUID(waitCtx, runtimeClient, sessionUID)
 		if err != nil {
 			lastStatusErr = err
+		} else if observed == nil && absentIsFinal {
+			return false, nil
 		} else if observed != nil {
 			if observed.RuntimeSessionID != sessionID || observed.Generation != generation {
 				return false, fmt.Errorf("%w: RuntimeSession status resolved to a different generation", store.ErrConflict)
@@ -2481,9 +2705,20 @@ func waitForRuntimeSessionAdmission(
 				return true, nil
 			}
 			if observed.State == harnessv2.RuntimeSessionStateCreating {
+				if absentIsFinal && !creationDeadlineSet {
+					// Creating starts when the runtime records the original
+					// create, not when this reconcile observes its replay.
+					creationCtx, cancelCreation := context.WithDeadline(waitCtx, observed.LastTransitionAt.Add(timeout))
+					defer cancelCreation()
+					waitCtx = creationCtx
+					creationDeadlineSet = true
+				}
 				lastStatusErr = nil
 				select {
 				case <-waitCtx.Done():
+					if absentIsFinal {
+						return false, fmt.Errorf("%w: RuntimeSession was still creating when the adoption window closed", errRuntimeSessionAdoptionInconclusive)
+					}
 					return false, nil
 				case <-ticker.C:
 					continue
@@ -2493,6 +2728,12 @@ func waitForRuntimeSessionAdmission(
 		}
 		select {
 		case <-waitCtx.Done():
+			if absentIsFinal {
+				if lastStatusErr != nil {
+					return false, fmt.Errorf("%w: %w", errRuntimeSessionAdoptionInconclusive, lastStatusErr)
+				}
+				return false, fmt.Errorf("%w: RuntimeSession status was not observed before the adoption window closed", errRuntimeSessionAdoptionInconclusive)
+			}
 			if lastStatusErr != nil {
 				return false, lastStatusErr
 			}
@@ -2646,6 +2887,120 @@ func (d *ACPDispatcher) reconcilePlannedRuntimeSession(
 	}
 	session.requeued = true
 	return true, nil
+}
+
+func (d *ACPDispatcher) reconcilePlannedTaskScopedRuntimeSession(
+	ctx context.Context,
+	runtimeClient *harnessv2.Client,
+	task *corev1alpha1.Task,
+	attemptID string,
+	fence store.ControllerEpochFence,
+	runtimeFence harnessv2.Fence,
+) (bool, bool, error) {
+	status, observed, err := runtimeSessionStatusForUID(ctx, runtimeClient, runtimeFence.RuntimeSessionUID)
+	if err != nil {
+		if requeueErr := d.requeuePreSubmissionTask(ctx, task, attemptID, fence, err); requeueErr != nil {
+			return false, false, requeueErr
+		}
+		return false, true, nil
+	}
+	expectedPoolFence := runtimeFence
+	expectedPoolFence.RuntimeSessionUID = ""
+	expectedPoolFence.RuntimeSessionGeneration = 0
+	if mismatch := harnessv2.CompareFence(expectedPoolFence, status.Fence, false); mismatch != harnessv2.FenceMatch {
+		fenceErr := fmt.Errorf("%w: RuntimeSession status fence mismatch: %s", store.ErrConflict, mismatch)
+		if requeueErr := d.requeuePreSubmissionTask(ctx, task, attemptID, fence, fenceErr); requeueErr != nil {
+			return false, false, errors.Join(fenceErr, requeueErr)
+		}
+		return false, true, nil
+	}
+	if observed == nil {
+		return false, false, nil
+	}
+	expectedID := harnessv2.RuntimeSessionID(runtimeSessionID(runtimeFence))
+	if observed.RuntimeSessionID == expectedID && observed.Generation == runtimeFence.RuntimeSessionGeneration {
+		if observed.State.CanAdmitPrompt() {
+			return true, false, nil
+		}
+		if observed.State == harnessv2.RuntimeSessionStateCreating {
+			if err := d.requeuePreSubmissionTask(
+				ctx, task, attemptID, fence, errors.New("task-scoped RuntimeSession creation is still settling"),
+			); err != nil {
+				return false, false, err
+			}
+			return false, true, nil
+		}
+	}
+	observedFence := expectedPoolFence
+	observedFence.RuntimeSessionUID = observed.RuntimeSessionUID
+	observedFence.RuntimeSessionGeneration = observed.Generation
+	if err := d.deleteRuntimeSessionReconciled(
+		context.WithoutCancel(ctx), runtimeClient, observed.RuntimeSessionID, task, observedFence,
+		"replace_stale_task_scoped_runtime_session",
+	); err != nil {
+		if requeueErr := d.requeuePreSubmissionTask(ctx, task, attemptID, fence, err); requeueErr != nil {
+			return false, false, errors.Join(err, requeueErr)
+		}
+		return false, true, nil
+	}
+	if err := d.requeuePreSubmissionTask(
+		ctx, task, attemptID, fence, errors.New("stale task-scoped RuntimeSession was retired before recreation"),
+	); err != nil {
+		return false, false, err
+	}
+	return false, true, nil
+}
+
+func taskScopedRuntimeSessionGeneration(attempt *store.PromptAttempt) (uint64, error) {
+	if attempt == nil || attempt.ExecutionState != store.PromptExecutionReserved || attempt.Version < 1 {
+		return 0, fmt.Errorf("reserved PromptAttempt is required for task-scoped RuntimeSession generation")
+	}
+	generation := uint64(attempt.Version)
+	if generation > maxControllerRuntimeSessionGeneration {
+		return 0, store.ValidationErrorf("task-scoped RuntimeSession generation is exhausted")
+	}
+	return generation, nil
+}
+
+func (d *ACPDispatcher) rotateExpiredSessionBoundRuntimeSessionCreation(
+	ctx context.Context,
+	task *corev1alpha1.Task,
+	attemptID string,
+	fence store.ControllerEpochFence,
+	session *acpTaskSession,
+	runtimeFence *harnessv2.Fence,
+) error {
+	if session == nil || runtimeFence == nil {
+		return fmt.Errorf("session-bound RuntimeSession creation rotation requires a Session binding")
+	}
+	if session.Binding.Generation >= maxControllerRuntimeSessionGeneration {
+		return store.ValidationErrorf("ACP runtime session generation is exhausted")
+	}
+	nextGeneration := max(session.Binding.Generation+1, uint64(session.LeaseGeneration))
+	if nextGeneration > maxControllerRuntimeSessionGeneration {
+		return store.ValidationErrorf("ACP runtime session generation is exhausted")
+	}
+	session.Binding.Generation = nextGeneration
+	session.Binding.WorkspaceDigest = ""
+	session.Binding.RecreationRequired = true
+	session.Reused = false
+	runtimeFence.RuntimeSessionGeneration = nextGeneration
+	d.setRuntimeSessionBinding(session.Binding)
+	if err := d.patchExecution(ctx, task, func(execution *corev1alpha1.TaskExecutionStatus) {
+		applyRuntimeSessionBindingToExecution(execution, &session.Binding)
+		execution.LastTransitionTime = nowMeta()
+	}); err != nil {
+		return err
+	}
+	if err := d.requeuePreSubmissionTaskWithRuntimeBinding(
+		ctx, task, attemptID, fence,
+		errors.New("session-bound RuntimeSession creation authorization expired before submission"),
+		&session.Binding,
+	); err != nil {
+		return err
+	}
+	session.requeued = true
+	return nil
 }
 
 func (d *ACPDispatcher) deleteRuntimeSessionReconciled(
@@ -3183,6 +3538,27 @@ func runtimeSessionCreateTimeout(target acpDispatchTarget) time.Duration {
 		return minimum
 	}
 	return configured
+}
+
+func runtimeSessionCreateExpiresAt(issuedAt time.Time, target acpDispatchTarget) time.Time {
+	return issuedAt.UTC().Add(max(runtimeSessionCreateTimeout(target), artifactcap.MaxCapabilityTTL))
+}
+
+func runtimeSessionCreateRenewalExpiresAt(issuedAt, createExpiresAt time.Time, hasWorkspaceAuthorization bool) time.Time {
+	if !hasWorkspaceAuthorization {
+		return createExpiresAt
+	}
+	workspaceExpiresAt := issuedAt.UTC().Add(artifactcap.MaxCapabilityTTL)
+	if workspaceExpiresAt.Before(createExpiresAt) {
+		return workspaceExpiresAt
+	}
+	return createExpiresAt
+}
+
+const runtimeSessionCreateRenewalMargin = 5 * time.Second
+
+func runtimeSessionCreateAuthorizationNeedsRenewal(expiresAt, now time.Time) bool {
+	return !expiresAt.After(now.UTC().Add(runtimeSessionCreateRenewalMargin))
 }
 
 func acpTaskDeadline(task *corev1alpha1.Task, now time.Time) (time.Time, bool) {
@@ -4557,17 +4933,12 @@ func boundedRuntimeSessionServerMessage(err error) string {
 }
 
 // stripACPControlRunes removes control characters (C0, DEL, and C1) and
-// Unicode format runes from runtime-supplied text so persisted status and
-// logs carry no terminal escapes and no invisible rune can split a
-// credential past redaction. Line breaks and tabs become spaces; every other
-// stripped rune is dropped rather than replaced, because a space would leave
-// fragments of a split token that survive redaction and can be reassembled
-// by a reader.
+// Unicode format runes from runtime-supplied text. Dropping every separator
+// before redaction reassembles credentials split across lines or tabs while
+// keeping terminal escapes and invisible runes out of status and logs.
 func stripACPControlRunes(value string) string {
 	return strings.Map(func(current rune) rune {
 		switch {
-		case current == '\n' || current == '\r' || current == '\t':
-			return ' '
 		case current < 0x20 || current == 0x7f || (current >= 0x80 && current < 0xa0):
 			return -1
 		// Format runes (zero-width spaces, joiners, directional marks) are
@@ -4579,10 +4950,28 @@ func stripACPControlRunes(value string) string {
 	}, strings.ToValidUTF8(value, ""))
 }
 
+// runtimeSessionCreateDigestConflict reports whether the runtime rejected a
+// create-session mutation because it already holds an operation record for the
+// same create identity under a different request digest. The controller
+// rebuilds the create request (fresh expiry, fresh workspace capability) on
+// every reconcile of one attempt, so a re-admitted attempt whose earlier send
+// was processed by the runtime is answered exactly this way.
+func runtimeSessionCreateDigestConflict(err error) bool {
+	clientErr, ok := errors.AsType[*harnessv2.ClientError](err)
+	return ok && clientErr != nil && clientErr.Kind == harnessv2.ClientErrorHTTP &&
+		clientErr.StatusCode == http.StatusConflict && clientErr.Code == harnessv2.ErrorCodeDigestConflict
+}
+
 func runtimeSessionCreationMayHaveApplied(err error) bool {
 	var clientErr *harnessv2.ClientError
 	if !errors.As(err, &clientErr) {
 		return err != nil
+	}
+	if runtimeSessionCreateDigestConflict(err) {
+		// The runtime holds an operation record for this exact create identity:
+		// an earlier send of the same attempt was processed, so the session it
+		// created may be resident and must be retired with the attempt.
+		return true
 	}
 	switch clientErr.Kind {
 	case harnessv2.ClientErrorConfiguration, harnessv2.ClientErrorValidation:

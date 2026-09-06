@@ -54,6 +54,8 @@ const (
 	repositoryMonitorPublishSkipBodyTooLarge               = "body_too_large"
 	repositoryMonitorPublishSkipInlineMappingFailed        = "inline_mapping_failed"
 	repositoryMonitorPublishSkipVerdictNotConfigured       = "verdict_not_configured"
+	repositoryMonitorPublishSkipValidationPolicyChanged    = "validation_policy_changed"
+	repositoryMonitorPublishSkipValidationUnavailable      = "validation_unavailable"
 
 	repositoryMonitorPublishFailureGitHubPermissionDenied = "github_permission_denied"
 	repositoryMonitorPublishFailureGitHubPermanent        = "github_permanent_error"
@@ -142,6 +144,21 @@ func (r *RepositoryMonitorReconciler) publishRepositoryMonitorReview(ctx context
 			reason = repositoryMonitorPublishSkipHeadSHAChanged
 		}
 		return skip(reason, fmt.Sprintf("Pull request #%d review publishing skipped: review verdict %q is not publishable", item.Number, record.Verdict), map[string]any{"verdict": record.Verdict})
+	}
+	if !repositoryMonitorReviewRecordMatchesValidationPolicy(monitor, record) {
+		return skip(repositoryMonitorPublishSkipValidationPolicyChanged, fmt.Sprintf("Pull request #%d review publishing skipped: validation policy changed after the review started", item.Number), map[string]any{
+			"currentValidationImage": strings.TrimSpace(monitor.Spec.Validation.Image),
+			"reviewValidationImage":  strings.TrimSpace(record.ValidationImage),
+		})
+	}
+	if record.ValidationStatus == repositoryMonitorValidationStatusUnavailable {
+		retryState, err := r.repositoryMonitorRepairValidationRetryState(ctx, monitor, record.Number, record.HeadSHA)
+		if err != nil {
+			return err
+		}
+		if !retryState.associated || !retryState.exhausted {
+			return skip(repositoryMonitorPublishSkipValidationUnavailable, fmt.Sprintf("Pull request #%d review publishing skipped: validation is temporarily unavailable", item.Number), nil)
+		}
 	}
 	if shouldPost, reason := repositoryMonitorPublishShouldPostVerdict(publish, record); !shouldPost {
 		return skip(reason, fmt.Sprintf("Pull request #%d review publishing skipped: verdict %q is not enabled for publishing", item.Number, record.Verdict), map[string]any{"verdict": record.Verdict})
@@ -690,7 +707,22 @@ func renderRepositoryMonitorReviewBody(monitor *corev1alpha1.RepositoryMonitor, 
 		b.WriteString("\n")
 	}
 	b.WriteString("### Tests\n\n")
-	b.WriteString("Not run by Orka. Review was based on static inspection.\n\n")
+	validationStatus := sanitizeRepositoryMonitorReviewText(firstNonEmptyString(record.ValidationStatus, repositoryMonitorValidationStatusNotRun), 80)
+	fmt.Fprintf(&b, "**Status:** %s  \n", validationStatus)
+	if image := sanitizeRepositoryMonitorReviewText(record.ValidationImage, 2048); image != "" {
+		fmt.Fprintf(&b, "**Image:** %s  \n", image)
+	}
+	evidence := sanitizeRepositoryMonitorReviewText(record.ValidationEvidence, repositoryMonitorReviewTextMaxRunes)
+	if evidence == "" {
+		evidence = "No validation evidence was recorded."
+	}
+	b.WriteString("\n")
+	for line := range strings.SplitSeq(evidence, "\n") {
+		b.WriteString("> ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 	b.WriteString(repositoryMonitorReviewMarker(monitor, item.Number, record.HeadSHA, repositoryMonitorReviewRunID(task), record.ID, publishID))
 	return b.String()
 }
@@ -855,7 +887,21 @@ func sanitizeRepositoryMonitorReviewText(value string, maxRunes int) string {
 	// redact credential shapes before bounding, so a secret an agent found
 	// in the repository never reaches a public comment — and bounding
 	// cannot split a token past the redactor.
-	value = repositoryMonitorReviewContextSanitize(strings.TrimSpace(value))
+	value = strings.TrimSpace(value)
+	// A model can wrap one credential across lines. Check a joined shadow
+	// before preserving the original formatting; if the joined value is
+	// credential-shaped, withhold the field because line-by-line redaction
+	// cannot safely reconstruct which fragments belong to the secret.
+	// The shadow is taken from the original text as well as the sanitized
+	// one: line-level sanitization may withhold the fragment that made the
+	// wrapped credential recognizable and leave a tail fragment behind.
+	sanitized := repositoryMonitorReviewContextSanitize(value)
+	unwrap := strings.NewReplacer("\r", "", "\n", "")
+	if security.LooksLikeSecret(unwrap.Replace(value)) || security.LooksLikeSecret(unwrap.Replace(sanitized)) {
+		value = "[REDACTED]"
+	} else {
+		value = sanitized
+	}
 	return neutralizeRepositoryMonitorActiveText(neutralizeRepositoryMonitorMentions(boundedString(value, maxRunes)))
 }
 

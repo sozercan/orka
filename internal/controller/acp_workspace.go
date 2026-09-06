@@ -30,10 +30,11 @@ const workspaceRepositoryProviderGitHub = "github"
 var errWorkspaceRepositoryHTTPSPort = errors.New("repository HTTPS URL must use port 443")
 
 type preparedACPRuntimeWorkspace struct {
-	baseline      harnessv2.WorkspaceBaseline
-	spec          harnessv2.WorkspaceSpec
-	authorization *harnessv2.ArtifactAuthorization
-	bindingDigest string
+	baseline       harnessv2.WorkspaceBaseline
+	spec           harnessv2.WorkspaceSpec
+	authorization  *harnessv2.ArtifactAuthorization
+	bindingDigest  string
+	createIssuedAt time.Time
 	// priorRepositoryIdentity records the canonical repository identity the
 	// session ran on BEFORE a verified publication transition moved its
 	// continuation to a new repository. Under an expected durable resume it
@@ -172,7 +173,13 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 	task *corev1alpha1.Task,
 	fence store.ControllerEpochFence,
 	session *acpTaskSession,
+	plannedAt time.Time,
+	runtimeSessionReused bool,
 ) (preparedACPRuntimeWorkspace, error) {
+	if plannedAt.IsZero() {
+		return preparedACPRuntimeWorkspace{}, fmt.Errorf("RuntimeSession creation timestamp is required for workspace authorization")
+	}
+	plannedAt = plannedAt.UTC()
 	workspace := task.Spec.Workspace
 	priorRepositoryIdentity := ""
 	if session != nil && session.VerifiedBaseline != nil {
@@ -214,7 +221,9 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 		if err != nil {
 			return preparedACPRuntimeWorkspace{}, err
 		}
-		return preparedACPRuntimeWorkspace{baseline: baseline, spec: spec, bindingDigest: bindingDigest}, nil
+		return preparedACPRuntimeWorkspace{
+			baseline: baseline, spec: spec, bindingDigest: bindingDigest, createIssuedAt: plannedAt,
+		}, nil
 	}
 	if d.Publisher == nil || len(d.ArtifactCapabilitySecret) < artifactcap.MinSecretBytes {
 		return preparedACPRuntimeWorkspace{}, fmt.Errorf("clean-room Workspace/Publisher and artifact authorization are required")
@@ -275,6 +284,14 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 		}
 		return preparedACPRuntimeWorkspace{}, fmt.Errorf("prepare source workspace: %w", err)
 	}
+	prepareCommittedAt, err := externalEffectSucceededAt(ctx, d.Store, prepareIdentity)
+	if err != nil {
+		return preparedACPRuntimeWorkspace{}, fmt.Errorf("load committed workspace prepare effect: %w", err)
+	}
+	createIssuedAt := plannedAt
+	if prepareCommittedAt.After(createIssuedAt) {
+		createIssuedAt = prepareCommittedAt
+	}
 	baseline := harnessv2.WorkspaceBaseline{
 		RepositoryIdentity: repository.ID, Revision: resolved.BaselineOID,
 		TreeDigest: prepared.ManifestDigest, Artifact: &prepared.Artifact,
@@ -289,9 +306,9 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 	}
 	result := preparedACPRuntimeWorkspace{
 		baseline: baseline, spec: spec, bindingDigest: bindingDigest,
-		priorRepositoryIdentity: priorRepositoryIdentity,
+		createIssuedAt: createIssuedAt, priorRepositoryIdentity: priorRepositoryIdentity,
 	}
-	if session != nil && session.Reused {
+	if runtimeSessionReused || session != nil && session.Reused {
 		return result, nil
 	}
 
@@ -308,7 +325,7 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 		OperationID: fmt.Sprintf("runtime-workspace-download-%s-a%d-g%d",
 			task.Status.Execution.PromptID, task.Status.Execution.Attempt, task.Status.Execution.RuntimeSessionGeneration),
 	}
-	authorizedAt := time.Now().UTC()
+	authorizedAt := result.createIssuedAt
 	const capabilityTTL = artifactcap.MaxCapabilityTTL
 	authorization, err := artifactcap.Issue(d.ArtifactCapabilitySecret, binding, authorizedAt, capabilityTTL)
 	if err != nil {
@@ -324,6 +341,36 @@ func (d *ACPDispatcher) prepareRuntimeWorkspace(
 		Capability: authorization.Capability, RequestDigest: authorization.RequestDigest,
 	}
 	return result, nil
+}
+
+func externalEffectSucceededAt(
+	ctx context.Context,
+	effects store.ExternalEffectStore,
+	identity store.ExternalEffectIdentity,
+) (time.Time, error) {
+	if effects == nil {
+		return time.Time{}, fmt.Errorf("external-effect store is required")
+	}
+	var (
+		effect *store.ExternalEffect
+		err    error
+	)
+	if reader, ok := effects.(store.ExternalEffectIdentityReader); ok {
+		effect, err = reader.GetExternalEffectByIdentity(ctx, identity)
+	} else {
+		id, idErr := identity.CanonicalID()
+		if idErr != nil {
+			return time.Time{}, idErr
+		}
+		effect, err = effects.GetExternalEffect(ctx, id)
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if effect.State != store.ExternalEffectSucceeded || effect.UpdatedAt.IsZero() {
+		return time.Time{}, fmt.Errorf("external effect %s lacks a durable success timestamp", effect.ID)
+	}
+	return effect.UpdatedAt.UTC(), nil
 }
 
 func acpRuntimeWorkspaceBindingDigest(sourceRef string, workspace harnessv2.WorkspaceSpec) (string, error) {

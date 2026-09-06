@@ -1,5 +1,9 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ApiError, api, isForbiddenError } from '@/lib/api-client'
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { ApiError, api } from '@/lib/api-client'
+import { pageParams, pollUnlessForbidden, maxListWalkPages, walkAllPages, type ListResponse } from '@/lib/list-api'
+import { useAuthStore } from '@/stores/auth'
+import { useUIStore } from '@/stores/ui'
+import type { Session, SessionListItem } from '@/schemas/session'
 
 // Client errors (403/404/400) do not clear on retry; only transient failures
 // do. 408 (request timeout) and 429 (throttled) are client statuses that an
@@ -8,47 +12,37 @@ const transientClientStatuses = new Set([408, 429])
 export const retryUnlessClientError = (failureCount: number, error: unknown) =>
   failureCount < 3 &&
   !(error instanceof ApiError && error.status >= 400 && error.status < 500 && !transientClientStatuses.has(error.status))
-import { useUIStore } from '@/stores/ui'
-import type { Session, SessionListItem } from '@/schemas/session'
-
-interface ListResponse<T> {
-  items: T[]
-  metadata: { continue?: string; remainingItemCount?: number }
-}
-
-export function useSessionList(limit = '25') {
+// Page-by-page session listing for the Sessions view; later pages follow
+// metadata.continue on demand instead of stopping at the first page.
+export function useSessionListPages(limit = '25', refetchInterval: number | false = 15000) {
   const namespace = useUIStore((s) => s.namespace)
-  return useQuery({
-    queryKey: ['sessions', namespace, limit],
-    queryFn: () => api.get<ListResponse<SessionListItem>>('/sessions', { namespace, limit }),
+  const token = useAuthStore((s) => s.token)
+  return useInfiniteQuery({
+    queryKey: ['sessions', 'pages', namespace, limit],
+    queryFn: ({ pageParam }) =>
+      api.get<ListResponse<SessionListItem>>('/sessions', pageParams({ namespace, limit }, pageParam || undefined)),
+    initialPageParam: '',
+    getNextPageParam: (lastPage) => lastPage.metadata?.continue || undefined,
+    enabled: Boolean(token),
     retry: retryUnlessClientError,
-    // A 403 will not clear on its own; polling it just spams the audit log.
-    refetchInterval: (query) => (isForbiddenError(query.state.error) ? false : 15000),
+    refetchInterval: pollUnlessForbidden(refetchInterval),
   })
 }
 
-export function useSessionListAll(pageLimit = '100') {
+export function useSessionListAll(pageLimit = '100', refetchInterval: number | false = 15000) {
   const namespace = useUIStore((s) => s.namespace)
+  const token = useAuthStore((s) => s.token)
   return useQuery({
     queryKey: ['sessions', 'all', namespace, pageLimit],
-    queryFn: async () => {
-      const items: SessionListItem[] = []
-      const seen = new Set<string>()
-      let continueToken: string | undefined
-      do {
-        const params: Record<string, string> = { namespace, limit: pageLimit }
-        if (continueToken) params.continue = continueToken
-        const page = await api.get<ListResponse<SessionListItem>>('/sessions', params)
-        items.push(...page.items)
-        const next = page.metadata?.continue
-        if (next && seen.has(next)) throw new Error('session list pagination repeated continuation cursor')
-        if (next) seen.add(next)
-        continueToken = next || undefined
-      } while (continueToken)
-      return { items, metadata: {} } as ListResponse<SessionListItem>
-    },
+    enabled: Boolean(token),
+    // Bounded like every full-list walk (maxListWalkPages): unbounded history
+    // on a polling interval grows without limit.
+    queryFn: () => walkAllPages(
+      (continueToken) => api.get<ListResponse<SessionListItem>>('/sessions', pageParams({ namespace, limit: pageLimit }, continueToken)),
+      { subject: 'session list', maxPages: maxListWalkPages },
+    ),
     retry: retryUnlessClientError,
-    refetchInterval: (query) => (isForbiddenError(query.state.error) ? false : 15000),
+    refetchInterval: pollUnlessForbidden(refetchInterval),
   })
 }
 

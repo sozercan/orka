@@ -22,7 +22,7 @@ export function useMediaQuery(query: string): boolean {
 }
 
 /** Tailwind's `md` breakpoint is 768px; below it the sidebar overlays content. */
-export const MOBILE_MEDIA_QUERY = '(max-width: 767px)'
+const MOBILE_MEDIA_QUERY = '(max-width: 767px)'
 
 export function useIsMobile(): boolean {
   return useMediaQuery(MOBILE_MEDIA_QUERY)

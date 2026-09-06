@@ -223,6 +223,12 @@ func TestBuildRuntimeSessionMCPConfigurationTranslatesReadOnlyPresetPerRuntime(t
 			images:      ACPRuntimeImages{Codex: "docker.io/example/codex@sha256:" + strings.Repeat("b", 64)},
 			wantAllowed: []string{providerNativeToolGlob, providerNativeToolGrep, providerNativeToolRead},
 		},
+		{
+			name: "copilot", runtime: corev1alpha1.AgentRuntimeCopilot,
+			model:       &corev1alpha1.ModelConfig{Name: "model"},
+			images:      ACPRuntimeImages{Copilot: "docker.io/example/copilot@sha256:" + strings.Repeat("c", 64)},
+			wantAllowed: []string{providerNativeToolGlob, providerNativeToolGrep, providerNativeToolRead},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -319,6 +325,7 @@ func TestEffectiveACPAllowedToolsOnlyTranslatesReadOnlyOpenCodePreset(t *testing
 		want    []string
 	}{
 		{name: "repository monitor preset", allowed: readOnlyAgentAllowedTools(), want: []string{providerNativeToolGlob, providerNativeToolRead}},
+		{name: "repository monitor validation preset", allowed: append(readOnlyAgentAllowedTools(), tools.RunValidationToolName, repositoryMonitorWaitForTasksToolName), want: []string{providerNativeToolGlob, providerNativeToolRead, tools.RunValidationToolName, repositoryMonitorWaitForTasksToolName}},
 		{name: "explicit deny all", allowed: []string{}, want: []string{}},
 		{name: "all blank remains deny all", allowed: []string{" "}, want: []string{}},
 		{name: "narrower glob only", allowed: []string{providerNativeToolGlob}, want: []string{providerNativeToolGlob}},

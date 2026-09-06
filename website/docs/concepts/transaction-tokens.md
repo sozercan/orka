@@ -1,4 +1,8 @@
-# Transaction Tokens
+---
+description: "Orka's vendor-neutral OAuth Transaction Token profile for governing who asked for a piece of work."
+---
+
+# Transaction tokens
 
 Orka implements a strict, vendor-neutral OAuth Transaction Token profile for request governance. Transaction tokens are not downstream resource credentials.
 

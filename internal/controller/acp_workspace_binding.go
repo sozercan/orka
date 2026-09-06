@@ -33,6 +33,7 @@ import (
 const (
 	defaultWorkspaceSlotName     = "default"
 	acpWorkspaceSessionUIDMapKey = "sessionUID"
+	acpWorkspaceSlotMapKey       = "workspaceSlot"
 )
 
 // ACPRuntimeWorkspaceBinding is the resolved, canonical execution-workspace
@@ -86,22 +87,6 @@ func acpSubstratePoolSuspendModeMatches(binding *ACPRuntimeWorkspaceBinding, poo
 		binding != nil && binding.Provider == corev1alpha1.WorkspaceProviderSubstrate && binding.Class != nil &&
 		binding.Class.SuspendMode == string(acpworkspacev1alpha1.SubstrateSuspendModeDataOnly) &&
 		!slices.Contains(binding.Class.AllowedOnDetach, string(workspacev1alpha1.WorkspaceOnDetachSuspend))
-}
-
-// resolveACPWorkspaceBinding distills Task.spec.execution.workspace into the
-// canonical ACP workspace binding. It is pure: the same frozen Task inputs and
-// default provider always produce the same binding, so snapshot verification
-// can recompute it exactly. Unsupported provider capabilities fail closed here,
-// before any workspace or RuntimePool demand exists.
-//
-//nolint:gocyclo // Every unsupported-capability rejection is audited in one place.
-func resolveACPWorkspaceBinding(
-	task *corev1alpha1.Task,
-	defaultProvider corev1alpha1.WorkspaceProvider,
-	enforceNamespaceIsolation bool,
-	sessionUID string,
-) (*ACPRuntimeWorkspaceBinding, error) {
-	return resolveACPWorkspaceBindingWithClass(task, defaultProvider, enforceNamespaceIsolation, sessionUID, nil)
 }
 
 // resolveACPWorkspaceBindingWithClass distills a legacy provider-shaped or
@@ -337,18 +322,6 @@ func validateSubstrateWorkspaceTemplateReference(namespace, name string) error {
 	return nil
 }
 
-// validateACPWorkspaceBindingRequest validates provider and capability shape
-// before durable Session identity is established. The placeholder is never
-// persisted or used for pool identity; executable resolution always supplies
-// the exact SessionControl UID.
-func validateACPWorkspaceBindingRequest(
-	task *corev1alpha1.Task,
-	defaultProvider corev1alpha1.WorkspaceProvider,
-	enforceNamespaceIsolation bool,
-) (*ACPRuntimeWorkspaceBinding, error) {
-	return validateACPWorkspaceBindingRequestWithClass(task, defaultProvider, enforceNamespaceIsolation, nil)
-}
-
 // validateACPWorkspaceBindingRequestWithClass validates a legacy or
 // class-shaped request with a validation-only Session placeholder that is
 // never persisted or used for pool identity.
@@ -508,7 +481,7 @@ func acpWorkspaceBindingDigestWithClassOnDetach(
 		"provider":                   string(binding.Provider),
 		"reusePolicy":                string(binding.ReusePolicy),
 		"cleanupPolicy":              string(binding.CleanupPolicy),
-		"workspaceSlot":              binding.WorkspaceSlot,
+		acpWorkspaceSlotMapKey:       binding.WorkspaceSlot,
 		acpWorkspaceSessionUIDMapKey: binding.SessionUID,
 		"sessionKey":                 binding.SessionKey,
 		"templateNamespace":          binding.TemplateNamespace,
@@ -566,12 +539,12 @@ func applyACPWorkspaceBindingToPlan(plan ACPRuntimePlan, binding *ACPRuntimeWork
 		// closed instead of silently materializing a fresh filesystem.
 		identityFields = map[string]string{
 			acpWorkspaceSessionUIDMapKey: binding.SessionUID,
-			"workspaceSlot":              binding.WorkspaceSlot,
+			acpWorkspaceSlotMapKey:       binding.WorkspaceSlot,
 		}
 		poolKind = "session"
 	} else {
-		identityFields["profileDigest"] = string(plan.Digest)
-		identityFields["runtimeImage"] = plan.Image
+		identityFields[acpRuntimePoolIdentityProfileDigestKey] = string(plan.Digest)
+		identityFields[acpRuntimePoolIdentityRuntimeImageKey] = plan.Image
 	}
 	identity, err := acpDomainDigest("runtime-pool-identity", identityFields)
 	if err != nil {

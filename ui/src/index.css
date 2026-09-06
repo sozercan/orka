@@ -7,15 +7,12 @@
  *   - phase     (status-*): pending / running / succeeded / failed
  *   - task type (type-*):   container / ai / agent
  *   - liveness  (live):     reserved bioluminescent cyan = "happening now"
- * Everything else is neutral (canvas / surface / elevated ramp).
+ * Everything else is neutral.
  */
 
 @theme {
-  /* ---- Neutral elevation ramp (light = cool paper) ---- */
-  --color-canvas: #f6f8fa;
+  /* ---- Neutral ground (light = cool paper) ---- */
   --color-background: #f6f8fa;
-  --color-surface: #ffffff;
-  --color-elevated: #ffffff;
 
   --color-foreground: #0b1220;
   --color-card: #ffffff;
@@ -68,7 +65,6 @@
     Consolas, monospace;
 
   /* ---- Shadow scale that reads on both paper and abyss ---- */
-  --shadow-2xs: 0 1px 2px 0 rgb(15 23 42 / 0.04);
   --shadow-xs: 0 1px 3px 0 rgb(15 23 42 / 0.06);
   --shadow-sm: 0 1px 2px 0 rgb(15 23 42 / 0.06), 0 1px 3px 0 rgb(15 23 42 / 0.1);
   --shadow-md: 0 2px 4px -1px rgb(15 23 42 / 0.08),
@@ -82,10 +78,7 @@
  * shadows do on light, so cards stay legible without relying on invisible shadow.
  */
 .dark {
-  --color-canvas: #0a0e14;
   --color-background: #0a0e14;
-  --color-surface: #111722;
-  --color-elevated: #18202c;
 
   --color-foreground: #e6edf3;
   --color-card: #111722;
@@ -128,7 +121,6 @@
   --color-type-agent: #818cf8;
 
   /* Deeper shadows so elevation still reads against near-black. */
-  --shadow-2xs: 0 1px 2px 0 rgb(0 0 0 / 0.4);
   --shadow-xs: 0 1px 3px 0 rgb(0 0 0 / 0.45);
   --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.45), 0 1px 3px 0 rgb(0 0 0 / 0.55);
   --shadow-md: 0 2px 4px -1px rgb(0 0 0 / 0.5), 0 8px 20px -6px rgb(0 0 0 / 0.6);

@@ -4,21 +4,16 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ListAccessError } from '@/components/ui/list-access-error'
 import { PageHeader } from '@/components/layout/page-header'
 import { useRepositoryScans, useRunSecurityScan } from '@/hooks/use-security'
 import type { RepositoryScan } from '@/schemas/security'
-
-function timeAgo(ts?: string) {
-  if (!ts) return 'Never'
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(ts).getTime()) / 1000))
-  if (seconds < 60) return `${seconds}s ago`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  return `${Math.floor(seconds / 86400)}d ago`
-}
+import { repositoryDisplayName } from '@/lib/repository-name'
+import { timeAgo } from '@/lib/time'
 
 export function RepositoryList() {
-  const { data, isLoading } = useRepositoryScans()
+  const { data, isLoading, error } = useRepositoryScans()
+  const repositories = error ? [] : (data?.items ?? [])
 
   return (
     <div className="space-y-4">
@@ -44,7 +39,9 @@ export function RepositoryList() {
             </Card>
           ))}
         </div>
-      ) : (data?.items ?? []).length === 0 ? (
+      ) : error ? (
+        <Card><CardContent className="pt-6"><ListAccessError error={error} resource="security repositories" /></CardContent></Card>
+      ) : repositories.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
             No repositories configured for security scanning yet.
@@ -52,7 +49,7 @@ export function RepositoryList() {
         </Card>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
-          {(data?.items ?? []).map((repo) => (
+          {repositories.map((repo) => (
             <RepositoryCard key={repo.metadata.name} repo={repo} />
           ))}
         </div>
@@ -64,6 +61,7 @@ export function RepositoryList() {
 function RepositoryCard({ repo }: { repo: RepositoryScan }) {
   const runScan = useRunSecurityScan(repo.metadata.name)
   const lastScanAt = repo.status?.lastScanAt ?? repo.status?.lastSuccessfulScanAt
+  const displayName = repositoryDisplayName(repo.spec, repo.metadata.name)
 
   return (
     <Card className="transition-colors hover:border-primary/50">
@@ -72,10 +70,10 @@ function RepositoryCard({ repo }: { repo: RepositoryScan }) {
           <CardTitle className="flex items-center gap-2 text-lg">
             <Shield className="h-5 w-5 text-primary" />
             <Link to="/security/$repoId" params={{ repoId: repo.metadata.name }} className="hover:underline">
-              {repo.spec.repository || repo.metadata.name}
+              {displayName.split('/').pop() || repo.metadata.name}
             </Link>
           </CardTitle>
-          <p className="text-sm text-muted-foreground">{repo.spec.owner}/{repo.spec.repository} · {repo.spec.branch || 'main'}</p>
+          <p className="text-sm text-muted-foreground">{displayName} · {repo.spec.branch || 'main'}</p>
         </div>
         <Badge variant={repo.status?.phase === 'Ready' ? 'default' : 'secondary'}>
           {repo.status?.phase || 'Pending'}
@@ -85,7 +83,7 @@ function RepositoryCard({ repo }: { repo: RepositoryScan }) {
         <div className="text-sm text-muted-foreground">{repo.spec.repoURL}</div>
         <div className="grid gap-2 text-sm md:grid-cols-2">
           <div>Open findings: <span className="font-medium text-foreground">{repo.status?.findingCounts?.total ?? 0}</span></div>
-          <div>Last scan: <span className="font-medium text-foreground">{timeAgo(lastScanAt)}</span></div>
+          <div>Last scan: <span className="font-medium text-foreground">{timeAgo(lastScanAt, { empty: 'Never' })}</span></div>
         </div>
         <div className="flex flex-wrap gap-2 text-xs">
           <Badge variant="destructive">{repo.status?.findingCounts?.critical ?? 0} critical</Badge>

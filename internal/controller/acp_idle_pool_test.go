@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	workspacev1alpha1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
+	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/store/sqlite"
 )
@@ -403,6 +405,63 @@ func TestRecordPoolLastDemandAtPreservesConcurrentNewerTimestamp(t *testing.T) {
 	got, err := time.Parse(time.RFC3339Nano, updated.Annotations[acpRuntimeLastDemandAnnotation])
 	if err != nil || !got.Equal(newerDemand) {
 		t.Fatalf("last demand = %s, %v, want concurrent newer value %s", got, err, newerDemand)
+	}
+}
+
+func TestReapStoppedSupersededPlainPoolDeletesAfterGrace(t *testing.T) {
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	oldImage := "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("a", 64)
+	newImage := "docker.io/sozercan/orka-acp@sha256:" + strings.Repeat("9", 64)
+
+	tests := []struct {
+		name        string
+		images      ACPRuntimeImages
+		activeTasks int
+		wantDeleted bool
+	}{
+		{name: "retired and idle", images: ACPRuntimeImages{Codex: newImage}, wantDeleted: true},
+		{name: "active Task still references pool", images: ACPRuntimeImages{Codex: newImage}, activeTasks: 1},
+		{name: "image is still approved", images: ACPRuntimeImages{Codex: oldImage}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := runtimePoolTestObject(0)
+			identity, err := acpDomainDigest("runtime-pool-identity", map[string]string{
+				"profileDigest": pool.Spec.Runtime.Profile.Digest,
+				"runtimeImage":  pool.Spec.Runtime.Image,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pool.Name = acpRuntimePoolName(pool.Spec.Runtime.Profile.ProviderKind, harnessv2.ProfileDigest(identity))
+			pool.UID = types.UID(pool.Namespace + "-retired-pool-uid")
+			pool.Annotations = map[string]string{
+				acpRuntimeLastDemandAnnotation: now.Add(-3 * time.Minute).Format(time.RFC3339Nano),
+			}
+			pool.Status = corev1alpha1.RuntimePoolStatus{
+				ObservedGeneration: pool.Generation,
+				DesiredReplicas:    0,
+				CurrentReplicas:    0,
+				Lifecycle:          corev1alpha1.RuntimePoolLifecycleStopped,
+				AdmissionState:     corev1alpha1.RuntimePoolAdmissionClosed,
+			}
+			kubeClient := fake.NewClientBuilder().
+				WithScheme(runtimePoolTestScheme(t)).
+				WithStatusSubresource(&corev1alpha1.RuntimePool{}).
+				WithObjects(pool).
+				Build()
+			dispatcher := &ACPDispatcher{Client: kubeClient, IdlePoolTTL: time.Minute, ACPRuntimeImages: tt.images}
+			if err := dispatcher.reapStoppedSupersededPlainPool(context.Background(), pool, tt.activeTasks, now); err != nil {
+				t.Fatal(err)
+			}
+			var pools corev1alpha1.RuntimePoolList
+			if err := kubeClient.List(context.Background(), &pools); err != nil {
+				t.Fatal(err)
+			}
+			if deleted := len(pools.Items) == 0; deleted != tt.wantDeleted {
+				t.Fatalf("pool deleted = %t, want %t", deleted, tt.wantDeleted)
+			}
+		})
 	}
 }
 

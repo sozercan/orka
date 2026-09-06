@@ -1586,7 +1586,6 @@ spec:
     name: orka-workers
     namespace: ate-demo
   targetActors: 2
-  targetWorkers: 1
   precreateActors: true
 YAML
 

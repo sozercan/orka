@@ -19,6 +19,7 @@ import (
 	"github.com/orka-agents/orka/internal/metrics"
 	"github.com/orka-agents/orka/internal/security"
 	"github.com/orka-agents/orka/internal/store"
+	"github.com/orka-agents/orka/internal/tools"
 	"github.com/orka-agents/orka/internal/workerenv"
 )
 
@@ -95,9 +96,6 @@ func (h *Handlers) normalizeRepositoryMonitorSpec(spec *corev1alpha1.RepositoryM
 	if spec.Review.Event == "" {
 		spec.Review.Event = "COMMENT"
 	}
-	if spec.Validation.Mode == "" {
-		spec.Validation.Mode = "changed"
-	}
 }
 
 func validateRepositoryMonitorSpec(spec corev1alpha1.RepositoryMonitorSpec) error {
@@ -118,6 +116,12 @@ func validateRepositoryMonitorSpec(spec corev1alpha1.RepositoryMonitorSpec) erro
 	}
 	if err := validateRepositoryMonitorCommandLabels(spec); err != nil {
 		return err
+	}
+	if strings.TrimSpace(spec.Validation.Mode) != "" || len(spec.Validation.Commands) > 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "spec.validation.mode and spec.validation.commands are no longer supported; replace them with spec.validation.image")
+	}
+	if image := spec.Validation.Image; image != "" && !tools.ValidRepositoryValidationImage(image) {
+		return fiber.NewError(fiber.StatusBadRequest, "spec.validation.image must be digest-pinned with sha256")
 	}
 	if repositoryMonitorPullRequestsEnabled(spec) && (spec.Agents.Reviewer == nil || strings.TrimSpace(spec.Agents.Reviewer.Name) == "") {
 		return fiber.NewError(fiber.StatusBadRequest, "spec.agents.reviewer.name is required when pull request monitoring is enabled")
@@ -190,6 +194,10 @@ func (h *Handlers) validateRepositoryMonitorImplementerAgent(c fiber.Ctx, namesp
 	if h.enforceNamespaceIsolation && agentNamespace != namespace {
 		return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("spec.agents.implementer namespace %q must match monitor namespace %q when namespace isolation is enforced", agentNamespace, namespace))
 	}
+	if err := authorizeKubernetesResourceAction(c.Context(), h.clientset, GetUserInfo(c),
+		agentNamespace, "get", corev1alpha1.GroupVersion.Group, "agents", ref.Name); err != nil {
+		return err
+	}
 	var agent corev1alpha1.Agent
 	if err := h.client.Get(c.Context(), types.NamespacedName{Name: ref.Name, Namespace: agentNamespace}, &agent); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -261,6 +269,10 @@ func (h *Handlers) validateRepositoryMonitorReadOnlyAgent(c fiber.Ctx, namespace
 	}
 	if h.enforceNamespaceIsolation && agentNamespace != namespace {
 		return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("%s namespace %q must match monitor namespace %q when namespace isolation is enforced", field, agentNamespace, namespace))
+	}
+	if err := authorizeKubernetesResourceAction(c.Context(), h.clientset, GetUserInfo(c),
+		agentNamespace, "get", corev1alpha1.GroupVersion.Group, "agents", ref.Name); err != nil {
+		return err
 	}
 	var agent corev1alpha1.Agent
 	if err := h.client.Get(c.Context(), types.NamespacedName{Name: ref.Name, Namespace: agentNamespace}, &agent); err != nil {
@@ -361,6 +373,10 @@ func (h *Handlers) validateRepositoryMonitorCredentialSecrets(c fiber.Ctx, names
 		secretName := repositoryMonitorCredentialRefName(credential.ref)
 		if secretName == "" {
 			continue
+		}
+		if err := authorizeKubernetesResourceAction(c.Context(), h.clientset, GetUserInfo(c),
+			namespace, "get", "", "secrets", secretName); err != nil {
+			return err
 		}
 		var secret corev1.Secret
 		if err := h.client.Get(c.Context(), types.NamespacedName{Name: secretName, Namespace: namespace}, &secret); err != nil {

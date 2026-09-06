@@ -625,15 +625,12 @@ const (
 	recoveredToolOutcomeUnknownSummary     = "Tool call outcome unknown"
 )
 
-// MapUpdate maps one validated harness v2 update to the public execution-event
-// taxonomy. Streamed assistant and tool text is deliberately omitted here:
-// independently redacting chunks can leak credentials split across update
-// boundaries. Journal state supplies tool text only after the logical stream is
-// complete, and assistant text is persisted from the terminal transcript.
-func MapUpdate(event harnessv2.Event, mapCtx MapContext) (*store.ExecutionEvent, error) {
-	return mapUpdate(event, mapCtx, mapUpdateOptions{})
-}
-
+// mapUpdate maps one validated harness v2 update to the public execution-event
+// taxonomy. Streamed assistant and tool text is deliberately omitted unless
+// options supply it: independently redacting chunks can leak credentials split
+// across update boundaries. Journal state supplies tool text only after the
+// logical stream is complete, and assistant text is persisted from the
+// terminal transcript.
 func mapUpdate(event harnessv2.Event, mapCtx MapContext, options mapUpdateOptions) (*store.ExecutionEvent, error) {
 	if err := mapCtx.validate(); err != nil {
 		return nil, err
@@ -813,19 +810,6 @@ func hasUsageTelemetry(usage harnessv2.UsageUpdate) bool {
 		usage.ContextWindowUsed != nil || usage.ContextWindowSize != nil
 }
 
-func mapToolUpdateWithContent(
-	event harnessv2.Event,
-	mapCtx MapContext,
-	contentText string,
-	contentTruncated bool,
-	contentMultipleBlocksOmitted bool,
-) (*store.ExecutionEvent, error) {
-	mapped, _, err := mapToolUpdateWithHistory(
-		event, mapCtx, &contentText, contentTruncated, contentMultipleBlocksOmitted, "", nil, false,
-	)
-	return mapped, err
-}
-
 func mapToolUpdateWithHistory(
 	event harnessv2.Event,
 	mapCtx MapContext,
@@ -910,13 +894,8 @@ func mapToolUpdateWithoutMetadata(event harnessv2.Event, mapCtx MapContext) (*st
 	return mapUpdate(event, mapCtx, mapUpdateOptions{omitToolMetadata: true})
 }
 
-// MapTerminalUsage projects usage reported only by a completed result while
-// retaining the terminal event's durable protocol identity.
-func MapTerminalUsage(event harnessv2.Event, mapCtx MapContext) (*store.ExecutionEvent, error) {
-	mapped, _, err := mapTerminalUsageWithHistory(event, mapCtx, nil, false)
-	return mapped, err
-}
-
+// mapTerminalUsageWithHistory projects usage reported only by a completed
+// result while retaining the terminal event's durable protocol identity.
 func mapTerminalUsageWithHistory(
 	event harnessv2.Event,
 	mapCtx MapContext,
@@ -951,6 +930,9 @@ func mapTerminalUsageWithHistory(
 
 // MapPromptLifecycle maps prompt acceptance and settlement into the existing
 // model-request lifecycle taxonomy used by task traces and UI execution graphs.
+// Journal state uses mapPromptLifecycleWithHistory directly; this entry point
+// serves callers outside the package that need a mapped lifecycle event
+// without journal deduplication.
 func MapPromptLifecycle(event harnessv2.Event, mapCtx MapContext) (*store.ExecutionEvent, error) {
 	mapped, _, err := mapPromptLifecycleWithHistory(event, mapCtx, nil, false)
 	return mapped, err

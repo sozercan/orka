@@ -145,21 +145,6 @@ func (s RuntimeSession) Validate() error {
 	return nil
 }
 
-func (s *RuntimeSession) Transition(to RuntimeSessionState, now time.Time) error {
-	if s == nil {
-		return fmt.Errorf("runtime session is required")
-	}
-	if err := ValidateRuntimeSessionTransition(s.State, to); err != nil {
-		return err
-	}
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
-	s.State = to
-	s.UpdatedAt = now.UTC()
-	return nil
-}
-
 func IsKnownRuntimeCleanupPolicy(policy RuntimeCleanupPolicy) bool {
 	switch policy {
 	case RuntimeCleanupPolicyDelete, RuntimeCleanupPolicyRetain, RuntimeCleanupPolicySuspend:

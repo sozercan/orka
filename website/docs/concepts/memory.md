@@ -1,5 +1,6 @@
 ---
 slug: /memory
+description: "The namespace-scoped memory layer: durable memories, proposals, and why writing one is a review request."
 ---
 
 # Memory

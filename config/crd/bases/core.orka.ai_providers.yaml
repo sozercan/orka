@@ -73,18 +73,6 @@ spec:
                 description: DefaultModel is the default model to use if not specified
                   in Task/Agent
                 type: string
-              rateLimit:
-                description: RateLimit configures rate limiting for this provider
-                properties:
-                  requestsPerMinute:
-                    description: RequestsPerMinute limits requests per minute
-                    format: int32
-                    type: integer
-                  tokensPerMinute:
-                    description: TokensPerMinute limits tokens per minute
-                    format: int64
-                    type: integer
-                type: object
               secretRef:
                 description: SecretRef references the Secret containing API credentials
                 properties:
