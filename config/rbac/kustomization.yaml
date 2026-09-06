@@ -53,5 +53,8 @@ resources:
 - task_admin_role.yaml
 - task_editor_role.yaml
 - task_viewer_role.yaml
+# External API permissions, including virtual resources stored outside CRDs.
+- api_viewer_role.yaml
+- api_editor_role.yaml
 # Worker ServiceAccount and RBAC for task execution
 - worker_role.yaml

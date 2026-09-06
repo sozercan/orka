@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"reflect"
+	"strings"
 
 	"github.com/gofiber/fiber/v3"
 	authorizationv1 "k8s.io/api/authorization/v1"
@@ -39,6 +40,7 @@ func authorizeKubernetesTaskCreate(ctx context.Context, clientset kubernetes.Int
 	review, err := clientset.AuthorizationV1().SubjectAccessReviews().Create(ctx, &authorizationv1.SubjectAccessReview{
 		Spec: authorizationv1.SubjectAccessReviewSpec{
 			User:   userInfo.Username,
+			UID:    userInfo.UID,
 			Groups: userInfo.Groups,
 			Extra:  extra,
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
@@ -57,12 +59,11 @@ func authorizeKubernetesTaskCreate(ctx context.Context, clientset kubernetes.Int
 		)
 		return fiber.NewError(fiber.StatusForbidden, "not authorized to create tasks")
 	}
-	if !review.Status.Allowed {
+	if review == nil || !review.Status.Allowed || review.Status.Denied || review.Status.EvaluationError != "" {
 		log.Info("task create authorization denied",
 			"username", userInfo.Username,
 			"namespace", task.Namespace,
 			"task", task.Name,
-			"reason", review.Status.Reason,
 		)
 		return fiber.NewError(fiber.StatusForbidden, "not authorized to create tasks")
 	}
@@ -94,15 +95,16 @@ func authorizeKubernetesResourceAction(
 	for key, values := range userInfo.Extra {
 		extra[key] = authorizationv1.ExtraValue(values)
 	}
+	resource, subresource, _ := strings.Cut(resource, "/")
 	review, err := clientset.AuthorizationV1().SubjectAccessReviews().Create(ctx, &authorizationv1.SubjectAccessReview{
 		Spec: authorizationv1.SubjectAccessReviewSpec{
-			User: userInfo.Username, Groups: userInfo.Groups, Extra: extra,
+			User: userInfo.Username, UID: userInfo.UID, Groups: userInfo.Groups, Extra: extra,
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Namespace: namespace, Verb: verb, Group: group, Resource: resource, Name: name,
+				Namespace: namespace, Verb: verb, Group: group, Resource: resource, Subresource: subresource, Name: name,
 			},
 		},
 	}, metav1.CreateOptions{})
-	if err != nil || !review.Status.Allowed {
+	if err != nil || review == nil || !review.Status.Allowed || review.Status.Denied || review.Status.EvaluationError != "" {
 		return fiber.NewError(fiber.StatusForbidden, "not authorized")
 	}
 	return nil

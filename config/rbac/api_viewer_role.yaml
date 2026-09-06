@@ -1,0 +1,58 @@
+# Optional permissions for callers of the external Orka API.
+# Bind this ClusterRole with a RoleBinding in the installation namespace.
+# Secret access and workspace-class use require separate grants.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: orka
+    app.kubernetes.io/managed-by: kustomize
+  name: api-viewer-role
+rules:
+- apiGroups: [core.orka.ai]
+  resources:
+  - tasks
+  - sessions
+  - memories
+  - memoryproposals
+  - providers
+  - tools
+  - runtimepools
+  - agentruntimes
+  - agents
+  - skills
+  - repositoryscans
+  - repositoryscans/slices
+  - repositorymonitors
+  - monitorcommands
+  - monitoractions
+  - monitorworkactions
+  - monitorimplementationjobs
+  - monitormutations
+  - substrateactorpools
+  verbs: [get, list]
+- apiGroups: [gateway.orka.ai]
+  resources:
+  - gatewayclasses
+  - gateways
+  - gatewaybindings
+  - gatewayevents
+  - gatewaydeliveries
+  verbs: [get, list]
+- apiGroups: [core.orka.ai]
+  resources:
+  - repositoryscans/threatmodel
+  - securityfindings
+  - securityfindings/pullrequest
+  - chats/config
+  verbs: [get]
+- apiGroups: [core.orka.ai]
+  resources:
+  - repositoryscans/scans
+  - repositoryscans/droppedfindings
+  - repositoryscans/findings
+  - securityfindings/patches
+  - repositorymonitors/runs
+  - repositorymonitors/items
+  - monitorevents
+  verbs: [list]

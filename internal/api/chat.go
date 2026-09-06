@@ -158,6 +158,7 @@ type ChatHandler struct {
 	enforceNamespaceIsolation bool
 	sessionStore              store.SessionStore
 	resultStore               store.ResultStore
+	gatewayEventStore         store.GatewayEventStore
 	contextTokenAuthorization ContextTokenAuthorizationConfig
 	cooldownTracker           *llm.CooldownTracker
 	resolver                  *ProviderResolver
@@ -246,9 +247,21 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 	if err := authorizeContextTokenAgentContext(c, ch.contextTokenAuthorization, "chat", namespace, req.AgentRef); err != nil {
 		return err
 	}
+	if req.AgentRef != "" {
+		if err := authorizeKubernetesResourceAction(ctx, ch.kubeClient, userInfo, namespace, "get", corev1alpha1.GroupVersion.Group, "agents", req.AgentRef); err != nil {
+			return err
+		}
+	}
 
 	// Resolve or create session ID
 	sessionID := resolveChatSessionID(req.SessionID)
+	if req.SessionID != "" {
+		for _, verb := range []string{"get", "update"} {
+			if err := authorizeKubernetesResourceAction(ctx, ch.kubeClient, userInfo, namespace, verb, corev1alpha1.GroupVersion.Group, "sessions", sessionID); err != nil {
+				return err
+			}
+		}
+	}
 	reservation, err := ch.reserveActiveChat(namespace, sessionID)
 	if err != nil {
 		return chatSessionLockError(err)
@@ -315,7 +328,8 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 	}()
 
 	// Build system prompt
-	promptBuilder := NewSystemPromptBuilder(ch.client, namespace, ch.config.RuntimeAvailability)
+	discoveryClient := newExternalToolClient(ch.client, ch.kubeClient, userInfo, namespace, ch.watchNamespace, ch.enforceNamespaceIsolation, ch.gatewayEventStore)
+	promptBuilder := NewSystemPromptBuilder(externalToolDiscoveryClient{Client: discoveryClient}, namespace, ch.config.RuntimeAvailability)
 	systemPrompt, err := promptBuilder.BuildSystemPrompt(ctx, req.SystemPrompt, PromptModeFull)
 	if err != nil {
 		chatLog.Error(err, "failed to build system prompt")
@@ -382,6 +396,8 @@ func (ch *ChatHandler) HandleChat(c fiber.Ctx) error {
 
 	// Create tool executor (also creates the chat registry)
 	executor := NewToolExecutor(ch.client, ch.sessionManager, namespace, sessionID, ch.watchNamespace, ch.enforceNamespaceIsolation, ch.config.MaxTasksPerTurn, ch.config.ToolTimeout, ch.resultStore, ch.kubeClient)
+	executor.userInfo = userInfo
+	executor.gatewayEventStore = ch.gatewayEventStore
 	executor.SetExecutionMode(ch.config.ExecutionMode)
 	executor.provider = providerInfo.Name
 	executor.providerType = providerInfo.Type
@@ -693,6 +709,7 @@ func (ch *ChatHandler) runToolLoop(
 	var allToolCalls []ToolCallInfo
 	repetitionTracker := make(map[string]int)
 	start := time.Now()
+	taskClient := newExternalToolClient(executor.client, executor.kubeClient, executor.userInfo, namespace, executor.watchNamespace, executor.enforceNamespaceIsolation, executor.gatewayEventStore)
 
 	for iteration := 0; ; iteration++ {
 		iterTracer := tracing.Tracer("orka.chat")
@@ -746,7 +763,7 @@ func (ch *ChatHandler) runToolLoop(
 		if len(resp.ToolCalls) == 0 {
 			// Check if any tasks created in this session are still running.
 			// If so, re-prompt the LLM to keep waiting instead of ending the session.
-			if executor.tasksCreated > 0 && ch.hasRunningTasks(iterCtx, namespace, sessionID) {
+			if executor.tasksCreated > 0 && hasRunningTasks(iterCtx, taskClient, namespace, sessionID) {
 				if emitSSE != nil && resp.Content != "" {
 					msgData, _ := json.Marshal(map[string]string{"content": resp.Content})
 					emitSSE("message", string(msgData))
@@ -1317,9 +1334,9 @@ func writeSSE(w *bufio.Writer, event, data string) error {
 }
 
 // hasRunningTasks checks if any tasks created by this chat session are still running.
-func (ch *ChatHandler) hasRunningTasks(ctx context.Context, namespace, sessionID string) bool {
+func hasRunningTasks(ctx context.Context, c client.Client, namespace, sessionID string) bool {
 	var taskList corev1alpha1.TaskList
-	if err := ch.client.List(ctx, &taskList,
+	if err := c.List(ctx, &taskList,
 		client.InNamespace(namespace),
 		client.MatchingLabels{labels.LabelChatSession: sessionID},
 	); err != nil {

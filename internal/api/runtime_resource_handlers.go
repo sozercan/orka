@@ -139,7 +139,7 @@ func (h *Handlers) CreateAgentRuntime(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.authorizeRuntimeResourceAction(c, "create", "agentruntimes", namespace, strings.TrimSpace(runtime.Name)); err != nil {
+	if err := h.authorizeRuntimeResourceAction(c, "create", "agentruntimes", namespace, ""); err != nil {
 		return err
 	}
 	runtime.TypeMeta = metav1.TypeMeta{APIVersion: corev1alpha1.GroupVersion.String(), Kind: "AgentRuntime"}

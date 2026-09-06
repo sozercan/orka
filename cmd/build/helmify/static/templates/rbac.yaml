@@ -285,10 +285,13 @@ rules:
   # Task permissions
   - apiGroups: ["core.orka.ai"]
     resources: ["tasks"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
   - apiGroups: ["core.orka.ai"]
     resources: ["tasks/status"]
     verbs: ["get"]
+  - apiGroups: ["core.orka.ai"]
+    resources: ["tasks/approvals"]
+    verbs: ["update"]
 
   # RepositoryMonitor permissions
   - apiGroups: ["core.orka.ai"]
@@ -323,13 +326,47 @@ rules:
   # Virtual Session API permissions
   - apiGroups: ["core.orka.ai"]
     resources: ["sessions"]
-    verbs: ["get", "list", "delete"]
+    verbs: ["get", "list", "update", "delete"]
+
+  # Chat admission does not authorize nested tool resource operations.
+  - apiGroups: ["core.orka.ai"]
+    resources: ["chats"]
+    verbs: ["create"]
+  - apiGroups: ["core.orka.ai"]
+    resources: ["chats/config"]
+    verbs: ["get"]
+
+  # Read virtual memory and security records. Review/apply and security
+  # mutations require an explicit operator grant.
+  - apiGroups: ["core.orka.ai"]
+    resources: ["memories", "memoryproposals", "repositoryscans/slices"]
+    verbs: ["get", "list"]
+  - apiGroups: ["core.orka.ai"]
+    resources: ["repositoryscans/threatmodel", "securityfindings", "securityfindings/pullrequest"]
+    verbs: ["get"]
+  - apiGroups: ["core.orka.ai"]
+    resources: ["repositoryscans/scans", "repositoryscans/droppedfindings", "repositoryscans/findings", "securityfindings/patches"]
+    verbs: ["list"]
+
+  # Virtual monitor records and actions, alongside RepositoryMonitor edit access.
+  - apiGroups: ["core.orka.ai"]
+    resources: ["repositorymonitors/runs", "repositorymonitors/commands"]
+    verbs: ["create"]
+  - apiGroups: ["core.orka.ai"]
+    resources: ["repositorymonitors/runs", "repositorymonitors/items", "monitorevents"]
+    verbs: ["list"]
+  - apiGroups: ["core.orka.ai"]
+    resources: ["monitorcommands", "monitoractions", "monitorworkactions", "monitorimplementationjobs", "monitormutations"]
+    verbs: ["get", "list"]
 
   {{- if $harnessV2 }}
-  # Generic gateway resource permissions (read-only; durable ledgers use the Orka REST API).
+  # Generic gateway resources and virtual durable ledgers remain read-only.
   - apiGroups: ["gateway.orka.ai"]
     resources: ["gateways", "gatewaybindings"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.orka.ai"]
+    resources: ["gatewayevents", "gatewaydeliveries"]
+    verbs: ["get", "list"]
 
   # ACP runtime resource permissions (read-only; the dashboard Runtimes page
   # and `orka runtime-pool` / `orka agent-runtime` reads pass a

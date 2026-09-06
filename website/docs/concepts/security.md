@@ -171,6 +171,20 @@ The controller runs with:
 - The `orka` CLI extracts tokens from kubeconfig for browser-based login
 - **Token caching**: Validated ServiceAccount tokens are cached for 60 seconds using SHA256 hashes to avoid repeated TokenReview API calls. Token revocation has up to 60s propagation delay. The cache is in-memory only — not persistent across pod restarts
 
+## API authorization
+
+For Kubernetes TokenReview callers, every external API route requires a
+SubjectAccessReview for the requested resource, operation, and resolved namespace.
+Only the authenticated `/api/v1/auth/validate` and `/api/v1/auth/whoami` routes omit
+resource authorization. Missing authorization infrastructure, denied decisions,
+and evaluation errors fail closed before the operation runs.
+
+Stored records such as sessions, memory proposals, security findings, and gateway
+deliveries have explicit RBAC resource names. OIDC subject allowlists and namespace
+bindings, transaction-token scope modes, workspace-class `use` checks, and Gateway
+identity checks retain their existing policies. See [API authorization](../reference/api-authorization.md)
+for every route's permissions, namespace precedence, and grant examples.
+
 ## Secret management
 
 - Provider-proxy, source-read, publication-read, publication-write, forge,

@@ -508,6 +508,9 @@ func (s *Store) applyMemoryProposalOnce(ctx context.Context, apply store.MemoryP
 		if proposal.AppliedMemoryID == "" {
 			return nil, fmt.Errorf("applied proposal is missing applied memory id")
 		}
+		if err := authorizeExistingProposalMemory(ctx, apply, proposal.Namespace, proposal.AppliedMemoryID); err != nil {
+			return nil, err
+		}
 		memory, err := scanMemory(tx.QueryRowContext(ctx, selectMemorySQL()+` WHERE namespace = ? AND id = ?`, proposal.Namespace, proposal.AppliedMemoryID))
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("applied proposal references missing memory")
@@ -534,6 +537,9 @@ func (s *Store) applyMemoryProposalOnce(ctx context.Context, apply store.MemoryP
 
 	existing, err := scanMemory(tx.QueryRowContext(ctx, selectMemorySQL()+` WHERE namespace = ? AND source_proposal_id = ?`, apply.Namespace, apply.ID))
 	if err == nil {
+		if err := authorizeExistingProposalMemory(ctx, apply, existing.Namespace, existing.ID); err != nil {
+			return nil, err
+		}
 		now := time.Now()
 		res, err := tx.ExecContext(ctx,
 			`UPDATE memory_proposals
@@ -593,6 +599,9 @@ func (s *Store) applyMemoryProposalOnce(ctx context.Context, apply store.MemoryP
 		if lookupErr != nil {
 			return nil, err
 		}
+		if err := authorizeExistingProposalMemory(ctx, apply, existing.Namespace, existing.ID); err != nil {
+			return nil, err
+		}
 		if err := markMemoryProposalApplied(ctx, tx, apply, existing.ID, true); err != nil {
 			return nil, err
 		}
@@ -610,6 +619,13 @@ func (s *Store) applyMemoryProposalOnce(ctx context.Context, apply store.MemoryP
 	}
 	committed = true
 	return memory, nil
+}
+
+func authorizeExistingProposalMemory(ctx context.Context, apply store.MemoryProposalApply, namespace, id string) error {
+	if apply.AuthorizeExistingMemory == nil {
+		return nil
+	}
+	return apply.AuthorizeExistingMemory(ctx, namespace, id)
 }
 
 func markMemoryProposalApplied(ctx context.Context, tx *sql.Tx, apply store.MemoryProposalApply, memoryID string, allowExistingAppliedID bool) error {

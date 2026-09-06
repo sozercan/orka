@@ -170,10 +170,13 @@ func NewServer(c client.Client, sessionManager *controller.SessionManager, confi
 	resolver := NewProviderResolver(c, config.Chat)
 	server.chatHandler = NewChatHandler(c, sessionManager, config.Chat, config.WatchNamespace, config.EnforceNamespaceIsolation, config.SessionStore, config.ResultStore, resolver, config.Clientset)
 	server.chatHandler.contextTokenAuthorization = config.ContextTokenAuthorization
+	server.chatHandler.gatewayEventStore = config.GatewayEventStore
 	server.openaiHandler = NewOpenAICompatHandler(c, config.WatchNamespace, config.EnforceNamespaceIsolation, config.Chat, resolver, config.ResultStore, config.Clientset)
 	server.openaiHandler.contextTokenAuthorization = config.ContextTokenAuthorization
+	server.openaiHandler.gatewayEventStore = config.GatewayEventStore
 	server.anthropicHandler = NewAnthropicCompatHandler(c, config.WatchNamespace, config.EnforceNamespaceIsolation, config.Chat, resolver, config.ResultStore, config.Clientset)
 	server.anthropicHandler.contextTokenAuthorization = config.ContextTokenAuthorization
+	server.anthropicHandler.gatewayEventStore = config.GatewayEventStore
 	server.setupMiddleware()
 	server.setupRoutes()
 	server.setupStaticFiles()
@@ -290,10 +293,7 @@ func (s *Server) setupRoutes() {
 	externalAuth := NewAuthMiddleware(s.client, AuthConfig{OIDC: s.config.OIDC, ContextTokens: s.config.ContextTokens})
 
 	// API v1 group
-	api := s.app.Group("/api/v1")
-
-	// Auth middleware for API endpoints
-	api.Use(externalAuth)
+	api := s.externalAPIGroup("/api/v1", externalAuth)
 
 	// Task endpoints
 	api.Post("/tasks", s.handlers.CreateTask)
@@ -454,14 +454,12 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI-compatible API (under /openai/v1, separate from /api/v1)
 	// This allows OpenAI-compatible clients to use Orka as a custom provider.
-	oai := s.app.Group("/openai/v1")
-	oai.Use(externalAuth)
+	oai := s.externalAPIGroup("/openai/v1", externalAuth)
 	oai.Post("/chat/completions", s.openaiHandler.HandleChatCompletions)
 	oai.Get("/models", s.openaiHandler.HandleListModels)
 
 	// Anthropic-compatible API
-	anthropic := s.app.Group("/anthropic/v1")
-	anthropic.Use(externalAuth)
+	anthropic := s.externalAPIGroup("/anthropic/v1", externalAuth)
 	anthropic.Post("/messages", s.anthropicHandler.HandleMessages)
 	anthropic.Get("/models", s.anthropicHandler.HandleListModels)
 

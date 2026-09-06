@@ -1,0 +1,99 @@
+# Optional permissions for callers of the external Orka API.
+# Bind this ClusterRole with a RoleBinding in the installation namespace.
+# Secret access and workspace-class use require separate grants.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: orka
+    app.kubernetes.io/managed-by: kustomize
+  name: api-editor-role
+rules:
+- apiGroups: [core.orka.ai]
+  resources:
+  - tasks
+  verbs: [get, list, create, patch, delete]
+- apiGroups: [core.orka.ai]
+  resources:
+  - tasks/approvals
+  verbs: [update]
+- apiGroups: [core.orka.ai]
+  resources:
+  - sessions
+  verbs: [get, list, update, delete]
+- apiGroups: [gateway.orka.ai]
+  resources:
+  - gatewayclasses
+  - gatewaybindings
+  - gatewayevents
+  verbs: [get, list]
+- apiGroups: [gateway.orka.ai]
+  resources:
+  - gateways
+  - gatewaydeliveries
+  verbs: [get, list, update]
+- apiGroups: [core.orka.ai]
+  resources:
+  - memories
+  - providers
+  - tools
+  - agentruntimes
+  - skills
+  - repositoryscans
+  - substrateactorpools
+  verbs: [get, list, create, update, delete]
+- apiGroups: [core.orka.ai]
+  resources:
+  - agents
+  verbs: [get, list, create, update, patch, delete]
+- apiGroups: [core.orka.ai]
+  resources:
+  - memoryproposals
+  verbs: [get, list, create, update, review, apply]
+- apiGroups: [core.orka.ai]
+  resources:
+  - runtimepools
+  - repositoryscans/slices
+  - monitorcommands
+  - monitoractions
+  - monitorworkactions
+  - monitorimplementationjobs
+  - monitormutations
+  verbs: [get, list]
+- apiGroups: [core.orka.ai]
+  resources:
+  - repositoryscans/threatmodel
+  - securityfindings
+  verbs: [get, update]
+- apiGroups: [core.orka.ai]
+  resources:
+  - repositoryscans/scans
+  - securityfindings/patches
+  - repositorymonitors/runs
+  verbs: [list, create]
+- apiGroups: [core.orka.ai]
+  resources:
+  - repositoryscans/status
+  verbs: [patch]
+- apiGroups: [core.orka.ai]
+  resources:
+  - repositoryscans/droppedfindings
+  - repositoryscans/findings
+  - repositorymonitors/items
+  - monitorevents
+  verbs: [list]
+- apiGroups: [core.orka.ai]
+  resources:
+  - securityfindings/validation
+  - repositorymonitors/commands
+  - chats
+  verbs: [create]
+- apiGroups: [core.orka.ai]
+  resources:
+  - securityfindings/pullrequest
+  - chats/config
+  verbs: [get]
+- apiGroups: [core.orka.ai]
+  resources:
+  - repositorymonitors
+  verbs: [get, list, create, update, patch, delete]

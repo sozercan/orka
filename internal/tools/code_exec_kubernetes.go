@@ -124,9 +124,10 @@ func (s *kubernetesCodeExecStoredResultCleanupState) pruneLocked(now time.Time) 
 }
 
 type kubernetesCodeExecClients struct {
-	client     crclient.Client
-	kubeClient kubernetes.Interface
-	namespace  string
+	client           crclient.Client
+	kubeClient       kubernetes.Interface
+	namespace        string
+	authorizePodLogs func(context.Context, string, string) error
 }
 
 type kubernetesCodeExecResources struct {
@@ -275,6 +276,7 @@ func (e *KubernetesJobCodeExecutor) kubernetesClients(ctx context.Context) (kube
 	if tc := GetToolContext(ctx); tc != nil {
 		clients.client = tc.Client
 		clients.kubeClient = tc.KubeClient
+		clients.authorizePodLogs = tc.AuthorizePodLogs
 		if strings.TrimSpace(tc.Namespace) != "" {
 			clients.namespace = tc.Namespace
 		}
@@ -1426,6 +1428,11 @@ func (e *KubernetesJobCodeExecutor) readJobLogs(ctx context.Context, clients kub
 	pod, ok, err := e.firstJobPod(ctx, clients, jobName)
 	if err != nil || !ok {
 		return kubernetesCodeExecLogOutput{}, err
+	}
+	if clients.authorizePodLogs != nil {
+		if err := clients.authorizePodLogs(ctx, clients.namespace, pod.Name); err != nil {
+			return kubernetesCodeExecLogOutput{}, err
+		}
 	}
 
 	streamer := e.logStreamer
