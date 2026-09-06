@@ -938,6 +938,47 @@ func TestThreatModelRedactsEditedContent(t *testing.T) {
 	}
 }
 
+func TestThreatModelRejectsBlankSanitizedEdit(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	app, handlers := setupSecurityHandlersWithAuthzFixture(
+		t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce,
+		securityAuthzTestRepositoryScan("scan-1", securityTestRepoURL),
+	)
+	ctx := context.Background()
+	const content = "Existing threat-model notes."
+	require.NoError(t, handlers.securityStore.SaveThreatModel(ctx, &store.ThreatModel{
+		Namespace: "demo", RepositoryScan: "scan-1", Content: content, Source: "edited",
+	}))
+	token := issueTestContextToken(t, provider, nil, map[string]any{
+		"scope": ContextTokenScopeSecurityWrite,
+		"tctx":  securityAuthzTestTctx(securityTestRepoURL),
+	})
+	for name, input := range map[string]string{
+		"empty":         "",
+		"whitespace":    " \n\t",
+		"format runes":  "\u200b\u202e",
+		"control runes": "\x00\x1b",
+		"mixed":         " \n\t\u200b\x00",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, err := json.Marshal(UpdateThreatModelRequest{Content: input})
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPut, "/security/repositories/scan-1/threat-model?namespace=demo", strings.NewReader(string(body)))
+			req.Header.Set(TransactionTokenHeaderName, token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			model, err := handlers.securityStore.GetLatestThreatModel(ctx, "demo", "scan-1")
+			require.NoError(t, err)
+			require.Equal(t, content, model.Content)
+			require.Equal(t, int64(1), model.Version)
+		})
+	}
+}
+
 func TestThreatModel_ContextTokenRepositoryScanAuthorizationDenials(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")

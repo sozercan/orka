@@ -751,6 +751,7 @@ func (h *Handlers) UpdateThreatModel(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid request body")
 	}
+	req.Content = security.SanitizeThreatModel(req.Content)
 	if strings.TrimSpace(req.Content) == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "content is required")
 	}
