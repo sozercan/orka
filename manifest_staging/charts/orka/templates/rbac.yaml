@@ -336,10 +336,10 @@ rules:
     resources: ["chats/config"]
     verbs: ["get"]
 
-  # Read virtual memory and security records. Review/apply and security
+  # Read memory and security resources. Review/apply and security
   # mutations require an explicit operator grant.
   - apiGroups: ["core.orka.ai"]
-    resources: ["memories", "memoryproposals", "repositoryscans/slices"]
+    resources: ["memories", "memoryproposals", "repositoryscans", "repositoryscans/slices"]
     verbs: ["get", "list"]
   - apiGroups: ["core.orka.ai"]
     resources: ["repositoryscans/threatmodel", "securityfindings", "securityfindings/pullrequest"]

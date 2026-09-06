@@ -201,6 +201,7 @@ func TestStaticChartClientVirtualAPIPermissions(t *testing.T) {
 				"chats/config":                    {"get"},
 				"memories":                        {"get", "list"},
 				"memoryproposals":                 {"get", "list"},
+				"repositoryscans":                 {"get", "list"},
 				"repositoryscans/threatmodel":     {"get"},
 				"repositoryscans/scans":           {"list"},
 				"repositoryscans/slices":          {"get", "list"},
@@ -236,6 +237,7 @@ func TestStaticChartClientVirtualAPIPermissions(t *testing.T) {
 			for _, permission := range [][3]string{
 				{"", "secrets", "get"}, {"", "secrets", "list"},
 				{"core.orka.ai", "agents", "create"},
+				{"core.orka.ai", "repositoryscans", "create"},
 				{"core.orka.ai", "memoryproposals", "review"},
 				{"core.orka.ai", "memoryproposals", "apply"},
 				{"core.orka.ai", "securityfindings", "update"},

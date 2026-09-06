@@ -180,49 +180,46 @@ regardless.
 authenticated callers must carry a namespace. A token from a ServiceAccount in the wrong
 namespace, or a user token with no namespace at all, is rejected.
 
-**The ServiceAccount lacks Task permissions.** Task creation checks the caller's
-Kubernetes RBAC through a SubjectAccessReview. This is an endpoint-specific check.
+**The caller lacks the requested permission.** Kubernetes TokenReview callers need RBAC
+permission for each protected API operation, checked through SubjectAccessReview. This includes Agent creation,
+chat, approval decisions, and stored records such as sessions and memories. Nested chat
+tools need their own resource permissions. A successful authentication check does not
+grant access to those actions. OIDC and transaction tokens retain their separate policies;
+see [API authorization](../reference/api-authorization.md).
 
-:::warning[Agent creation does not enforce caller RBAC]
-The REST Agent-creation endpoint and compatibility `create_agent` tool do not check a
-ServiceAccount caller's `agents/create` permission. Read-only Agent roles therefore do
-not prevent Agent creation through these API paths. Context-token authorization is a
-separate check for context-token callers.
-:::
-
-The Helm chart creates `orka-client` with the roles below; raw-manifest and Kustomize
-installs do not. To create one by hand:
+The Helm chart creates a client ServiceAccount and namespace-scoped Role. Raw-manifest
+and Kustomize installs do not create a client ServiceAccount. Current-source bundles
+include `orka-api-viewer-role` and `orka-api-editor-role`; for a client that can create
+Tasks and use chat, bind the editor role:
 
 ```bash
 kubectl -n orka-system create serviceaccount orka-client
 
-kubectl -n orka-system create role orka-client \
-  --verb=get,list,watch,create,delete --resource=tasks.core.orka.ai
-kubectl -n orka-system create role orka-client-monitors \
-  --verb=get,list,watch,create,update,patch,delete --resource=repositorymonitors.core.orka.ai
-kubectl -n orka-system create role orka-client-read \
-  --verb=get,list,watch \
-  --resource=agents.core.orka.ai,tools.core.orka.ai,skills.core.orka.ai,providers.core.orka.ai,runtimepools.core.orka.ai,agentruntimes.core.orka.ai
-kubectl -n orka-system create role orka-client-sessions \
-  --verb=get,list,delete --resource=sessions.core.orka.ai
-kubectl -n orka-system create role orka-client-gateway \
-  --verb=get,list,watch --resource=gateways.gateway.orka.ai,gatewaybindings.gateway.orka.ai
-kubectl create clusterrole orka-client-gatewayclass-viewer \
-  --verb=get,list,watch --resource=gatewayclasses.gateway.orka.ai
-
-for r in orka-client orka-client-monitors orka-client-read orka-client-sessions orka-client-gateway; do
-  kubectl -n orka-system create rolebinding "$r" \
-    --role="$r" --serviceaccount=orka-system:orka-client
-done
-kubectl create clusterrolebinding orka-client-gatewayclass-viewer \
-  --clusterrole=orka-client-gatewayclass-viewer --serviceaccount=orka-system:orka-client
+kubectl -n orka-system create rolebinding orka-client \
+  --clusterrole=orka-api-editor-role --serviceaccount=orka-system:orka-client
 ```
 
-Two of those look odd and are correct:
+Use `orka-api-viewer-role` for read-only access. The editor also permits Agent, Tool, and
+Provider changes, memory review/apply, and security actions. Use a narrower Role from the
+[permission inventory](../reference/api-authorization.md#grant-access) when that exceeds
+the client's needs. Both helper roles keep Secrets and workspace-class `use` separate;
+nested tools that run Kubernetes workloads need explicit workload grants as well.
 
-- **`sessions`** has no CRD. It is a virtual API resource; the REST API still runs a
-  SubjectAccessReview against it.
-- **`providers`** read access is what the dashboard's provider picker checks.
+If a bundle does not include these helper roles, apply `config/rbac/api_viewer_role.yaml`
+and `config/rbac/api_editor_role.yaml` from a checkout containing the authorization update.
+Files applied directly use the unprefixed names `api-viewer-role` and `api-editor-role`;
+use those names in the RoleBinding instead.
+
+GatewayClass reads require a separate cluster-scoped grant. If the client needs them,
+bind the installed GatewayClass viewer role:
+
+```bash
+kubectl create clusterrolebinding orka-client-gatewayclass-viewer \
+  --clusterrole=orka-gatewayclass-viewer-role --serviceaccount=orka-system:orka-client
+```
+
+Sessions, chats, memories, and other stored records use virtual RBAC resources without
+CRDs. Their grants are included in the API helper roles.
 
 ### `kubectl create token orka-client` fails
 
