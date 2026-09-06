@@ -28,7 +28,12 @@ import (
 	"github.com/orka-agents/orka/internal/tools"
 )
 
-const externalToolTaskResource = "tasks"
+const (
+	externalToolAgentResource = "agents"
+	externalToolTaskResource  = "tasks"
+	externalToolCreateVerb    = "create"
+	externalToolDeleteVerb    = "delete"
+)
 
 // authorizeExternalToolContext keeps API tool calls on the caller's resource
 // permissions. Controller and worker clients are never changed.
@@ -49,18 +54,22 @@ func authorizeExternalToolContext(tc *tools.ToolContext, userInfo *UserInfo, eve
 		tc.RequireGitHubTaskCredentials = true
 		tc.AuthorizeCodeExecResources = func(ctx context.Context, objects []client.Object) error {
 			for _, obj := range objects {
-				if err := authorizedClient.authorize(ctx, obj, obj.GetNamespace(), "create", ""); err != nil {
+				if err := authorizedClient.authorize(ctx, obj, obj.GetNamespace(), externalToolCreateVerb, ""); err != nil {
 					return err
 				}
-				if err := authorizedClient.authorize(ctx, obj, obj.GetNamespace(), "delete", obj.GetName()); err != nil {
+				if err := authorizedClient.authorize(ctx, obj, obj.GetNamespace(), externalToolDeleteVerb, obj.GetName()); err != nil {
 					return err
 				}
 			}
 			return nil
 		}
 		tc.AuthorizeAgentInitialTask = func(ctx context.Context, agent *corev1alpha1.Agent) *tools.ChatToolError {
-			for _, resource := range []string{"agents", externalToolTaskResource} {
-				if err := authorization.authorize(ctx, agent.Namespace, "create", corev1alpha1.GroupVersion.Group, resource, ""); err != nil {
+			for _, permission := range []struct{ verb, resource, name string }{
+				{externalToolCreateVerb, externalToolAgentResource, ""},
+				{externalToolCreateVerb, externalToolTaskResource, ""},
+				{externalToolDeleteVerb, externalToolAgentResource, agent.Name},
+			} {
+				if err := authorization.authorize(ctx, agent.Namespace, permission.verb, corev1alpha1.GroupVersion.Group, permission.resource, permission.name); err != nil {
 					return &tools.ChatToolError{Type: "permission_denied", Message: err.Error(), Suggestion: "Check RBAC permissions"}
 				}
 			}
@@ -167,7 +176,7 @@ func externalToolResource(obj runtime.Object) (schema.GroupResource, bool) {
 	case *corev1alpha1.Task, *corev1alpha1.TaskList:
 		resource = externalToolTaskResource
 	case *corev1alpha1.Agent, *corev1alpha1.AgentList:
-		resource = "agents"
+		resource = externalToolAgentResource
 	case *corev1alpha1.Tool, *corev1alpha1.ToolList:
 		resource = "tools"
 	case *corev1alpha1.Provider, *corev1alpha1.ProviderList:
@@ -252,14 +261,14 @@ func (c *externalToolClient) List(ctx context.Context, list client.ObjectList, o
 }
 
 func (c *externalToolClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
-	if err := c.authorize(ctx, obj, obj.GetNamespace(), "create", ""); err != nil {
+	if err := c.authorize(ctx, obj, obj.GetNamespace(), externalToolCreateVerb, ""); err != nil {
 		return err
 	}
 	return c.Client.Create(ctx, obj, opts...)
 }
 
 func (c *externalToolClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
-	if err := c.authorize(ctx, obj, obj.GetNamespace(), "delete", obj.GetName()); err != nil {
+	if err := c.authorize(ctx, obj, obj.GetNamespace(), externalToolDeleteVerb, obj.GetName()); err != nil {
 		return err
 	}
 	if _, ok := obj.(*corev1alpha1.Task); ok {
@@ -352,7 +361,7 @@ type externalToolSessionDeleter struct {
 }
 
 func (d *externalToolSessionDeleter) DeleteSession(ctx context.Context, namespace, sessionID string) error {
-	if err := d.authorization.authorize(ctx, namespace, "delete", corev1alpha1.GroupVersion.Group, "sessions", sessionID); err != nil {
+	if err := d.authorization.authorize(ctx, namespace, externalToolDeleteVerb, corev1alpha1.GroupVersion.Group, "sessions", sessionID); err != nil {
 		return err
 	}
 	if d.deleter == nil || (reflect.ValueOf(d.deleter).Kind() == reflect.Pointer && reflect.ValueOf(d.deleter).IsNil()) {

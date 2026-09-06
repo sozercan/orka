@@ -51,6 +51,9 @@ resource and subresource fields and to the same slash-separated string in RBAC.
   `repositoryscans/slices`, `repositoryscans/droppedfindings`, and
   `repositoryscans/findings` authorize stored data or actions for one named
   RepositoryScan. `securityfindings` and its subresources use the finding ID.
+  Validation and patch action grants include their fixed pending/proposal state
+  transitions. General finding mutations, such as dismiss and reopen, require
+  `update` on `securityfindings`.
 - `repositorymonitors/runs`, `repositorymonitors/items`, and
   `repositorymonitors/commands` use the parent monitor name. `monitorcommands`,
   `monitoractions`, `monitorworkactions`, `monitorimplementationjobs`,
@@ -68,6 +71,11 @@ request that creates a Task also needs `create` on `tasks` before any work is
 queued. Starting a scan also requires `list` on Tasks to check for active scan
 work. `POST /api/v1/security/findings/:id/pull-request` only returns a stored PR
 receipt, so its permission is `get`, despite the HTTP method.
+
+The `create_agent` tool with `initialPrompt` requires Agent and Task creation
+plus named `delete` on the new Agent before creating it. Deletion permits rollback
+if the subsequent Task authorization fails. Creating an Agent without an initial
+Task requires only Agent creation.
 
 Creating or updating a RepositoryMonitor also requires named `get` on the Agents
 used by its enabled workflows and on each credential Secret read during

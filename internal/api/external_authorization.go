@@ -166,6 +166,8 @@ var externalAPIPolicies = map[string]apiRoutePolicy{
 	"GET /api/v1/security/findings/:id":                        coreAPIPolicy("get", "securityfindings", "id"),
 	"POST /api/v1/security/findings/:id/dismiss":               coreAPIPolicy("update", "securityfindings", "id"),
 	"POST /api/v1/security/findings/:id/reopen":                coreAPIPolicy("update", "securityfindings", "id"),
+	// Named action grants include their fixed finding-state transitions.
+	// General edits, including dismissal/reopening, require securityfindings update.
 	"POST /api/v1/security/findings/:id/validate": coreAPIPolicy("create", "securityfindings/validation", "id",
 		apiResourcePermission{corev1alpha1.GroupVersion.Group, "tasks", "create", ""}),
 	"POST /api/v1/security/findings/:id/patch": coreAPIPolicy("create", "securityfindings/patches", "id",

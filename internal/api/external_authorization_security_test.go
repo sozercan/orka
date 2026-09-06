@@ -19,6 +19,67 @@ import (
 	"github.com/orka-agents/orka/internal/store"
 )
 
+func TestExternalAPISecurityActionGrantsRemainScoped(t *testing.T) {
+	for _, action := range []string{"validate", "patch"} {
+		t.Run(action, func(t *testing.T) {
+			f := newExternalAuthorizationFixture(t)
+			scan := &corev1alpha1.RepositoryScan{}
+			require.NoError(t, f.kube.Get(t.Context(), client.ObjectKey{Namespace: "default", Name: "protected"}, scan))
+			scan.Spec = corev1alpha1.RepositoryScanSpec{
+				RepoURL: "https://github.com/orka-agents/orka", AnalysisAgentRef: corev1alpha1.AgentReference{Name: "reviewer"},
+				ReadCredentialRef: &corev1.LocalObjectReference{Name: "source-read"}, PublicationReadCredentialRef: &corev1.LocalObjectReference{Name: "publication-read"},
+				PublicationCredentialRef: &corev1.LocalObjectReference{Name: "publication-write"}, ForgeCredentialRef: &corev1.LocalObjectReference{Name: "forge"},
+			}
+			require.NoError(t, f.kube.Update(t.Context(), scan))
+			for _, id := range []string{"protected", "other"} {
+				require.NoError(t, f.store.UpsertFinding(t.Context(), &store.Finding{
+					ID: id, Namespace: "default", RepositoryScan: "protected", Title: "original title", State: "open", ValidationStatus: "unvalidated",
+				}))
+			}
+			resource := "validation"
+			wantStatus := http.StatusAccepted
+			if action == "patch" {
+				resource, wantStatus = "patches", http.StatusCreated
+			}
+			f.allowOnly(t,
+				authorizationv1.ResourceAttributes{Namespace: "default", Group: "core.orka.ai", Resource: "securityfindings", Subresource: resource, Verb: "create", Name: "protected"},
+				authorizationv1.ResourceAttributes{Namespace: "default", Group: "core.orka.ai", Resource: "tasks", Verb: "create"},
+			)
+			status, body := f.request(t, http.MethodPost, "/api/v1/security/findings/protected/"+action,
+				`{"title":"edited title","state":"dismissed","validationStatus":"validated"}`)
+			require.Equal(t, wantStatus, status, body)
+			finding, err := f.store.GetFinding(t.Context(), "default", "protected")
+			require.NoError(t, err)
+			require.Equal(t, "original title", finding.Title)
+			if action == "validate" {
+				require.Equal(t, "pending", finding.ValidationStatus)
+				require.Equal(t, "open", finding.State)
+				require.Empty(t, finding.PatchProposalID)
+			} else {
+				require.Equal(t, "unvalidated", finding.ValidationStatus)
+				require.Equal(t, "patch_pending", finding.State)
+				require.NotEmpty(t, finding.PatchProposalID)
+			}
+			for _, path := range []string{
+				"/api/v1/security/findings/protected/dismiss",
+				"/api/v1/security/findings/protected/reopen",
+				"/api/v1/security/findings/other/" + action,
+			} {
+				before := f.changes(t)
+				f.kubeCalls = 0
+				status, body := f.request(t, http.MethodPost, path, "{}")
+				require.Equal(t, http.StatusForbidden, status, body)
+				require.Zero(t, f.kubeCalls)
+				require.Equal(t, before, f.changes(t))
+				after, err := f.store.GetFinding(t.Context(), "default", "protected")
+				require.NoError(t, err)
+				require.Equal(t, finding, after)
+			}
+			require.Zero(t, f.externalCalls.Load())
+		})
+	}
+}
+
 func TestExternalAPIScanAdmissionRequiresTaskList(t *testing.T) {
 	for _, active := range []bool{false, true} {
 		t.Run("active="+boolString(active), func(t *testing.T) {

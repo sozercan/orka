@@ -261,23 +261,73 @@ func TestExternalToolExecutorResourcePermissions(t *testing.T) {
 }
 
 func TestExternalToolExecutorCreateAgentPreflightsInitialTask(t *testing.T) {
-	for _, allowed := range []bool{false, true} {
-		t.Run(boolString(allowed), func(t *testing.T) {
-			clientset, _ := externalToolReviews(t, func(spec authorizationv1.SubjectAccessReviewSpec) (runtime.Object, error) {
+	for _, test := range []struct {
+		name, cleanupName               string
+		denyAgentCreate, denyTaskCreate bool
+		denyFinalTask, standalone       bool
+		wantSuccess                     bool
+		wantWrites                      int
+	}{
+		{name: "created", cleanupName: "combined", wantSuccess: true, wantWrites: 2},
+		{name: "agent-create-denied", cleanupName: "combined", denyAgentCreate: true},
+		{name: "task-create-denied", cleanupName: "combined", denyTaskCreate: true},
+		{name: "cleanup-denied"},
+		{name: "cleanup-other-agent", cleanupName: "other"},
+		{name: "late-task-denied-without-cleanup", denyFinalTask: true},
+		{name: "late-task-denied", cleanupName: "combined", denyFinalTask: true, wantWrites: 2},
+		{name: "standalone", standalone: true, wantSuccess: true, wantWrites: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			taskReviews := 0
+			clientset, reviews := externalToolReviews(t, func(spec authorizationv1.SubjectAccessReviewSpec) (runtime.Object, error) {
 				a := spec.ResourceAttributes
-				return externalToolReview(a.Verb == "create" && (a.Resource == "agents" || allowed && a.Resource == "tasks")), nil
+				require.Equal(t, externalToolNamespace, a.Namespace)
+				require.Equal(t, corev1alpha1.GroupVersion.Group, a.Group)
+				allowed := false
+				switch {
+				case a.Verb == "create" && a.Resource == "agents":
+					require.Empty(t, a.Name)
+					allowed = !test.denyAgentCreate
+				case a.Verb == "create" && a.Resource == "tasks":
+					require.Empty(t, a.Name)
+					taskReviews++
+					allowed = !test.denyTaskCreate && (!test.denyFinalTask || taskReviews == 1)
+				case a.Verb == "delete" && a.Resource == "agents":
+					require.Equal(t, "combined", a.Name)
+					allowed = a.Name == test.cleanupName
+				}
+				return externalToolReview(allowed), nil
 			})
 			executor, backend, _, _ := newExternalToolExecutor(clientset)
-			result := executeExternalTool(t, executor, "create_agent", `{"name":"combined","namespace":"tool-target","initialPrompt":"run this"}`)
-			if result.Success != allowed {
-				t.Fatalf("success = %v, allowed = %v, error = %s", result.Success, allowed, result.Error)
+			executor.SetTaskCreateAuthorizer(func(ctx context.Context, task *corev1alpha1.Task) error {
+				return authorizeAndStampToolTaskCreate(ctx, backend, clientset, nil, ContextTokenAuthorizationConfig{}, "chatToolCreateTask", externalToolUser(), task)
+			})
+			args := map[string]any{"name": "combined", "namespace": externalToolNamespace}
+			if !test.standalone {
+				args["initialPrompt"] = "run this"
 			}
-			wantWrites := 0
-			if allowed {
-				wantWrites = 2
-			}
-			if backend.writes != wantWrites {
-				t.Fatalf("writes = %d, want %d", backend.writes, wantWrites)
+			encoded, err := json.Marshal(args)
+			require.NoError(t, err)
+			result := executeExternalTool(t, executor, "create_agent", string(encoded))
+			require.Equal(t, test.wantSuccess, result.Success, result.Error)
+			require.Equal(t, test.wantWrites, backend.writes, result.Error)
+			agents, tasks := &corev1alpha1.AgentList{}, &corev1alpha1.TaskList{}
+			require.NoError(t, backend.Client.List(t.Context(), agents, client.InNamespace(externalToolNamespace)))
+			require.NoError(t, backend.Client.List(t.Context(), tasks, client.InNamespace(externalToolNamespace)))
+			if test.wantSuccess {
+				require.Len(t, agents.Items, 1)
+				if test.standalone {
+					require.Empty(t, tasks.Items)
+					require.Zero(t, taskReviews)
+				} else {
+					require.Len(t, tasks.Items, 1)
+					require.True(t, slices.ContainsFunc(*reviews, func(spec authorizationv1.SubjectAccessReviewSpec) bool {
+						return spec.ResourceAttributes.Verb == "delete" && spec.ResourceAttributes.Resource == "agents" && spec.ResourceAttributes.Name == "combined"
+					}), "missing named cleanup preflight")
+				}
+			} else {
+				require.Empty(t, agents.Items, "Agent remained after a denied compound operation")
+				require.Empty(t, tasks.Items)
 			}
 		})
 	}
