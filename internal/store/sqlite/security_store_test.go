@@ -354,6 +354,44 @@ func TestSaveThreatModelReplacesCurrentModel(t *testing.T) {
 	}
 }
 
+func TestSaveThreatModelRedactsContent(t *testing.T) {
+	for _, source := range []string{"generated", "edited"} {
+		t.Run(source, func(t *testing.T) {
+			s := setupTestStore(t)
+			ctx := context.Background()
+			token := "ghp_" + strings.Repeat("a", 36)
+			model := &store.ThreatModel{
+				Namespace: "ns1", RepositoryScan: "repo1", Source: source,
+				Content: "Notes for `config/auth.go:12`.\n\n\t" + token[:2] + "\u200b" + token[2:] + "\n\nRotate keys.",
+			}
+			const want = "Notes for `config/auth.go:12`.\n\n\t[REDACTED]\n\nRotate keys."
+			if err := s.SaveThreatModel(ctx, model); err != nil {
+				t.Fatalf("SaveThreatModel() error = %v", err)
+			}
+			if model.Content != want {
+				t.Fatal("SaveThreatModel() left unsanitized content in the returned model")
+			}
+			var persisted string
+			if err := s.db.QueryRowContext(ctx,
+				`SELECT content FROM security_threat_models WHERE namespace = ? AND repository_scan = ?`,
+				model.Namespace, model.RepositoryScan,
+			).Scan(&persisted); err != nil {
+				t.Fatalf("read stored threat model: %v", err)
+			}
+			if persisted != want {
+				t.Fatal("SaveThreatModel() persisted unsanitized content")
+			}
+			got, err := s.GetLatestThreatModel(ctx, model.Namespace, model.RepositoryScan)
+			if err != nil {
+				t.Fatalf("GetLatestThreatModel() error = %v", err)
+			}
+			if got.Content != want || got.Source != source || got.Version != 1 {
+				t.Fatal("GetLatestThreatModel() did not preserve the sanitized content and metadata")
+			}
+		})
+	}
+}
+
 func TestSaveThreatModelCollapsesExistingVersions(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()

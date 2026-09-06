@@ -2672,6 +2672,40 @@ func TestIngestReviewTaskSkipsStaleSliceRun(t *testing.T) {
 	}
 }
 
+func TestPersistThreatModelIfChangedDeduplicatesRedactedResult(t *testing.T) {
+	ctx := context.Background()
+	store := setupControllerSQLiteStore(t)
+	reconciler := &RepositoryScanReconciler{SecurityStore: store}
+	scan := &corev1alpha1.RepositoryScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "kaset", Namespace: defaultNS},
+	}
+	const scanID = "scan_current"
+	data, err := json.Marshal(security.ThreatModelResultEnvelope{
+		SchemaVersion: security.AgentResultSchemaVersion, Kind: security.AgentResultKindThreatModel,
+		RepositoryScan: scan.Name, ScanID: scanID,
+		ThreatModel: "# Threat model\n\nEnvironment assignment `API_KEY=\"" + strings.Repeat("a", 32) + "\"`.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := security.ParseThreatModelResult(data, security.AgentResultBinding{RepositoryScan: scan.Name, ScanID: scanID})
+	if err != nil {
+		t.Fatalf("ParseThreatModelResult() error = %v", err)
+	}
+	for range 2 {
+		if err := reconciler.persistThreatModelIfChanged(ctx, scan, scanID, time.Time{}, content); err != nil {
+			t.Fatalf("persistThreatModelIfChanged() error = %v", err)
+		}
+	}
+	latest, err := store.GetLatestThreatModel(ctx, scan.Namespace, scan.Name)
+	if err != nil {
+		t.Fatalf("GetLatestThreatModel() error = %v", err)
+	}
+	if latest.Version != 1 || latest.Content != content {
+		t.Fatal("identical sanitized threat-model results were not deduplicated")
+	}
+}
+
 func TestPersistThreatModelIfChangedSkipsOlderGeneratedRun(t *testing.T) {
 	ctx := context.Background()
 	store := setupControllerSQLiteStore(t)

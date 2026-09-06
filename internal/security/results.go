@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/orka-agents/orka/internal/redact"
 	"github.com/orka-agents/orka/internal/store"
 )
 
@@ -160,11 +161,13 @@ func ParseThreatModelResult(data []byte, expected AgentResultBinding) (string, e
 		return "", err
 	}
 	content := strings.TrimSpace(result.ThreatModel)
-	if content == "" {
-		return "", fmt.Errorf("threatModel is required")
-	}
 	if len(content) > maxThreatModelBytes {
 		return "", fmt.Errorf("threatModel exceeds %d bytes", maxThreatModelBytes)
+	}
+	// Validate visible markdown before redaction can hide transcript markers.
+	content = strings.TrimSpace(stripUnsafeTextRunes(content))
+	if content == "" {
+		return "", fmt.Errorf("threatModel is required")
 	}
 	if !strings.HasPrefix(content, "#") {
 		return "", fmt.Errorf("threatModel must be markdown beginning with a heading")
@@ -172,7 +175,18 @@ func ParseThreatModelResult(data []byte, expected AgentResultBinding) (string, e
 	if securityResultLooksLikeToolTranscript(content) {
 		return "", fmt.Errorf("threatModel looks like a tool transcript")
 	}
+	content = SanitizeThreatModel(content)
+	if len(content) > maxThreatModelBytes {
+		return "", fmt.Errorf("threatModel exceeds %d bytes", maxThreatModelBytes)
+	}
 	return content, nil
+}
+
+// SanitizeThreatModel redacts common credential shapes in generated and edited
+// threat models. Strip invisible runes first so they cannot split a credential
+// past the redactor; preserve newlines and tabs for markdown structure.
+func SanitizeThreatModel(content string) string {
+	return redact.SensitiveText(stripUnsafeTextRunes(content))
 }
 
 func securityResultLooksLikeToolTranscript(content string) bool {
