@@ -903,6 +903,41 @@ func TestRepositoryScanReadDelete_ContextTokenObjectAuthorizationDenials(t *test
 	}
 }
 
+func TestThreatModelRedactsEditedContent(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	app, _ := setupSecurityHandlersWithAuthzFixture(
+		t, ctxTokenConfig, ContextTokenAuthorizationModeEnforce,
+		securityAuthzTestRepositoryScan("scan-1", securityTestRepoURL),
+	)
+	credential := "ghp_" + strings.Repeat("a", 36)
+	body, err := json.Marshal(UpdateThreatModelRequest{
+		Content: "Notes for `config/auth.go:12`.\n\n\t" + credential[:2] + "\u200b" + credential[2:] + "\n\nRotate keys.",
+	})
+	require.NoError(t, err)
+	const want = "Notes for `config/auth.go:12`.\n\n\t[REDACTED]\n\nRotate keys."
+	token := issueTestContextToken(t, provider, nil, map[string]any{
+		"scope": ContextTokenScopeSecurityRead + " " + ContextTokenScopeSecurityWrite,
+		"tctx":  securityAuthzTestTctx(securityTestRepoURL),
+	})
+	for _, method := range []string{http.MethodPut, http.MethodGet} {
+		req := httptest.NewRequest(method, "/security/repositories/scan-1/threat-model?namespace=demo", strings.NewReader(string(body)))
+		req.Header.Set(TransactionTokenHeaderName, token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var model store.ThreatModel
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&model))
+		require.NoError(t, resp.Body.Close())
+		if model.Content != want {
+			t.Fatalf("%s returned unsanitized threat-model content", method)
+		}
+		require.Equal(t, "edited", model.Source)
+		require.Equal(t, int64(1), model.Version)
+	}
+}
+
 func TestThreatModel_ContextTokenRepositoryScanAuthorizationDenials(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")

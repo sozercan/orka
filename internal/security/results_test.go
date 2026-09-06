@@ -43,6 +43,86 @@ func TestParseThreatModelResultRequiresExactEnvelopeAndBinding(t *testing.T) {
 	}
 }
 
+func TestParseThreatModelResultRedactsCredentials(t *testing.T) {
+	expected := AgentResultBinding{RepositoryScan: "repo", ScanID: "scan_123", PolicyDigest: "sha256:policy"}
+	// Synthetic values are assembled here so the fixtures cannot be mistaken
+	// for credentials copied from a repository.
+	token := "ghp_" + strings.Repeat("a", 36)
+	value := strings.Repeat("b", 32)
+	const prefix = "# Threat model\n\nCredential handling in `config/auth.go:12`.\n\n"
+	tests := []struct {
+		name, content, want string
+	}{
+		{name: "token", content: "Found `" + token + "`.", want: "Found `[REDACTED]`."},
+		{name: "assignment", content: "```\nAPI_KEY=\"" + value + "\"\n```", want: "```\nAPI_KEY=\"[REDACTED]\"\n```"},
+		{name: "inline assignment", content: "Environment assignment `API_KEY=\"" + value + "\"`.", want: "Environment assignment `API_KEY=\"[REDACTED]\"`."},
+		{name: "bearer header", content: "Authorization: Bearer " + value, want: "Authorization: [REDACTED]"},
+		{name: "transaction header", content: "Txn-Token: " + value, want: "Txn-Token: [REDACTED]"},
+		{name: "URL credentials", content: "https://user:" + value + "@example.test/repo", want: "https://[REDACTED]@example.test/repo"},
+		{name: "signed URL", content: "https://example.test/file?sig=" + value + "&page=1", want: "https://example.test/file?sig=[REDACTED]&page=1"},
+		{name: "prose", content: "The token is " + value, want: "The token is [REDACTED]"},
+		{name: "NUL", content: token[:2] + "\x00" + token[2:], want: "[REDACTED]"},
+		{name: "escape", content: token[:2] + "\x1b" + token[2:], want: "[REDACTED]"},
+		{name: "delete", content: token[:2] + "\x7f" + token[2:], want: "[REDACTED]"},
+		{name: "C1 control", content: token[:2] + "\u0085" + token[2:], want: "[REDACTED]"},
+		{name: "zero-width space", content: token[:2] + "\u200b" + token[2:], want: "[REDACTED]"},
+		{name: "zero-width joiner", content: token[:2] + "\u200d" + token[2:], want: "[REDACTED]"},
+		{name: "directional override", content: token[:2] + "\u202e" + token[2:], want: "[REDACTED]"},
+		{
+			name:    "ordinary markdown",
+			content: "Credentials come from Kubernetes Secrets.\n\n## 認証\n\n```go\n\tloadCredentials()\n```\n\n- Rotate keys regularly.",
+			want:    "Credentials come from Kubernetes Secrets.\n\n## 認証\n\n```go\n\tloadCredentials()\n```\n\n- Rotate keys regularly.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ThreatModelResultEnvelope{
+				SchemaVersion: AgentResultSchemaVersion, Kind: AgentResultKindThreatModel,
+				RepositoryScan: expected.RepositoryScan, ScanID: expected.ScanID, PolicyDigest: expected.PolicyDigest,
+				ThreatModel: prefix + tt.content,
+			}
+			got, err := ParseThreatModelResult(mustMarshalSecurityResult(t, result), expected)
+			if err != nil {
+				t.Fatalf("ParseThreatModelResult() error = %v", err)
+			}
+			if got != prefix+tt.want {
+				t.Fatal("threat model did not redact the credential while preserving surrounding markdown")
+			}
+			result.ThreatModel = got
+			again, err := ParseThreatModelResult(mustMarshalSecurityResult(t, result), expected)
+			if err != nil || again != got {
+				t.Fatalf("sanitized threat model is not stable on reprocessing: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseThreatModelResultValidatesSanitizedContent(t *testing.T) {
+	tests := []struct {
+		name, content, wantError string
+	}{
+		{name: "empty", content: " \n\t", wantError: "threatModel is required"},
+		{name: "only invisible runes", content: "\x00\u200b", wantError: "threatModel is required"},
+		{name: "missing heading", content: "Trusted boundaries.", wantError: "beginning with a heading"},
+		{name: "transcript", content: "# Model\n<tool_call>read</tool_call>", wantError: "tool transcript"},
+		{name: "hidden transcript", content: "# Model\n<tool_\u200bcall>read</tool_\u200bcall>", wantError: "tool transcript"},
+		{name: "oversized before stripping", content: "# " + strings.Repeat("a", maxThreatModelBytes-2) + "\x00", wantError: "threatModel exceeds"},
+		{name: "oversized after redaction", content: "# Model\n" + strings.Repeat("pwd=x\n", maxThreatModelBytes/10), wantError: "threatModel exceeds"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ThreatModelResultEnvelope{
+				SchemaVersion: AgentResultSchemaVersion, Kind: AgentResultKindThreatModel,
+				ThreatModel: tt.content,
+			}
+			got, err := ParseThreatModelResult(mustMarshalSecurityResult(t, result), AgentResultBinding{})
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) || got != "" {
+				t.Fatalf("ParseThreatModelResult() error = %v, want %q and no content", err, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestParseFindingsResultRequiresExactRepositoryAndContext(t *testing.T) {
 	repository := FindingsV2Repository{
 		RepoURL: "https://github.com/sozercan/vekil",
