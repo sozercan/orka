@@ -11,6 +11,23 @@ import (
 	"testing"
 )
 
+func TestSensitiveTextPreservesRedactedMarkdown(t *testing.T) {
+	value := strings.Repeat("a", 32)
+	for input, want := range map[string]string{
+		"Environment assignment `API_KEY=\"" + value + "\"`.": "Environment assignment `API_KEY=\"[REDACTED]\"`.",
+		"Environment assignment `API_KEY='" + value + "'`.":   "Environment assignment `API_KEY='[REDACTED]'`.",
+		`{"api_key":"` + value + `","line":12}`:               `{"api_key":"[REDACTED]","line":12}`,
+	} {
+		if got := SensitiveText(input); got != want || SensitiveText(got) != got {
+			t.Fatal("redaction changed delimiters outside the credential or was not stable on a second pass")
+		}
+	}
+	input := "API_KEY=" + redactedValue + strings.Repeat("a", 32)
+	if got := SensitiveText(input); got != "API_KEY="+redactedValue {
+		t.Fatal("a credential using the redaction marker as a prefix was not fully redacted")
+	}
+}
+
 func TestSensitiveTextRedactsTxnTokenHeader(t *testing.T) {
 	input := `curl -H "Txn-Token: opaque-secret-token" https://orka.example.test`
 	got := SensitiveText(input)
