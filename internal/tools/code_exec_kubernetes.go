@@ -667,7 +667,8 @@ func (e *KubernetesJobCodeExecutor) loadStoredResult(ctx context.Context, c crcl
 
 	stored := &corev1.ConfigMap{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, stored); err != nil {
-		if apierrors.IsNotFound(err) {
+		// Cache access is optional; a caller may still authorize a new Job.
+		if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
 			return CodeExecResult{}, false, nil
 		}
 		return CodeExecResult{}, false, err

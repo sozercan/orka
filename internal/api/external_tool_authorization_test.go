@@ -78,13 +78,13 @@ func TestExternalToolCodeExecPreflightsLifecyclePermissions(t *testing.T) {
 			clientset, reviews := externalToolReviews(t, func(spec authorizationv1.SubjectAccessReviewSpec) (runtime.Object, error) {
 				a := spec.ResourceAttributes
 				require.Equal(t, externalToolNamespace, a.Namespace)
-				return externalToolReview(a.Verb != test.deniedVerb || a.Resource != test.deniedResource), nil
+				return externalToolReview(a.Resource != "configmaps" && (a.Verb != test.deniedVerb || a.Resource != test.deniedResource)), nil
 			})
 			scheme := runtime.NewScheme()
 			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, networkingv1.AddToScheme} {
 				require.NoError(t, add(scheme))
 			}
-			creates := 0
+			creates, cacheReads := 0, 0
 			backend := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
 				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 					if creates == 0 {
@@ -123,6 +123,9 @@ func TestExternalToolCodeExecPreflightsLifecyclePermissions(t *testing.T) {
 					return c.Create(ctx, obj, opts...)
 				},
 				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*corev1.ConfigMap); ok {
+						cacheReads++
+					}
 					err := c.Get(ctx, key, obj, opts...)
 					if job, ok := obj.(*batchv1.Job); ok && err == nil {
 						job.Status.Succeeded = 1
@@ -135,8 +138,10 @@ func TestExternalToolCodeExecPreflightsLifecyclePermissions(t *testing.T) {
 			executor := &tools.KubernetesJobCodeExecutor{}
 			result := executor.Execute(tools.WithToolContext(t.Context(), tc), tools.CodeExecutionRequest{
 				Language: "python", Code: "pass", Timeout: time.Second,
+				RunID: "external-run-" + test.name, InputHash: "external-input",
 			})
-			for _, list := range []client.ObjectList{&corev1.SecretList{}, &corev1.ServiceAccountList{}, &networkingv1.NetworkPolicyList{}, &batchv1.JobList{}} {
+			require.Zero(t, cacheReads, "denied result cache was read")
+			for _, list := range []client.ObjectList{&corev1.SecretList{}, &corev1.ServiceAccountList{}, &networkingv1.NetworkPolicyList{}, &batchv1.JobList{}, &corev1.ConfigMapList{}} {
 				require.NoError(t, backend.List(t.Context(), list, client.InNamespace(externalToolNamespace)))
 				items, err := meta.ExtractList(list)
 				require.NoError(t, err)

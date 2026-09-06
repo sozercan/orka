@@ -35,11 +35,11 @@ func (f *externalAuthorizationFixture) allowOnly(t *testing.T, permissions ...au
 	}
 }
 
-func (f *externalAuthorizationFixture) allowRoute(t *testing.T, route string) {
+func (f *externalAuthorizationFixture) allowRoute(t *testing.T, route string, additional ...authorizationv1.ResourceAttributes) {
 	t.Helper()
 	for _, tc := range externalAuthorizationCases(t) {
 		if tc.route == route {
-			f.allowOnly(t, tc.permissions...)
+			f.allowOnly(t, append(tc.permissions, additional...)...)
 			return
 		}
 	}
@@ -48,6 +48,7 @@ func (f *externalAuthorizationFixture) allowRoute(t *testing.T, route string) {
 
 // CRUD controls use only the action's exact grant. A get or list grant is not
 // required for the handler's internal read during an update or deletion.
+// Monitor validation also needs access to the referenced reviewer Agent.
 func TestExternalAPIAuthorizedKubernetesCRUD(t *testing.T) {
 	for _, tc := range []struct {
 		path, spec, marker string
@@ -69,7 +70,11 @@ func TestExternalAPIAuthorizedKubernetesCRUD(t *testing.T) {
 			reviewer.Namespace = "default"
 			require.NoError(t, f.kube.Create(t.Context(), reviewer))
 			base := "/api/v1/" + tc.path
-			f.allowRoute(t, "POST "+base)
+			var referencePermissions []authorizationv1.ResourceAttributes
+			if tc.path == "monitors/repositories" {
+				referencePermissions = []authorizationv1.ResourceAttributes{{Namespace: "default", Group: corev1alpha1.GroupVersion.Group, Resource: "agents", Verb: "get", Name: "reviewer"}}
+			}
+			f.allowRoute(t, "POST "+base, referencePermissions...)
 			status, body := f.request(t, http.MethodPost, base, `{"name":"created","metadata":{"name":"created","labels":{"authorization-test":"created"}},"spec":`+tc.spec+`}`)
 			require.Equal(t, http.StatusCreated, status, body)
 			created := tc.object.DeepCopyObject().(client.Object)
@@ -84,7 +89,7 @@ func TestExternalAPIAuthorizedKubernetesCRUD(t *testing.T) {
 			if tc.path == "tasks" {
 				parameter = ":id"
 			} else {
-				f.allowRoute(t, "PUT "+base+"/"+parameter)
+				f.allowRoute(t, "PUT "+base+"/"+parameter, referencePermissions...)
 				status, body = f.request(t, http.MethodPut, base+"/protected", `{"metadata":{"name":"wrong-target","namespace":"other"},"spec":`+tc.spec+`}`)
 				require.Equal(t, http.StatusOK, status, body)
 				updated := tc.object.DeepCopyObject().(client.Object)

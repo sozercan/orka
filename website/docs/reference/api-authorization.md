@@ -68,6 +68,12 @@ request that creates a Task also needs `create` on `tasks` before any work is
 queued. `POST /api/v1/security/findings/:id/pull-request` only returns a stored PR
 receipt, so its permission is `get`, despite the HTTP method.
 
+Creating or updating a RepositoryMonitor also requires named `get` on the Agents
+used by its enabled workflows and on each credential Secret read during
+validation. Agent references use their explicit namespace or the monitor
+namespace. Credential Secrets use the monitor namespace; `readCredentialRef`
+takes precedence over the legacy `gitSecretRef`.
+
 Workspace-class `use` remains a separate check for every authenticated identity,
 including OIDC and transaction-token callers. When a Task or workspace-backed Tool
 references a class, grant `use` on `executionworkspaceclasses` in
@@ -210,10 +216,10 @@ otherwise. In the additional-checks column:
 | `POST` | `/api/v1/security/findings/:id/patch` | `core.orka.ai` | `securityfindings/patches` | `create` | `:id` | `Q` | `create` on `core.orka.ai/tasks`, empty name; Class use |
 | `GET` | `/api/v1/security/findings/:id/patches` | `core.orka.ai` | `securityfindings/patches` | `list` | `:id` | `Q` | none |
 | `POST` | `/api/v1/security/findings/:id/pull-request` | `core.orka.ai` | `securityfindings/pullrequest` | `get` | `:id` | `Q` | Stored PR receipt read only |
-| `POST` | `/api/v1/monitors/repositories` | `core.orka.ai` | `repositorymonitors` | `create` | empty | `C` | none |
+| `POST` | `/api/v1/monitors/repositories` | `core.orka.ai` | `repositorymonitors` | `create` | empty | `C` | Named `get` on the `core.orka.ai/agents` and core `secrets` references read during validation |
 | `GET` | `/api/v1/monitors/repositories` | `core.orka.ai` | `repositorymonitors` | `list` | empty | `Q` | none |
 | `GET` | `/api/v1/monitors/repositories/:name` | `core.orka.ai` | `repositorymonitors` | `get` | `:name` | `Q` | none |
-| `PUT` | `/api/v1/monitors/repositories/:name` | `core.orka.ai` | `repositorymonitors` | `update` | `:name` | `Q` | none |
+| `PUT` | `/api/v1/monitors/repositories/:name` | `core.orka.ai` | `repositorymonitors` | `update` | `:name` | `Q` | Named `get` on the `core.orka.ai/agents` and core `secrets` references read during validation |
 | `DELETE` | `/api/v1/monitors/repositories/:name` | `core.orka.ai` | `repositorymonitors` | `delete` | `:name` | `Q` | none |
 | `POST` | `/api/v1/monitors/repositories/:name/runs` | `core.orka.ai` | `repositorymonitors/runs` | `create` | `:name` | `Q` | `patch` on `core.orka.ai/repositorymonitors`, `:name` |
 | `GET` | `/api/v1/monitors/repositories/:name/runs` | `core.orka.ai` | `repositorymonitors/runs` | `list` | `:name` | `Q` | none |
@@ -252,13 +258,15 @@ otherwise. In the additional-checks column:
 Use a RoleBinding in the installation namespace. A ClusterRoleBinding would grant
 namespaced permissions across the cluster. The Kustomize bundle includes
 `orka-api-viewer-role` and `orka-api-editor-role`. The viewer covers the read
-permissions above. The editor also covers the listed Orka mutations and their
-secondary permissions. Nested tools that run Kubernetes workloads need separate
+permissions above. The editor adds the listed Orka mutations. Nested tools that
+run Kubernetes workloads need separate
 workload grants, including `get` on `pods/log` when reading Pod logs. Neither
 helper grants Secrets or workspace-class use.
 Kubernetes `code_exec` preflights `create` and `delete` on its temporary Secrets,
 ServiceAccounts, Jobs, and optional NetworkPolicies before creating any of them.
 The delete permissions cover cleanup after completion or failed setup.
+ConfigMap caching is optional. A denied cache lookup behaves as a cache miss;
+without ConfigMap `create`, execution returns its result without storing it.
 The source files in `config/rbac` have unprefixed names when applied directly.
 
 Existing Task helper roles retain session access; Task editor/admin roles also
