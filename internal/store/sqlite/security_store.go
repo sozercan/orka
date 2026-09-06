@@ -108,7 +108,7 @@ func (s *Store) CreateScanRun(ctx context.Context, run *store.ScanRun) error {
 		 )`
 		args = append(args, run.Namespace, run.RepositoryScan)
 	}
-	result, err := s.db.ExecContext(ctx, query, args...)
+	result, err := s.securityDB().ExecContext(ctx, query, args...)
 	if err != nil && isSQLiteConstraintError(err) {
 		return fmt.Errorf("%w: active security scan run already exists", store.ErrConflict)
 	}
@@ -129,7 +129,7 @@ func (s *Store) CreateScanRun(ctx context.Context, run *store.ScanRun) error {
 func (s *Store) UpdateScanRun(ctx context.Context, run *store.ScanRun) error {
 	run.StartedAt = utcTime(run.StartedAt)
 	run.CompletedAt = utcTimePtr(run.CompletedAt)
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.securityDB().ExecContext(ctx,
 		`UPDATE security_scan_runs
 		 SET task_name = ?, mode = ?, phase = ?, base_commit = ?, head_commit = ?, commit_count = ?,
 		     slice_count = ?, reviewed_slice_count = ?, skipped_slice_count = ?, accepted_findings = ?, dropped_findings = ?,
@@ -147,7 +147,7 @@ func (s *Store) UpdateScanRun(ctx context.Context, run *store.ScanRun) error {
 // GetScanRun fetches a scan run by ID.
 func (s *Store) GetScanRun(ctx context.Context, namespace, id string) (*store.ScanRun, error) {
 	var run store.ScanRun
-	err := s.db.QueryRowContext(ctx,
+	err := s.securityDB().QueryRowContext(ctx,
 		`SELECT id, namespace, repository_scan, task_name, mode, phase, started_at, completed_at,
 		        base_commit, head_commit, commit_count, slice_count, reviewed_slice_count, skipped_slice_count,
 		        accepted_findings, dropped_findings, scanner_policy_version, policy_digest, idempotency_key,
@@ -180,7 +180,7 @@ func (s *Store) ListScanRuns(ctx context.Context, namespace, repositoryScan stri
 		limit = 20
 	}
 
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.securityDB().QueryContext(ctx,
 		`SELECT id, namespace, repository_scan, task_name, mode, phase, started_at, completed_at,
 		        base_commit, head_commit, commit_count, slice_count, reviewed_slice_count, skipped_slice_count,
 		        accepted_findings, dropped_findings, scanner_policy_version, policy_digest, idempotency_key,
@@ -273,7 +273,7 @@ func (s *Store) UpsertReviewSlice(ctx context.Context, slice *store.ReviewSlice)
 	}
 	slice.UpdatedAt = now
 
-	_, err = s.db.ExecContext(ctx,
+	_, err = s.securityDB().ExecContext(ctx,
 		`INSERT INTO security_review_slices
 		 (id, namespace, repository_scan, source, title, summary, kind, confidence, status,
 		  entrypoints_json, owned_files_json, context_files_json, tests_json, tags_json,
@@ -389,7 +389,7 @@ func (s *Store) ListReviewSlices(ctx context.Context, filter store.ReviewSliceFi
 	query.WriteString(` ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`)
 	args = append(args, filter.Limit, offset)
 
-	rows, err := s.db.QueryContext(ctx, query.String(), args...)
+	rows, err := s.securityDB().QueryContext(ctx, query.String(), args...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -411,7 +411,7 @@ func (s *Store) ListReviewSlices(ctx context.Context, filter store.ReviewSliceFi
 
 // GetReviewSlice returns one review slice.
 func (s *Store) GetReviewSlice(ctx context.Context, namespace, repositoryScan, id string) (*store.ReviewSlice, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.securityDB().QueryRowContext(ctx,
 		`SELECT id, namespace, repository_scan, source, title, summary, kind, confidence, status,
 		        entrypoints_json, owned_files_json, context_files_json, tests_json, tags_json, trust_boundaries_json,
 		        changed_files_json, changed_line_ranges_json, review_context_json, review_context_hash,
@@ -433,7 +433,7 @@ func (s *Store) GetReviewSlice(ctx context.Context, namespace, repositoryScan, i
 // UpdateReviewSliceStatus updates slice status and review timestamp.
 func (s *Store) UpdateReviewSliceStatus(ctx context.Context, namespace, repositoryScan, id, lastScanRunID, status string) error {
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.securityDB().ExecContext(ctx,
 		`UPDATE security_review_slices
 		 SET status = ?, last_reviewed_at = CASE WHEN ? IN ('reviewed', 'completed') THEN ? ELSE last_reviewed_at END,
 		     updated_at = ?
@@ -456,7 +456,7 @@ func (s *Store) UpdateReviewSliceStatus(ctx context.Context, namespace, reposito
 // GetLatestThreatModel returns the current threat model for a repository.
 func (s *Store) GetLatestThreatModel(ctx context.Context, namespace, repositoryScan string) (*store.ThreatModel, error) {
 	var model store.ThreatModel
-	err := s.db.QueryRowContext(ctx,
+	err := s.securityDB().QueryRowContext(ctx,
 		`SELECT namespace, repository_scan, version, content, source, generated_by_scan, created_at, updated_at
 		 FROM security_threat_models
 		 WHERE namespace = ? AND repository_scan = ?
@@ -479,14 +479,15 @@ func (s *Store) GetLatestThreatModel(ctx context.Context, namespace, repositoryS
 // SaveThreatModel stores the current threat model, replacing any older copies for the repository.
 // When Version is zero, the revision number is incremented from the latest stored model.
 func (s *Store) SaveThreatModel(ctx context.Context, model *store.ThreatModel) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withSecurityTransaction(ctx, func(tx *Store) error {
+		return tx.saveThreatModel(ctx, model)
+	})
+}
+
+func (s *Store) saveThreatModel(ctx context.Context, model *store.ThreatModel) error {
 
 	var latestVersion int64
-	err = tx.QueryRowContext(ctx,
+	err := s.securityDB().QueryRowContext(ctx,
 		`SELECT version FROM security_threat_models WHERE namespace = ? AND repository_scan = ? ORDER BY version DESC LIMIT 1`,
 		model.Namespace, model.RepositoryScan,
 	).Scan(&latestVersion)
@@ -508,14 +509,14 @@ func (s *Store) SaveThreatModel(ctx context.Context, model *store.ThreatModel) e
 	}
 	model.UpdatedAt = now
 
-	if _, err := tx.ExecContext(ctx,
+	if _, err := s.securityDB().ExecContext(ctx,
 		`DELETE FROM security_threat_models WHERE namespace = ? AND repository_scan = ?`,
 		model.Namespace, model.RepositoryScan,
 	); err != nil {
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx,
+	if _, err := s.securityDB().ExecContext(ctx,
 		`INSERT INTO security_threat_models
 		 (namespace, repository_scan, version, content, source, generated_by_scan, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -525,7 +526,7 @@ func (s *Store) SaveThreatModel(ctx context.Context, model *store.ThreatModel) e
 		return err
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 func marshalEvidence(evidence []store.FindingEvidenceRef) (string, error) {
@@ -583,7 +584,7 @@ func (s *Store) upsertFinding(ctx context.Context, finding *store.Finding, obser
 	}
 	finding.UpdatedAt = now
 
-	_, err = s.db.ExecContext(ctx,
+	_, err = s.securityDB().ExecContext(ctx,
 		`INSERT INTO security_findings
 		 (id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, target_key, title, category, summary, severity, confidence, triage,
 			  validation_status, state, decision_at, duplicate_of, file_path, line, commit_sha, root_cause, reproduction, remediation, suggested_action,
@@ -784,7 +785,7 @@ func scanFinding(scanner interface {
 
 // GetFinding returns a finding by ID.
 func (s *Store) GetFinding(ctx context.Context, namespace, id string) (*store.Finding, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.securityDB().QueryRowContext(ctx,
 		`SELECT id, namespace, repository_scan, scan_run_id, slice_id, fingerprint, target_key, title, category, summary, severity,
 		        confidence, triage, validation_status, state, decision_at, duplicate_of, file_path, line, commit_sha, root_cause, reproduction,
 		        remediation, suggested_action, why_tests_do_not_cover, suggested_regression_test, minimum_fix_scope,
@@ -883,7 +884,7 @@ func (s *Store) ListFindings(ctx context.Context, filter store.FindingFilter) ([
 	query.WriteString(` LIMIT ? OFFSET ?`)
 	args = append(args, filter.Limit, offset)
 
-	rows, err := s.db.QueryContext(ctx, query.String(), args...)
+	rows, err := s.securityDB().QueryContext(ctx, query.String(), args...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -906,7 +907,7 @@ func (s *Store) ListFindings(ctx context.Context, filter store.FindingFilter) ([
 
 // GetFindingCounts returns current open finding counts by severity.
 func (s *Store) GetFindingCounts(ctx context.Context, namespace, repositoryScan string) (store.FindingCounts, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.securityDB().QueryRowContext(ctx,
 		`SELECT
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END), 0),
@@ -927,7 +928,7 @@ func (s *Store) GetFindingCounts(ctx context.Context, namespace, repositoryScan 
 // UpdateFindingState updates the user-visible finding state.
 func (s *Store) UpdateFindingState(ctx context.Context, namespace, id, state string) error {
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.securityDB().ExecContext(ctx,
 		`WITH RECURSIVE canonical(id, duplicate_of) AS (
 			SELECT id, duplicate_of FROM security_findings WHERE namespace = ? AND id = ?
 			UNION ALL
@@ -959,7 +960,7 @@ func (s *Store) UpdateFindingState(ctx context.Context, namespace, id, state str
 // ResolveFindingIfCurrent resolves only the pr_open occurrence and PR selected by the caller.
 func (s *Store) ResolveFindingIfCurrent(ctx context.Context, namespace, id, scanRunID string, prNumber int) (bool, error) {
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.securityDB().ExecContext(ctx,
 		`UPDATE security_findings
 		 SET state = 'resolved', decision_at = NULL, updated_at = ?
 		 WHERE namespace = ? AND id = ? AND scan_run_id = ? AND pr_number = ? AND state = 'pr_open' AND duplicate_of = ''`,
@@ -990,20 +991,21 @@ func (s *Store) MarkFindingDuplicate(ctx context.Context, namespace, id, canonic
 	if strings.TrimSpace(namespace) == "" || strings.TrimSpace(id) == "" || strings.TrimSpace(canonicalID) == "" || id == canonicalID {
 		return store.ValidationErrorf("duplicate finding namespace, ID, and distinct canonical ID are required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withSecurityTransaction(ctx, func(tx *Store) error {
+		return tx.markFindingDuplicate(ctx, namespace, id, canonicalID)
+	})
+}
+
+func (s *Store) markFindingDuplicate(ctx context.Context, namespace, id, canonicalID string) error {
 	var sourceRepo, sourceState, canonicalRepo, canonicalDuplicate, canonicalState string
 	var sourceDecision, canonicalDecision sql.NullTime
-	if err := tx.QueryRowContext(ctx, `SELECT repository_scan, state, decision_at FROM security_findings WHERE namespace = ? AND id = ?`, namespace, id).Scan(&sourceRepo, &sourceState, &sourceDecision); err != nil {
+	if err := s.securityDB().QueryRowContext(ctx, `SELECT repository_scan, state, decision_at FROM security_findings WHERE namespace = ? AND id = ?`, namespace, id).Scan(&sourceRepo, &sourceState, &sourceDecision); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.ErrNotFound
 		}
 		return err
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT repository_scan, duplicate_of, state, decision_at FROM security_findings WHERE namespace = ? AND id = ?`, namespace, canonicalID).Scan(&canonicalRepo, &canonicalDuplicate, &canonicalState, &canonicalDecision); err != nil {
+	if err := s.securityDB().QueryRowContext(ctx, `SELECT repository_scan, duplicate_of, state, decision_at FROM security_findings WHERE namespace = ? AND id = ?`, namespace, canonicalID).Scan(&canonicalRepo, &canonicalDuplicate, &canonicalState, &canonicalDecision); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.ErrNotFound
 		}
@@ -1014,14 +1016,14 @@ func (s *Store) MarkFindingDuplicate(ctx context.Context, namespace, id, canonic
 	}
 	newerSourceDecision := sourceDecision.Valid && (!canonicalDecision.Valid || sourceDecision.Time.After(canonicalDecision.Time))
 	if findingUserFinalState(sourceState) && (!findingUserFinalState(canonicalState) || newerSourceDecision) {
-		if _, err := tx.ExecContext(ctx,
+		if _, err := s.securityDB().ExecContext(ctx,
 			`UPDATE security_findings SET state = ?, decision_at = ?, updated_at = ? WHERE namespace = ? AND id = ?`,
 			sourceState, sourceDecision, time.Now().UTC(), namespace, canonicalID,
 		); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `WITH RECURSIVE descendants(id) AS (
+	if _, err := s.securityDB().ExecContext(ctx, `WITH RECURSIVE descendants(id) AS (
 		SELECT id FROM security_findings
 		 WHERE namespace = ? AND repository_scan = ? AND duplicate_of = ?
 		UNION
@@ -1035,10 +1037,10 @@ func (s *Store) MarkFindingDuplicate(ctx context.Context, namespace, id, canonic
 		namespace, sourceRepo, id, namespace, sourceRepo, canonicalID, namespace, sourceRepo); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE security_findings SET duplicate_of = ?, updated_at = CURRENT_TIMESTAMP WHERE namespace = ? AND id = ?`, canonicalID, namespace, id); err != nil {
+	if _, err := s.securityDB().ExecContext(ctx, `UPDATE security_findings SET duplicate_of = ?, updated_at = CURRENT_TIMESTAMP WHERE namespace = ? AND id = ?`, canonicalID, namespace, id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 // CreatePatchProposal inserts a new patch proposal.
@@ -1053,7 +1055,7 @@ func (s *Store) CreatePatchProposal(ctx context.Context, proposal *store.PatchPr
 	}
 	proposal.UpdatedAt = now
 
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.securityDB().ExecContext(ctx,
 		`INSERT INTO security_patch_proposals
 		 (id, namespace, repository_scan, finding_id, task_name, branch, diff_artifact, summary_artifact, status, reason, pr_number, pr_url, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1268,7 +1270,7 @@ func (s *Store) UpdatePatchProposal(ctx context.Context, proposal *store.PatchPr
 		return store.ValidationErrorf("patch proposal publication evidence must be bound with BindPatchProposalPublicationEvidence")
 	}
 	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx,
+	result, err := s.securityDB().ExecContext(ctx,
 		`UPDATE security_patch_proposals
 		 SET task_name = ?, branch = ?, diff_artifact = ?, summary_artifact = ?, status = ?, reason = ?, pr_number = ?, pr_url = ?, updated_at = ?
 		 WHERE namespace = ? AND id = ? AND publication_evidence_json = ''`,
@@ -1309,14 +1311,14 @@ func (s *Store) UpdatePatchProposal(ctx context.Context, proposal *store.PatchPr
 func (s *Store) ListPatchProposals(ctx context.Context, namespace, findingID string) ([]store.PatchProposal, error) {
 	canonicalID := findingID
 	var duplicateOf string
-	if err := s.db.QueryRowContext(ctx, `SELECT duplicate_of FROM security_findings WHERE namespace = ? AND id = ?`, namespace, findingID).Scan(&duplicateOf); err == nil {
+	if err := s.securityDB().QueryRowContext(ctx, `SELECT duplicate_of FROM security_findings WHERE namespace = ? AND id = ?`, namespace, findingID).Scan(&duplicateOf); err == nil {
 		if strings.TrimSpace(duplicateOf) != "" {
 			canonicalID = duplicateOf
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.securityDB().QueryContext(ctx,
 		`SELECT id, namespace, repository_scan, finding_id, task_name, branch, diff_artifact, summary_artifact,
 		        status, reason, pr_number, pr_url, publication_evidence_json, created_at, updated_at
 		 FROM security_patch_proposals
@@ -1374,7 +1376,7 @@ func (s *Store) CreateDroppedFinding(ctx context.Context, dropped *store.Dropped
 	if dropped.CreatedAt.IsZero() {
 		dropped.CreatedAt = time.Now().UTC()
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.securityDB().ExecContext(ctx,
 		`INSERT OR IGNORE INTO security_dropped_findings
 		 (id, namespace, repository_scan, scan_run_id, task_name, slice_id, reason, layer, sample_json, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1425,7 +1427,7 @@ func (s *Store) ListDroppedFindings(ctx context.Context, filter store.DroppedFin
 	query.WriteString(` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`)
 	args = append(args, filter.Limit, offset)
 
-	rows, err := s.db.QueryContext(ctx, query.String(), args...)
+	rows, err := s.securityDB().QueryContext(ctx, query.String(), args...)
 	if err != nil {
 		return nil, "", err
 	}

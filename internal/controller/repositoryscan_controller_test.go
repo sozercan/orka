@@ -5976,8 +5976,8 @@ func TestRepositoryScanPolicyDigestDriftFailsValidationTaskCreationWithoutRequeu
 	}
 	finding := &storepkg.Finding{ID: "finding_policy", Namespace: defaultNS, RepositoryScan: "kaset", ScanRunID: run.ID, Severity: "high", Confidence: "high"}
 
-	if err := reconciler.createValidationTask(ctx, scan, finding); err == nil || !strings.Contains(err.Error(), "scanner policy digest changed") {
-		t.Fatalf("createValidationTask() error = %v, want policy drift propagated", err)
+	if err := reconciler.ensureValidationTask(ctx, scan, finding, nil); err == nil || !strings.Contains(err.Error(), "scanner policy digest changed") {
+		t.Fatalf("ensureValidationTask() error = %v, want policy drift propagated", err)
 	}
 	storedRun, err := store.GetScanRun(ctx, defaultNS, run.ID)
 	if err != nil {
