@@ -21,7 +21,7 @@ No other runtime behavior is intentionally changed.
 
 ## Packaging
 
-The upstream test suites, fixtures, and optional `scripts/test-review-harness*` live-provider smoke wrappers are omitted. `scripts/autoreview` does not depend on them. A small downstream test covers only the three local behavior overrides.
+Orka vendors the runtime without tests, fixtures, or optional `scripts/test-review-harness*` wrappers. The focused downstream override tests remain in the shared skills repository.
 
 ## Upstream license
 
