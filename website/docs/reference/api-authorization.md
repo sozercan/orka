@@ -66,10 +66,12 @@ resource and subresource fields and to the same slash-separated string in RBAC.
 The HTTP method does not define the permission. `PUT /api/v1/agents/:name` patches
 the Kubernetes Agent, so it requires `patch` on `agents`. Approval decisions require
 `update` on `tasks/approvals` and `patch` on the parent Task. A monitor run or
-command also needs `patch` on its RepositoryMonitor. A scan, validation, or patch
-request that creates a Task also needs `create` on `tasks` before any work is
-queued. Starting a scan also requires `list` on Tasks to check for active scan
-work. `POST /api/v1/security/findings/:id/pull-request` only returns a stored PR
+command also needs `patch` on its RepositoryMonitor. Commands also require named
+`create` on `repositorymonitors/runs` before the command or its derived run is
+stored. A scan, validation, or patch request that creates a Task also needs
+`create` on `tasks` before any work is queued. Starting a scan also requires
+`list` on Tasks to check for active scan work.
+`POST /api/v1/security/findings/:id/pull-request` only returns a stored PR
 receipt, so its permission is `get`, despite the HTTP method.
 
 The `create_agent` tool with `initialPrompt` requires Agent and Task creation
@@ -239,7 +241,7 @@ otherwise. In the additional-checks column:
 | `POST` | `/api/v1/monitors/repositories/:name/runs` | `core.orka.ai` | `repositorymonitors/runs` | `create` | `:name` | `Q` | `patch` on `core.orka.ai/repositorymonitors`, `:name` |
 | `GET` | `/api/v1/monitors/repositories/:name/runs` | `core.orka.ai` | `repositorymonitors/runs` | `list` | `:name` | `Q` | none |
 | `GET` | `/api/v1/monitors/repositories/:name/items` | `core.orka.ai` | `repositorymonitors/items` | `list` | `:name` | `Q` | none |
-| `POST` | `/api/v1/monitors/repositories/:name/commands` | `core.orka.ai` | `repositorymonitors/commands` | `create` | `:name` | `Q` | `patch` on `core.orka.ai/repositorymonitors`, `:name` |
+| `POST` | `/api/v1/monitors/repositories/:name/commands` | `core.orka.ai` | `repositorymonitors/commands` | `create` | `:name` | `Q` | `create` on `core.orka.ai/repositorymonitors/runs`, `:name`; `patch` on `core.orka.ai/repositorymonitors`, `:name` |
 | `GET` | `/api/v1/monitors/commands` | `core.orka.ai` | `monitorcommands` | `list` | empty | `Q` | none |
 | `GET` | `/api/v1/monitors/commands/:id` | `core.orka.ai` | `monitorcommands` | `get` | `:id` | `Q` | none |
 | `GET` | `/api/v1/monitors/actions` | `core.orka.ai` | `monitoractions` | `list` | empty | `Q` | none |

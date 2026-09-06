@@ -410,26 +410,54 @@ func TestExternalAPIGatewayRetryPreservesOwnershipChecks(t *testing.T) {
 	}
 }
 
-func TestExternalAPIAuthorizedMonitorCommand(t *testing.T) {
-	f := newExternalAuthorizationFixture(t)
-	monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "protected"}}
-	require.NoError(t, f.kube.Get(t.Context(), client.ObjectKeyFromObject(monitor), monitor))
-	monitor.Spec.RepoURL = "https://github.com/orka-agents/orka"
-	f.server.handlers.normalizeRepositoryMonitorSpec(&monitor.Spec)
-	require.NoError(t, f.kube.Update(t.Context(), monitor))
-	require.NoError(t, f.store.UpsertMonitorItem(t.Context(), &store.MonitorItem{MonitorNamespace: "default", MonitorName: "protected", Kind: "pull_request", ItemKey: "42", Number: 42, State: "open", HeadSHA: "fixture-sha", UpdatedAt: time.Now()}))
-	f.allowRoute(t, "POST /api/v1/monitors/repositories/:name/commands")
-	status, body := f.request(t, http.MethodPost, "/api/v1/monitors/repositories/protected/commands", `{"kind":"pull_request","number":42,"intent":"review","targetSHA":"fixture-sha"}`)
-	require.Equal(t, http.StatusCreated, status, body)
-	commands, _, err := f.store.ListCommandEvents(t.Context(), store.CommandEventFilter{Namespace: "default", MonitorName: "protected"})
-	require.NoError(t, err)
-	require.Len(t, commands, 1)
-	require.Equal(t, "review", commands[0].Intent)
-	runs, _, err := f.store.ListMonitorRuns(t.Context(), store.MonitorRunFilter{Namespace: "default", MonitorName: "protected"})
-	require.NoError(t, err)
-	require.Len(t, runs, 1)
-	require.NoError(t, f.kube.Get(t.Context(), client.ObjectKeyFromObject(monitor), monitor))
-	require.Equal(t, runs[0].ID, monitor.Annotations[repositoryMonitorRunRequestAnnotation])
+func TestExternalAPIMonitorCommandPreflightsRunCreation(t *testing.T) {
+	for _, test := range []struct{ name, runGrantName string }{
+		{name: "missing-run-grant"},
+		{name: "other-monitor-run-grant", runGrantName: "other"},
+		{name: "authorized", runGrantName: "protected"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newExternalAuthorizationFixture(t)
+			monitor := &corev1alpha1.RepositoryMonitor{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "protected"}}
+			require.NoError(t, f.kube.Get(t.Context(), client.ObjectKeyFromObject(monitor), monitor))
+			monitor.Spec.RepoURL = "https://github.com/orka-agents/orka"
+			f.server.handlers.normalizeRepositoryMonitorSpec(&monitor.Spec)
+			require.NoError(t, f.kube.Update(t.Context(), monitor))
+			require.NoError(t, f.store.UpsertMonitorItem(t.Context(), &store.MonitorItem{MonitorNamespace: "default", MonitorName: "protected", Kind: "pull_request", ItemKey: "42", Number: 42, State: "open", HeadSHA: "fixture-sha", UpdatedAt: time.Now()}))
+			permissions := []authorizationv1.ResourceAttributes{
+				{Namespace: "default", Group: "core.orka.ai", Resource: "repositorymonitors", Subresource: "commands", Verb: "create", Name: "protected"},
+				{Namespace: "default", Group: "core.orka.ai", Resource: "repositorymonitors", Verb: "patch", Name: "protected"},
+			}
+			if test.runGrantName != "" {
+				permissions = append(permissions, authorizationv1.ResourceAttributes{
+					Namespace: "default", Group: "core.orka.ai", Resource: "repositorymonitors", Subresource: "runs", Verb: "create", Name: test.runGrantName,
+				})
+			}
+			f.allowOnly(t, permissions...)
+			before := f.changes(t)
+			f.kubeCalls = 0
+			status, body := f.request(t, http.MethodPost, "/api/v1/monitors/repositories/protected/commands", `{"kind":"pull_request","number":42,"intent":"review","targetSHA":"fixture-sha"}`)
+			require.Zero(t, f.externalCalls.Load())
+			if test.runGrantName != "protected" {
+				require.Equal(t, http.StatusForbidden, status, "body=%s; Kubernetes calls=%d; SQLite changes=%d", body, f.kubeCalls, f.changes(t)-before)
+				require.Zero(t, f.kubeCalls)
+				require.Equal(t, before, f.changes(t), "denied command changed a record or queued work")
+				return
+			}
+			require.Equal(t, http.StatusCreated, status, body)
+			commands, _, err := f.store.ListCommandEvents(t.Context(), store.CommandEventFilter{Namespace: "default", MonitorName: "protected"})
+			require.NoError(t, err)
+			require.Len(t, commands, 1)
+			require.Equal(t, "review", commands[0].Intent)
+			runs, _, err := f.store.ListMonitorRuns(t.Context(), store.MonitorRunFilter{Namespace: "default", MonitorName: "protected"})
+			require.NoError(t, err)
+			require.Len(t, runs, 1)
+			require.Equal(t, commands[0].ID, runs[0].CommandEventID)
+			require.Equal(t, repositoryMonitorRunPhaseQueued, runs[0].Phase)
+			require.NoError(t, f.kube.Get(t.Context(), client.ObjectKeyFromObject(monitor), monitor))
+			require.Equal(t, runs[0].ID, monitor.Annotations[repositoryMonitorRunRequestAnnotation])
+		})
+	}
 }
 
 func TestExternalAPIAuthorizedChatProviderInvocation(t *testing.T) {

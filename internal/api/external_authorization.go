@@ -185,6 +185,7 @@ var externalAPIPolicies = map[string]apiRoutePolicy{
 	"GET /api/v1/monitors/repositories/:name/runs":  coreAPIPolicy("list", "repositorymonitors/runs", "name"),
 	"GET /api/v1/monitors/repositories/:name/items": coreAPIPolicy("list", "repositorymonitors/items", "name"),
 	"POST /api/v1/monitors/repositories/:name/commands": coreAPIPolicy("create", "repositorymonitors/commands", "name",
+		apiResourcePermission{corev1alpha1.GroupVersion.Group, "repositorymonitors/runs", "create", "name"},
 		apiResourcePermission{corev1alpha1.GroupVersion.Group, "repositorymonitors", "patch", "name"}),
 	"GET /api/v1/monitors/commands":                              coreAPIPolicy("list", "monitorcommands", ""),
 	"GET /api/v1/monitors/commands/:id":                          coreAPIPolicy("get", "monitorcommands", "id"),

@@ -138,7 +138,7 @@ DELETE /api/v1/monitors/repositories/:name | delete core.orka.ai:repositorymonit
 POST /api/v1/monitors/repositories/:name/runs | create core.orka.ai:repositorymonitors/runs protected; patch core.orka.ai:repositorymonitors protected
 GET /api/v1/monitors/repositories/:name/runs | list core.orka.ai:repositorymonitors/runs protected
 GET /api/v1/monitors/repositories/:name/items | list core.orka.ai:repositorymonitors/items protected
-POST /api/v1/monitors/repositories/:name/commands | create core.orka.ai:repositorymonitors/commands protected; patch core.orka.ai:repositorymonitors protected
+POST /api/v1/monitors/repositories/:name/commands | create core.orka.ai:repositorymonitors/commands protected; create core.orka.ai:repositorymonitors/runs protected; patch core.orka.ai:repositorymonitors protected
 GET /api/v1/monitors/commands | list core.orka.ai:monitorcommands
 GET /api/v1/monitors/commands/:id | get core.orka.ai:monitorcommands protected
 GET /api/v1/monitors/actions | list core.orka.ai:monitoractions
