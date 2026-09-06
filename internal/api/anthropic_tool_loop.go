@@ -14,10 +14,8 @@ import (
 	"strings"
 	"time"
 
-	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
 	"github.com/orka-agents/orka/internal/llm"
 	"github.com/orka-agents/orka/internal/tools"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // goalStateSentinel is the literal tag the coordinator MUST include in its
@@ -606,28 +604,14 @@ var coordinatorProxyTools = []string{
 	"list_tasks",
 }
 
-// injectOrkaTools appends Orka's built-in tools, coordinator tools, and namespace Tool CRDs
-// to the completion request. Client-provided tools (if any) are preserved.
-func injectOrkaTools(ctx context.Context, k8sClient client.Client, req *llm.CompletionRequest, namespace string) {
+// injectOrkaTools appends the built-in and coordinator tools that the registry can execute.
+// Kubernetes Tool resources are not supported by the compatibility tool loop.
+func injectOrkaTools(req *llm.CompletionRequest) {
 	builtinTools := tools.DefaultRegistry.ToLLMTools(builtinProxyTools)
 	req.Tools = append(req.Tools, builtinTools...)
 
 	coordinatorTools := tools.DefaultRegistry.ToLLMTools(coordinatorProxyTools)
 	req.Tools = append(req.Tools, coordinatorTools...)
-
-	// Load Tool CRDs from namespace for custom HTTP tools
-	var toolList corev1alpha1.ToolList
-	if err := k8sClient.List(ctx, &toolList, client.InNamespace(namespace)); err == nil {
-		for _, t := range toolList.Items {
-			if t.Spec.Parameters != nil {
-				req.Tools = append(req.Tools, llm.Tool{
-					Name:        t.Name,
-					Description: t.Spec.Description,
-					Parameters:  t.Spec.Parameters.Raw,
-				})
-			}
-		}
-	}
 }
 
 // executeToolCall executes a single tool call via the default registry with a timeout.

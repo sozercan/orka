@@ -7,16 +7,12 @@ MIT License - see LICENSE file for details.
 package api
 
 import (
-	"context"
-
 	"github.com/gofiber/fiber/v3"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/orka-agents/orka/internal/llm"
 )
 
 type compatCoordinatorSetup struct {
-	Client              client.Client
 	Namespace           string
 	ToolUseAction       string
 	AuthorizationConfig ContextTokenAuthorizationConfig
@@ -28,7 +24,6 @@ type compatCoordinatorSetup struct {
 // order so OpenAI and Anthropic do not drift.
 func prepareCompatCoordinatorTools(
 	c fiber.Ctx,
-	ctx context.Context,
 	req *llm.CompletionRequest,
 	setup compatCoordinatorSetup,
 ) (bool, error) {
@@ -36,7 +31,7 @@ func prepareCompatCoordinatorTools(
 		return false, nil
 	}
 	req.Tools = nil
-	injectOrkaTools(ctx, setup.Client, req, setup.Namespace)
+	injectOrkaTools(req)
 	req.Tools = filterCompletionToolsForContextToken(c, setup.AuthorizationConfig, req.Tools)
 	if err := authorizeContextTokenToolUse(c, setup.AuthorizationConfig, setup.ToolUseAction, completionToolNames(req.Tools)); err != nil {
 		return false, err

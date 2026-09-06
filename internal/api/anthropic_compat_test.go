@@ -20,7 +20,6 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	corev1 "k8s.io/api/core/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1541,9 +1540,8 @@ func TestHandleStreamingMessages_DoesNotStreamPrematureCoordinatorText(t *testin
 // --- Tests: injectOrkaTools ---
 
 func TestInjectOrkaTools_BuiltinTools(t *testing.T) {
-	handler, _ := setupTestAnthropicHandler()
 	req := &llm.CompletionRequest{}
-	injectOrkaTools(context.Background(), handler.client, req, "default")
+	injectOrkaTools(req)
 
 	if len(req.Tools) < len(builtinProxyTools) {
 		t.Fatalf("expected at least %d tools, got %d", len(builtinProxyTools), len(req.Tools))
@@ -1561,7 +1559,6 @@ func TestInjectOrkaTools_BuiltinTools(t *testing.T) {
 }
 
 func TestInjectOrkaTools_PreservesClientTools(t *testing.T) {
-	handler, _ := setupTestAnthropicHandler()
 	clientTool := llm.Tool{
 		Name:        "my_custom_tool",
 		Description: "A client-provided tool",
@@ -1569,7 +1566,7 @@ func TestInjectOrkaTools_PreservesClientTools(t *testing.T) {
 	}
 	req := &llm.CompletionRequest{Tools: []llm.Tool{clientTool}}
 
-	injectOrkaTools(context.Background(), handler.client, req, "default")
+	injectOrkaTools(req)
 
 	// Client tool should still be first
 	if req.Tools[0].Name != "my_custom_tool" {
@@ -1591,34 +1588,6 @@ func TestInjectOrkaTools_PreservesClientTools(t *testing.T) {
 	}
 }
 
-func TestInjectOrkaTools_WithToolCRDs(t *testing.T) {
-	toolCRD := &corev1alpha1.Tool{
-		ObjectMeta: metav1.ObjectMeta{Name: "custom-tool", Namespace: "default"},
-		Spec: corev1alpha1.ToolSpec{
-			Description: "A custom tool",
-			Parameters:  &apiextensionsv1.JSON{Raw: json.RawMessage(`{"type":"object"}`)},
-			HTTP:        &corev1alpha1.HTTPExecution{URL: "http://example.com/tool"},
-		},
-	}
-
-	handler, _ := setupTestAnthropicHandler(toolCRD)
-	req := &llm.CompletionRequest{}
-	injectOrkaTools(context.Background(), handler.client, req, "default")
-
-	names := map[string]bool{}
-	for _, tool := range req.Tools {
-		names[tool.Name] = true
-	}
-	if !names["custom-tool"] {
-		t.Error("expected Tool CRD 'custom-tool' not found in injected tools")
-	}
-	for _, expected := range builtinProxyTools {
-		if !names[expected] {
-			t.Errorf("expected built-in tool %q not found", expected)
-		}
-	}
-}
-
 // TestInjectOrkaTools_CoordinatorToolsAllRegistered guards against a class of
 // outages where coordinatorProxyTools lists a tool name that is not registered
 // in DefaultRegistry. When that happens ToLLMTools silently drops the tool, the
@@ -1635,7 +1604,7 @@ func TestInjectOrkaTools_CoordinatorToolsAllRegistered(t *testing.T) {
 	tools.RegisterProxyPRTools(handler.client)
 
 	req := &llm.CompletionRequest{}
-	injectOrkaTools(context.Background(), handler.client, req, "default")
+	injectOrkaTools(req)
 
 	names := map[string]bool{}
 	for _, tool := range req.Tools {

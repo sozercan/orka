@@ -206,9 +206,9 @@ The 18 injected tools:
 | Track work | `check_task_progress`, `fetch_task_output`, `wait_for_task`, `cancel_task`, `list_agents`, `list_tasks` |
 | Pull requests | `create_pull_request`, `check_pull_request_ci` |
 
-Custom `Tool` CRDs in the namespace that define `parameters` are also advertised to the
-model, but the compatibility loop cannot execute their HTTP requests. Calling one returns
-`tool "..." not found`. Use the built-ins listed above for coordinator requests.
+Orka advertises only the tools listed above that are registered for server-side execution.
+Custom Kubernetes `Tool` resources are not advertised or executed by either compatibility
+endpoint. A custom `Tool` with a built-in name cannot replace or duplicate its definition.
 
 ### Turning it off
 
@@ -216,8 +216,9 @@ model, but the compatibility loop cannot execute their HTTP requests. Calling on
 X-Orka-Tools: disabled
 ```
 
-This header disables the coordinator rewrite and Orka's tool loop. Your client manages
-its own tools and tool loop. Requests still pass through Orka's OpenAI request conversion;
+This header disables the coordinator rewrite and Orka's tool loop. Your client's tool
+definitions pass through unchanged, and your client manages its own tool execution.
+Requests still pass through Orka's OpenAI request conversion;
 for example, `top_p`, `frequency_penalty`, and `presence_penalty` are not forwarded to the
 provider. Provider resolution and credential handling are unchanged.
 
