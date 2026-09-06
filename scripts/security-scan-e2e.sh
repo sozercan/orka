@@ -524,7 +524,9 @@ create_api_identity() {
     kubectl apply -f - >/dev/null
   jq -n \
     --arg ns "${test_namespace}" \
-    --arg name "${api_identity_name}" '
+    --arg name "${api_identity_name}" \
+    --arg scan "${scan_name}" \
+    --arg badScan "${bad_scan_name}" '
     {
       apiVersion:"rbac.authorization.k8s.io/v1",
       kind:"Role",
@@ -533,6 +535,16 @@ create_api_identity() {
         apiGroups:["core.orka.ai"],
         resources:["agents","repositoryscans","tasks"],
         verbs:["get","list","watch"]
+      },{
+        apiGroups:["core.orka.ai"],
+        resources:["repositoryscans/scans","repositoryscans/slices","repositoryscans/findings","repositoryscans/droppedfindings"],
+        resourceNames:[$scan,$badScan],
+        verbs:["list"]
+      },{
+        apiGroups:["core.orka.ai"],
+        resources:["repositoryscans/threatmodel"],
+        resourceNames:[$scan,$badScan],
+        verbs:["get"]
       }]
     }' | kubectl apply -f - >/dev/null
   jq -n \

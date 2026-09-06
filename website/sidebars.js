@@ -60,6 +60,7 @@ const sidebars = {
       items: [
         'reference/configuration',
         'reference/api-reference',
+        'reference/api-authorization',
         'reference/cli',
         'reference/cli-commands',
         'reference/execution-events',

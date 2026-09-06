@@ -108,9 +108,8 @@ func TestChatHandlerHasRunningTasksExcludesTerminalAndScheduledPhases(t *testing
 				Status: corev1alpha1.TaskStatus{Phase: tt.phase},
 			}
 			fakeClient := fake.NewClientBuilder().WithScheme(newTestScheme()).WithRuntimeObjects(task).Build()
-			handler := &ChatHandler{client: fakeClient}
 
-			require.Equal(t, tt.active, handler.hasRunningTasks(context.Background(), "default", sessionID))
+			require.Equal(t, tt.active, hasRunningTasks(context.Background(), fakeClient, "default", sessionID))
 		})
 	}
 }

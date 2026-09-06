@@ -590,6 +590,233 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: orka
+  name: orka-api-editor-role
+rules:
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - tasks
+  verbs:
+  - get
+  - list
+  - create
+  - patch
+  - delete
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - tasks/approvals
+  verbs:
+  - update
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - sessions
+  verbs:
+  - get
+  - list
+  - update
+  - delete
+- apiGroups:
+  - gateway.orka.ai
+  resources:
+  - gatewayclasses
+  - gatewaybindings
+  - gatewayevents
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - gateway.orka.ai
+  resources:
+  - gateways
+  - gatewaydeliveries
+  verbs:
+  - get
+  - list
+  - update
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - memories
+  - providers
+  - tools
+  - agentruntimes
+  - skills
+  - repositoryscans
+  - substrateactorpools
+  verbs:
+  - get
+  - list
+  - create
+  - update
+  - delete
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - agents
+  verbs:
+  - get
+  - list
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - memoryproposals
+  verbs:
+  - get
+  - list
+  - create
+  - update
+  - review
+  - apply
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - runtimepools
+  - repositoryscans/slices
+  - monitorcommands
+  - monitoractions
+  - monitorworkactions
+  - monitorimplementationjobs
+  - monitormutations
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - repositoryscans/threatmodel
+  - securityfindings
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - repositoryscans/scans
+  - securityfindings/patches
+  - repositorymonitors/runs
+  verbs:
+  - list
+  - create
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - repositoryscans/status
+  verbs:
+  - patch
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - repositoryscans/droppedfindings
+  - repositoryscans/findings
+  - repositorymonitors/items
+  - monitorevents
+  verbs:
+  - list
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - securityfindings/validation
+  - repositorymonitors/commands
+  - chats
+  verbs:
+  - create
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - securityfindings/pullrequest
+  - chats/config
+  verbs:
+  - get
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - repositorymonitors
+  verbs:
+  - get
+  - list
+  - create
+  - update
+  - patch
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: orka
+  name: orka-api-viewer-role
+rules:
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - tasks
+  - sessions
+  - memories
+  - memoryproposals
+  - providers
+  - tools
+  - runtimepools
+  - agentruntimes
+  - agents
+  - skills
+  - repositoryscans
+  - repositoryscans/slices
+  - repositorymonitors
+  - monitorcommands
+  - monitoractions
+  - monitorworkactions
+  - monitorimplementationjobs
+  - monitormutations
+  - substrateactorpools
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - gateway.orka.ai
+  resources:
+  - gatewayclasses
+  - gateways
+  - gatewaybindings
+  - gatewayevents
+  - gatewaydeliveries
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - repositoryscans/threatmodel
+  - securityfindings
+  - securityfindings/pullrequest
+  - chats/config
+  verbs:
+  - get
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - repositoryscans/scans
+  - repositoryscans/droppedfindings
+  - repositoryscans/findings
+  - securityfindings/patches
+  - repositorymonitors/runs
+  - repositorymonitors/items
+  - monitorevents
+  verbs:
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
   name: orka-container-worker-role
 rules:
 - apiGroups:
@@ -621,6 +848,20 @@ rules:
   - gatewaybindings/status
   verbs:
   - get
+- apiGroups:
+  - gateway.orka.ai
+  resources:
+  - gatewayevents
+  - gatewaydeliveries
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - gateway.orka.ai
+  resources:
+  - gatewaydeliveries
+  verbs:
+  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -650,6 +891,20 @@ rules:
   - gatewaybindings/status
   verbs:
   - get
+- apiGroups:
+  - gateway.orka.ai
+  resources:
+  - gatewayevents
+  - gatewaydeliveries
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - gateway.orka.ai
+  resources:
+  - gatewaydeliveries
+  verbs:
+  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -670,6 +925,14 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - gateway.orka.ai
+  resources:
+  - gatewayevents
+  - gatewaydeliveries
+  verbs:
+  - get
+  - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -1220,6 +1483,12 @@ rules:
   - sessions
   verbs:
   - '*'
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - tasks/approvals
+  verbs:
+  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -1255,6 +1524,12 @@ rules:
   - delete
   - get
   - list
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - tasks/approvals
+  verbs:
+  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

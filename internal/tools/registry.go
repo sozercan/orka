@@ -95,21 +95,31 @@ type ToolContext struct {
 		DeleteSession(ctx context.Context, namespace, sessionID string) error
 	}
 	// Task creation helpers provided by the chat executor
-	GenerateTaskName               func() string
-	TaskLabels                     func() map[string]string
-	CheckTaskLimit                 func() *ChatToolError
-	AuthorizeTaskCreate            func(context.Context, *corev1alpha1.Task) *ChatToolError
-	AuthorizeTaskDelete            func(context.Context, *corev1alpha1.Task) *ChatToolError
-	AuthorizeAgentCreate           func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeAgentUpdate           func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeAgentDelete           func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeSecretRead            func(context.Context, string, string) *ChatToolError
+	GenerateTaskName     func() string
+	TaskLabels           func() map[string]string
+	CheckTaskLimit       func() *ChatToolError
+	AuthorizeTaskCreate  func(context.Context, *corev1alpha1.Task) *ChatToolError
+	AuthorizeTaskDelete  func(context.Context, *corev1alpha1.Task) *ChatToolError
+	AuthorizeAgentCreate func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	// AuthorizeAgentInitialTask preflights the combined Agent/Task operation
+	// before creating the Agent. Full Task authorization still runs later.
+	AuthorizeAgentInitialTask func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeAgentUpdate      func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeAgentDelete      func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeSecretRead       func(context.Context, string, string) *ChatToolError
+	AuthorizePodLogs          func(context.Context, string, string) error
+	// AuthorizeCodeExecResources checks creation and cleanup permissions for
+	// the complete temporary resource set before code_exec creates anything.
+	AuthorizeCodeExecResources     func(context.Context, []client.Object) error
 	RequireSecretReadAuthorization bool
-	IncrementTasks                 func()
-	ApprovalEmitter                func(context.Context, approvals.ApprovalTarget) error
-	ApprovalTargetSpecDigest       func(context.Context, string) (string, error)
-	ApprovalTargetArguments        func(context.Context, string, json.RawMessage) (json.RawMessage, error)
-	ApprovalTargetRefresh          func(context.Context, string, *corev1alpha1.Tool) error
+	// RequireGitHubTaskCredentials disables controller-global repository and
+	// credential fallback for external GitHub tool calls.
+	RequireGitHubTaskCredentials bool
+	IncrementTasks               func()
+	ApprovalEmitter              func(context.Context, approvals.ApprovalTarget) error
+	ApprovalTargetSpecDigest     func(context.Context, string) (string, error)
+	ApprovalTargetArguments      func(context.Context, string, json.RawMessage) (json.RawMessage, error)
+	ApprovalTargetRefresh        func(context.Context, string, *corev1alpha1.Tool) error
 }
 
 type toolContextKey struct{}

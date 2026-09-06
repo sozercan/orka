@@ -5,9 +5,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	rbacv1 "k8s.io/api/rbac/v1"
+	"sigs.k8s.io/yaml"
 )
 
 const testCRD = `apiVersion: apiextensions.k8s.io/v1
@@ -148,8 +152,109 @@ func TestStaticChartGrantsSessionAuthorizationRBAC(t *testing.T) {
 	if end := strings.Index(clientRole, "\n---"); end >= 0 {
 		clientRole = clientRole[:end]
 	}
-	if !strings.Contains(clientRole, want) {
-		t.Fatalf("client Role is missing the Session API rule %q:\n%s", want, clientRole)
+	const wantClient = "apiGroups: [\"core.orka.ai\"]\n    resources: [\"sessions\"]\n" +
+		"    verbs: [\"get\", \"list\", \"update\", \"delete\"]"
+	if !strings.Contains(clientRole, wantClient) {
+		t.Fatalf("client Role is missing the Session API rule %q:\n%s", wantClient, clientRole)
+	}
+}
+
+func TestStaticChartClientVirtualAPIPermissions(t *testing.T) {
+	for _, mode := range []string{"harness-v1", "harness-v2"} {
+		t.Run(mode, func(t *testing.T) {
+			args := []string{"--show-only", "templates/rbac.yaml", "--set-string", "controller.mode=" + mode}
+			if mode == "harness-v1" {
+				args = append(args,
+					"--set-string", "harnessV1.image.digest=sha256:"+strings.Repeat("1", 64),
+					"--set-string", "harnessV1.auth.existingSecret=harness-wrapper-auth",
+					"--set-string", "harnessV1.tls.existingSecret=harness-wrapper-tls",
+				)
+			}
+			output := requireHelmRender(t, args...)
+			_, clientRole, found := strings.Cut(output, "# Client Role")
+			if !found {
+				t.Fatal("rendered RBAC is missing the client Role")
+			}
+			_, clientRole, _ = strings.Cut(clientRole, "\n")
+			clientRole, _, _ = strings.Cut(clientRole, "\n---")
+			var role rbacv1.Role
+			if err := yaml.Unmarshal([]byte(clientRole), &role); err != nil {
+				t.Fatalf("decode client Role: %v", err)
+			}
+			if role.Namespace != "orka-test" {
+				t.Fatalf("client Role namespace = %q, want orka-test", role.Namespace)
+			}
+			allows := func(group, resource, verb string) bool {
+				for _, rule := range role.Rules {
+					if slices.Contains(rule.APIGroups, group) && slices.Contains(rule.Resources, resource) &&
+						slices.Contains(rule.Verbs, verb) && len(rule.ResourceNames) == 0 {
+						return true
+					}
+				}
+				return false
+			}
+			for resource, verbs := range map[string][]string{
+				"tasks":                           {"get", "list", "create", "delete", "patch"},
+				"tasks/approvals":                 {"update"},
+				"sessions":                        {"get", "list", "update", "delete"},
+				"chats":                           {"create"},
+				"chats/config":                    {"get"},
+				"memories":                        {"get", "list"},
+				"memoryproposals":                 {"get", "list"},
+				"repositoryscans":                 {"get", "list"},
+				"repositoryscans/threatmodel":     {"get"},
+				"repositoryscans/scans":           {"list"},
+				"repositoryscans/slices":          {"get", "list"},
+				"repositoryscans/droppedfindings": {"list"},
+				"repositoryscans/findings":        {"list"},
+				"securityfindings":                {"get"},
+				"securityfindings/patches":        {"list"},
+				"securityfindings/pullrequest":    {"get"},
+				"repositorymonitors":              {"patch"},
+				"repositorymonitors/runs":         {"list", "create"},
+				"repositorymonitors/items":        {"list"},
+				"repositorymonitors/commands":     {"create"},
+				"monitorcommands":                 {"get", "list"},
+				"monitoractions":                  {"get", "list"},
+				"monitorworkactions":              {"get", "list"},
+				"monitorimplementationjobs":       {"get", "list"},
+				"monitormutations":                {"get", "list"},
+				"monitorevents":                   {"list"},
+			} {
+				for _, verb := range verbs {
+					if !allows("core.orka.ai", resource, verb) {
+						t.Errorf("client cannot %s core.orka.ai/%s", verb, resource)
+					}
+				}
+			}
+			for _, resource := range []string{"gatewayevents", "gatewaydeliveries"} {
+				for _, verb := range []string{"get", "list"} {
+					if got := allows("gateway.orka.ai", resource, verb); got != (mode == "harness-v2") {
+						t.Errorf("client %s gateway.orka.ai/%s = %v", verb, resource, got)
+					}
+				}
+			}
+			for _, permission := range [][3]string{
+				{"", "secrets", "get"}, {"", "secrets", "list"},
+				{"core.orka.ai", "agents", "create"},
+				{"core.orka.ai", "repositoryscans", "create"},
+				{"core.orka.ai", "memoryproposals", "review"},
+				{"core.orka.ai", "memoryproposals", "apply"},
+				{"core.orka.ai", "securityfindings", "update"},
+				{"gateway.orka.ai", "gateways", "update"},
+				{"gateway.orka.ai", "gatewaydeliveries", "update"},
+			} {
+				if allows(permission[0], permission[1], permission[2]) {
+					t.Errorf("client unexpectedly grants %s %s/%s", permission[2], permission[0], permission[1])
+				}
+			}
+			for _, rule := range role.Rules {
+				if slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Resources, "*") ||
+					slices.Contains(rule.Verbs, "*") {
+					t.Error("client Role contains a wildcard permission")
+				}
+			}
+		})
 	}
 }
 

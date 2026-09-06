@@ -9,3 +9,6 @@ rules:
 - apiGroups: [gateway.orka.ai]
   resources: [gateways, gatewaybindings, gateways/status, gatewaybindings/status]
   verbs: [get, list, watch]
+- apiGroups: [gateway.orka.ai]
+  resources: [gatewayevents, gatewaydeliveries]
+  verbs: [get, list]

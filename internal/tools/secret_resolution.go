@@ -103,6 +103,10 @@ func loadAgent(ctx context.Context, k8sClient client.Reader, namespace, agentNam
 func firstExistingSecretName(ctx context.Context, k8sClient client.Reader, namespace string, candidates []string) (string, error) {
 	for _, name := range candidates {
 		exists, err := secretExists(ctx, k8sClient, namespace, name)
+		// Optional discovery only considers candidates the caller can read.
+		if apierrors.IsForbidden(err) {
+			continue
+		}
 		if err != nil {
 			return "", err
 		}

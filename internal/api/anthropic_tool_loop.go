@@ -647,7 +647,7 @@ func executeToolCall(ctx context.Context, tc llm.ToolCall, timeout time.Duration
 		toolCtx = tools.WithToolContext(toolCtx, &toolCtxCopy)
 	}
 
-	result, err := tools.DefaultRegistry.Execute(toolCtx, tc.Name, tc.Arguments)
+	result, err := registryForExternalToolCall(toolCtxOpt, tc.Name).Execute(toolCtx, tc.Name, tc.Arguments)
 	if err != nil {
 		errResult, _ := json.Marshal(map[string]any{"success": false, "error": err.Error()})
 		return string(errResult)

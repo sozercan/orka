@@ -89,6 +89,36 @@ if grep -F '  transaction:' "${manifest_capture}" >/dev/null; then
   exit 1
 fi
 
+api_role_capture="${work_dir}/api-role.json"
+kubectl() {
+  if [[ "$*" == "apply -f -" ]]; then
+    local manifest
+    manifest="$(cat)"
+    if jq -e '.kind == "Role"' <<<"${manifest}" >/dev/null; then
+      printf '%s\n' "${manifest}" >"${api_role_capture}"
+    fi
+    return 0
+  fi
+  if [[ "$*" == "-n ${test_namespace} create token ${api_identity_name} --duration=2h" ]]; then
+    printf '%s' 'fixture-only-token'
+    return 0
+  fi
+  return 1
+}
+create_api_identity
+for resource in repositoryscans/scans repositoryscans/slices repositoryscans/findings repositoryscans/droppedfindings; do
+  jq -e --arg resource "${resource}" --arg ns "${test_namespace}" --arg scan "${scan_name}" --arg badScan "${bad_scan_name}" '
+    .metadata.namespace == $ns and any(.rules[];
+      .apiGroups == ["core.orka.ai"] and (.resources | index($resource)) != null and
+      .resourceNames == [$scan,$badScan] and .verbs == ["list"])
+  ' "${api_role_capture}" >/dev/null
+done
+jq -e --arg scan "${scan_name}" --arg badScan "${bad_scan_name}" '
+  any(.rules[]; .apiGroups == ["core.orka.ai"] and .resources == ["repositoryscans/threatmodel"] and
+    .resourceNames == [$scan,$badScan] and .verbs == ["get"]) and
+  all(.rules[].verbs[]; . == "get" or . == "list" or . == "watch")
+' "${api_role_capture}" >/dev/null
+
 wait_calls="${work_dir}/authority-wait-calls"
 kubectl() {
   printf '%s\n' "$*" >>"${wait_calls}"

@@ -31,3 +31,9 @@ rules:
   - sessions
   verbs:
   - '*'
+- apiGroups:
+  - core.orka.ai
+  resources:
+  - tasks/approvals
+  verbs:
+  - update
