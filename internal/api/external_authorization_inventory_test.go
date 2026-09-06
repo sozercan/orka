@@ -118,7 +118,7 @@ DELETE /api/v1/security/repositories/:name | delete core.orka.ai:repositoryscans
 GET /api/v1/security/repositories/:name/threat-model | get core.orka.ai:repositoryscans/threatmodel protected
 PUT /api/v1/security/repositories/:name/threat-model | update core.orka.ai:repositoryscans/threatmodel protected
 GET /api/v1/security/repositories/:name/scans | list core.orka.ai:repositoryscans/scans protected
-POST /api/v1/security/repositories/:name/scans | create core.orka.ai:repositoryscans/scans protected; create core.orka.ai:tasks; patch core.orka.ai:repositoryscans/status protected
+POST /api/v1/security/repositories/:name/scans | create core.orka.ai:repositoryscans/scans protected; list core.orka.ai:tasks; create core.orka.ai:tasks; patch core.orka.ai:repositoryscans/status protected
 GET /api/v1/security/repositories/:name/slices | list core.orka.ai:repositoryscans/slices protected
 GET /api/v1/security/repositories/:name/slices/:sliceID | get core.orka.ai:repositoryscans/slices protected
 GET /api/v1/security/repositories/:name/dropped-findings | list core.orka.ai:repositoryscans/droppedfindings protected

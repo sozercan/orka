@@ -46,6 +46,7 @@ func authorizeExternalToolContext(tc *tools.ToolContext, userInfo *UserInfo, eve
 		return authorization.authorize(ctx, namespace, "get", "", "pods/log", podName)
 	}
 	if userInfo != nil && userInfo.AuthType == AuthTypeTokenReview {
+		tc.RequireGitHubTaskCredentials = true
 		tc.AuthorizeCodeExecResources = func(ctx context.Context, objects []client.Object) error {
 			for _, obj := range objects {
 				if err := authorizedClient.authorize(ctx, obj, obj.GetNamespace(), "create", ""); err != nil {

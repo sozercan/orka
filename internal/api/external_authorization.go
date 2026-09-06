@@ -156,6 +156,7 @@ var externalAPIPolicies = map[string]apiRoutePolicy{
 	"PUT /api/v1/security/repositories/:name/threat-model": coreAPIPolicy("update", "repositoryscans/threatmodel", "name"),
 	"GET /api/v1/security/repositories/:name/scans":        coreAPIPolicy("list", "repositoryscans/scans", "name"),
 	"POST /api/v1/security/repositories/:name/scans": coreAPIPolicy("create", "repositoryscans/scans", "name",
+		apiResourcePermission{corev1alpha1.GroupVersion.Group, "tasks", "list", ""},
 		apiResourcePermission{corev1alpha1.GroupVersion.Group, "tasks", "create", ""},
 		apiResourcePermission{corev1alpha1.GroupVersion.Group, "repositoryscans/status", "patch", "name"}),
 	"GET /api/v1/security/repositories/:name/slices":           coreAPIPolicy("list", "repositoryscans/slices", "name"),

@@ -65,7 +65,8 @@ the Kubernetes Agent, so it requires `patch` on `agents`. Approval decisions req
 `update` on `tasks/approvals` and `patch` on the parent Task. A monitor run or
 command also needs `patch` on its RepositoryMonitor. A scan, validation, or patch
 request that creates a Task also needs `create` on `tasks` before any work is
-queued. `POST /api/v1/security/findings/:id/pull-request` only returns a stored PR
+queued. Starting a scan also requires `list` on Tasks to check for active scan
+work. `POST /api/v1/security/findings/:id/pull-request` only returns a stored PR
 receipt, so its permission is `get`, despite the HTTP method.
 
 Creating or updating a RepositoryMonitor also requires named `get` on the Agents
@@ -73,6 +74,12 @@ used by its enabled workflows and on each credential Secret read during
 validation. Agent references use their explicit namespace or the monitor
 namespace. Credential Secrets use the monitor namespace; `readCredentialRef`
 takes precedence over the legacy `gitSecretRef`.
+
+Scanner policies selected by `customScanInstructionsRef` and
+`falsePositivePolicyRef` require named `get` on core `configmaps` in the
+RepositoryScan namespace. Configuration create/update, scan start, and finding
+validation check these grants before loading the policies. The policy opt-in
+label or annotation remains required.
 
 Workspace-class `use` remains a separate check for every authenticated identity,
 including OIDC and transaction-token callers. When a Task or workspace-backed Tool
@@ -196,15 +203,15 @@ otherwise. In the additional-checks column:
 | `GET` | `/api/v1/skills/:name/content` | `core.orka.ai` | `skills` | `get` | `:name` | `Q` | none |
 | `PUT` | `/api/v1/skills/:name` | `core.orka.ai` | `skills` | `update` | `:name` | `Q` | none |
 | `DELETE` | `/api/v1/skills/:name` | `core.orka.ai` | `skills` | `delete` | `:name` | `Q` | none |
-| `POST` | `/api/v1/security/repositories` | `core.orka.ai` | `repositoryscans` | `create` | empty | `C` | none |
+| `POST` | `/api/v1/security/repositories` | `core.orka.ai` | `repositoryscans` | `create` | empty | `C` | Named `get` on core `configmaps` for configured scanner-policy references |
 | `GET` | `/api/v1/security/repositories` | `core.orka.ai` | `repositoryscans` | `list` | empty | `Q` | none |
 | `GET` | `/api/v1/security/repositories/:name` | `core.orka.ai` | `repositoryscans` | `get` | `:name` | `Q` | none |
-| `PUT` | `/api/v1/security/repositories/:name` | `core.orka.ai` | `repositoryscans` | `update` | `:name` | `Q` | none |
+| `PUT` | `/api/v1/security/repositories/:name` | `core.orka.ai` | `repositoryscans` | `update` | `:name` | `Q` | Named `get` on core `configmaps` for configured scanner-policy references |
 | `DELETE` | `/api/v1/security/repositories/:name` | `core.orka.ai` | `repositoryscans` | `delete` | `:name` | `Q` | none |
 | `GET` | `/api/v1/security/repositories/:name/threat-model` | `core.orka.ai` | `repositoryscans/threatmodel` | `get` | `:name` | `Q` | none |
 | `PUT` | `/api/v1/security/repositories/:name/threat-model` | `core.orka.ai` | `repositoryscans/threatmodel` | `update` | `:name` | `Q` | none |
 | `GET` | `/api/v1/security/repositories/:name/scans` | `core.orka.ai` | `repositoryscans/scans` | `list` | `:name` | `Q` | none |
-| `POST` | `/api/v1/security/repositories/:name/scans` | `core.orka.ai` | `repositoryscans/scans` | `create` | `:name` | `Q` | `create` on `core.orka.ai/tasks`, empty name; `patch` on `core.orka.ai/repositoryscans/status`, `:name`; Class use |
+| `POST` | `/api/v1/security/repositories/:name/scans` | `core.orka.ai` | `repositoryscans/scans` | `create` | `:name` | `Q` | `list` and `create` on `core.orka.ai/tasks`, empty name; `patch` on `core.orka.ai/repositoryscans/status`, `:name`; Class use; named `get` on core `configmaps` for configured scanner-policy references |
 | `GET` | `/api/v1/security/repositories/:name/slices` | `core.orka.ai` | `repositoryscans/slices` | `list` | `:name` | `Q` | none |
 | `GET` | `/api/v1/security/repositories/:name/slices/:sliceID` | `core.orka.ai` | `repositoryscans/slices` | `get` | `:name` | `Q` | none |
 | `GET` | `/api/v1/security/repositories/:name/dropped-findings` | `core.orka.ai` | `repositoryscans/droppedfindings` | `list` | `:name` | `Q` | none |
@@ -212,7 +219,7 @@ otherwise. In the additional-checks column:
 | `GET` | `/api/v1/security/findings/:id` | `core.orka.ai` | `securityfindings` | `get` | `:id` | `Q` | none |
 | `POST` | `/api/v1/security/findings/:id/dismiss` | `core.orka.ai` | `securityfindings` | `update` | `:id` | `Q` | none |
 | `POST` | `/api/v1/security/findings/:id/reopen` | `core.orka.ai` | `securityfindings` | `update` | `:id` | `Q` | none |
-| `POST` | `/api/v1/security/findings/:id/validate` | `core.orka.ai` | `securityfindings/validation` | `create` | `:id` | `Q` | `create` on `core.orka.ai/tasks`, empty name; Class use |
+| `POST` | `/api/v1/security/findings/:id/validate` | `core.orka.ai` | `securityfindings/validation` | `create` | `:id` | `Q` | `create` on `core.orka.ai/tasks`, empty name; Class use; named `get` on core `configmaps` for configured scanner-policy references |
 | `POST` | `/api/v1/security/findings/:id/patch` | `core.orka.ai` | `securityfindings/patches` | `create` | `:id` | `Q` | `create` on `core.orka.ai/tasks`, empty name; Class use |
 | `GET` | `/api/v1/security/findings/:id/patches` | `core.orka.ai` | `securityfindings/patches` | `list` | `:id` | `Q` | none |
 | `POST` | `/api/v1/security/findings/:id/pull-request` | `core.orka.ai` | `securityfindings/pullrequest` | `get` | `:id` | `Q` | Stored PR receipt read only |
@@ -261,13 +268,18 @@ namespaced permissions across the cluster. The Kustomize bundle includes
 permissions above. The editor adds the listed Orka mutations. Nested tools that
 run Kubernetes workloads need separate
 workload grants, including `get` on `pods/log` when reading Pod logs. Neither
-helper grants Secrets or workspace-class use.
+helper grants Secrets, ConfigMaps, or workspace-class use.
 Kubernetes `code_exec` preflights `create` and `delete` on its temporary Secrets,
 ServiceAccounts, Jobs, and optional NetworkPolicies before creating any of them.
 The delete permissions cover cleanup after completion or failed setup.
 ConfigMap caching is optional. A denied cache lookup behaves as a cache miss;
 without ConfigMap `create`, execution returns its result without storing it.
 The source files in `config/rbac` have unprefixed names when applied directly.
+
+TokenReview calls to GitHub tools require a Task repository scope and a referenced
+credential. Grant named `get` on the Task and Secret. `check_pull_request_ci` uses
+the selected repository's read credential; `create_pull_request` uses
+`forgeCredentialRef`. These calls use only the Task's repository and credentials.
 
 Existing Task helper roles retain session access; Task editor/admin roles also
 grant `update` on `tasks/approvals`. Gateway helper roles include ledger reads;

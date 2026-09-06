@@ -93,6 +93,13 @@ func resolveRepoAndTokenWithPolicy(
 	}
 
 	scopeTaskName := githubTaskNameFromContext(ctx, taskName)
+	requireTaskCredentials := false
+	if tc := GetToolContext(ctx); tc != nil {
+		requireTaskCredentials = tc.RequireGitHubTaskCredentials
+	}
+	if requireTaskCredentials && scopeTaskName == "" {
+		return "", "", "", "", fmt.Errorf("task_name or current Task context is required for external GitHub access")
+	}
 	if hasRepoURL && requireRepoURLScope && scopeTaskName == "" {
 		return "", "", "", "", fmt.Errorf("repo_url repository %s/%s requires a permitted repository scope", owner, repo)
 	}
@@ -140,6 +147,9 @@ func resolveRepoAndTokenWithPolicy(
 	}
 
 	if token == "" {
+		if requireTaskCredentials {
+			return "", "", "", "", fmt.Errorf("task %s requires an explicit GitHub credential reference", scopeTaskName)
+		}
 		token = resolveToken()
 	}
 
