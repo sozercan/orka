@@ -281,6 +281,10 @@ credential. Grant named `get` on the Task and Secret. `check_pull_request_ci` us
 the selected repository's read credential; `create_pull_request` uses
 `forgeCredentialRef`. These calls use only the Task's repository and credentials.
 
+Optional Git credential discovery skips Secret names that the caller cannot
+read. Other lookup errors still stop discovery, and explicit Secret reads
+remain subject to authorization.
+
 Existing Task helper roles retain session access; Task editor/admin roles also
 grant `update` on `tasks/approvals`. Gateway helper roles include ledger reads;
 Gateway editor/admin roles also grant delivery retry. GatewayClass reads require
