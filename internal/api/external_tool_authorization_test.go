@@ -21,10 +21,15 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/stretchr/testify/require"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -32,6 +37,7 @@ import (
 	kubernetestesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 
 	corev1alpha1 "github.com/orka-agents/orka/api/v1alpha1"
@@ -40,9 +46,118 @@ import (
 	"github.com/orka-agents/orka/internal/llm"
 	"github.com/orka-agents/orka/internal/store"
 	"github.com/orka-agents/orka/internal/tools"
+	"github.com/orka-agents/orka/internal/workerenv"
 )
 
 const externalToolNamespace = "tool-target"
+
+func TestExternalToolCodeExecPreflightsLifecyclePermissions(t *testing.T) {
+	type testCase struct {
+		name           string
+		deniedVerb     string
+		deniedResource string
+		networkPolicy  bool
+		rejectResource string
+		wantCreates    int
+	}
+	tests := make([]testCase, 0, 12)
+	tests = append(tests,
+		testCase{name: "completed", networkPolicy: true, wantCreates: 4},
+		testCase{name: "partial-setup", networkPolicy: true, rejectResource: "serviceaccounts", wantCreates: 2},
+		testCase{name: "job-rejected", networkPolicy: true, rejectResource: "jobs", wantCreates: 4},
+		testCase{name: "network-policy-disabled", deniedVerb: "delete", deniedResource: "networkpolicies", wantCreates: 3},
+	)
+	for _, resource := range []string{"secrets", "serviceaccounts", "networkpolicies", "jobs"} {
+		for _, verb := range []string{"create", "delete"} {
+			tests = append(tests, testCase{name: "denied-" + verb + "-" + resource, deniedVerb: verb, deniedResource: resource, networkPolicy: true})
+		}
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(workerenv.CodeExecKubernetesNetworkPolicy, boolString(test.networkPolicy))
+			clientset, reviews := externalToolReviews(t, func(spec authorizationv1.SubjectAccessReviewSpec) (runtime.Object, error) {
+				a := spec.ResourceAttributes
+				require.Equal(t, externalToolNamespace, a.Namespace)
+				return externalToolReview(a.Verb != test.deniedVerb || a.Resource != test.deniedResource), nil
+			})
+			scheme := runtime.NewScheme()
+			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, networkingv1.AddToScheme} {
+				require.NoError(t, add(scheme))
+			}
+			creates := 0
+			backend := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if creates == 0 {
+						permissions := []authorizationv1.ResourceAttributes{
+							{Resource: "secrets"}, {Resource: "serviceaccounts"}, {Group: "batch", Resource: "jobs"},
+							{Group: "networking.k8s.io", Resource: "networkpolicies"},
+						}
+						if !test.networkPolicy {
+							permissions = permissions[:3]
+						}
+						for _, permission := range permissions {
+							permission.Namespace = externalToolNamespace
+							for _, verb := range []string{"create", "delete"} {
+								permission.Verb = verb
+								permission.Name = ""
+								if verb == "delete" {
+									permission.Name = obj.GetName()
+								}
+								require.True(t, slices.ContainsFunc(*reviews, func(spec authorizationv1.SubjectAccessReviewSpec) bool {
+									return reflect.DeepEqual(*spec.ResourceAttributes, permission)
+								}), "missing %s %s preflight before the first create", verb, permission.Resource)
+							}
+						}
+					}
+					creates++
+					if test.rejectResource == "serviceaccounts" {
+						if _, ok := obj.(*corev1.ServiceAccount); ok {
+							return errors.New("fixture admission rejected")
+						}
+					}
+					if test.rejectResource == "jobs" {
+						if _, ok := obj.(*batchv1.Job); ok {
+							return errors.New("fixture admission rejected")
+						}
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					err := c.Get(ctx, key, obj, opts...)
+					if job, ok := obj.(*batchv1.Job); ok && err == nil {
+						job.Status.Succeeded = 1
+					}
+					return err
+				},
+			}).Build()
+			tc := &tools.ToolContext{Client: backend, KubeClient: clientset, Namespace: externalToolNamespace}
+			authorizeExternalToolContext(tc, externalToolUser(), nil)
+			executor := &tools.KubernetesJobCodeExecutor{}
+			result := executor.Execute(tools.WithToolContext(t.Context(), tc), tools.CodeExecutionRequest{
+				Language: "python", Code: "pass", Timeout: time.Second,
+			})
+			for _, list := range []client.ObjectList{&corev1.SecretList{}, &corev1.ServiceAccountList{}, &networkingv1.NetworkPolicyList{}, &batchv1.JobList{}} {
+				require.NoError(t, backend.List(t.Context(), list, client.InNamespace(externalToolNamespace)))
+				items, err := meta.ExtractList(list)
+				require.NoError(t, err)
+				require.Zero(t, len(items), "temporary %T resources survived", list)
+			}
+			require.Equal(t, test.wantCreates, creates)
+			switch {
+			case test.wantCreates == 0:
+				require.Contains(t, result.Error, "not authorized")
+				require.True(t, slices.ContainsFunc(*reviews, func(spec authorizationv1.SubjectAccessReviewSpec) bool {
+					return spec.ResourceAttributes.Resource == test.deniedResource && spec.ResourceAttributes.Verb == test.deniedVerb
+				}))
+			case test.rejectResource != "":
+				require.Contains(t, result.Error, "fixture admission rejected")
+			default:
+				require.Empty(t, result.Error)
+				require.Zero(t, result.ExitCode)
+			}
+		})
+	}
+}
 
 func TestExternalToolExecutorEditorAgentUpdateRole(t *testing.T) {
 	data, err := os.ReadFile("../../config/rbac/api_editor_role.yaml")

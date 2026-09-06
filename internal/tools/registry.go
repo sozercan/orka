@@ -103,11 +103,14 @@ type ToolContext struct {
 	AuthorizeAgentCreate func(context.Context, *corev1alpha1.Agent) *ChatToolError
 	// AuthorizeAgentInitialTask preflights the combined Agent/Task operation
 	// before creating the Agent. Full Task authorization still runs later.
-	AuthorizeAgentInitialTask      func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeAgentUpdate           func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeAgentDelete           func(context.Context, *corev1alpha1.Agent) *ChatToolError
-	AuthorizeSecretRead            func(context.Context, string, string) *ChatToolError
-	AuthorizePodLogs               func(context.Context, string, string) error
+	AuthorizeAgentInitialTask func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeAgentUpdate      func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeAgentDelete      func(context.Context, *corev1alpha1.Agent) *ChatToolError
+	AuthorizeSecretRead       func(context.Context, string, string) *ChatToolError
+	AuthorizePodLogs          func(context.Context, string, string) error
+	// AuthorizeCodeExecResources checks creation and cleanup permissions for
+	// the complete temporary resource set before code_exec creates anything.
+	AuthorizeCodeExecResources     func(context.Context, []client.Object) error
 	RequireSecretReadAuthorization bool
 	IncrementTasks                 func()
 	ApprovalEmitter                func(context.Context, approvals.ApprovalTarget) error

@@ -509,6 +509,16 @@ func (e *KubernetesJobCodeExecutor) createResources(ctx context.Context, c crcli
 	if resources == nil || resources.job == nil || resources.secret == nil || resources.serviceAccount == nil {
 		return created, fmt.Errorf("required Kubernetes resources are not configured")
 	}
+	if tc := GetToolContext(ctx); tc != nil && tc.AuthorizeCodeExecResources != nil {
+		objects := make([]crclient.Object, 0, 4)
+		objects = append(objects, resources.secret, resources.serviceAccount, resources.job)
+		if resources.networkPolicy != nil {
+			objects = append(objects, resources.networkPolicy)
+		}
+		if err := tc.AuthorizeCodeExecResources(ctx, objects); err != nil {
+			return created, fmt.Errorf("resource authorization: %w", err)
+		}
+	}
 
 	if wasCreated, err := createKubernetesCodeExecObject(ctx, c, resources.secret); err != nil {
 		return created, fmt.Errorf("secret: %w", err)
@@ -1532,9 +1542,15 @@ func (e *KubernetesJobCodeExecutor) cleanupResources(c crclient.Client, resource
 	defer cancel()
 
 	deleteKubernetesCodeExecJob(cleanupCtx, c, resources.job)
-	deleteKubernetesCodeExecObject(cleanupCtx, c, resources.secret)
-	deleteKubernetesCodeExecObject(cleanupCtx, c, resources.serviceAccount)
-	deleteKubernetesCodeExecObject(cleanupCtx, c, resources.networkPolicy)
+	if resources.secret != nil {
+		deleteKubernetesCodeExecObject(cleanupCtx, c, resources.secret)
+	}
+	if resources.serviceAccount != nil {
+		deleteKubernetesCodeExecObject(cleanupCtx, c, resources.serviceAccount)
+	}
+	if resources.networkPolicy != nil {
+		deleteKubernetesCodeExecObject(cleanupCtx, c, resources.networkPolicy)
+	}
 }
 
 func deleteKubernetesCodeExecJob(ctx context.Context, c crclient.Client, job *batchv1.Job) {

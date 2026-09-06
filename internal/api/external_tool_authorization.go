@@ -46,6 +46,17 @@ func authorizeExternalToolContext(tc *tools.ToolContext, userInfo *UserInfo, eve
 		return authorization.authorize(ctx, namespace, "get", "", "pods/log", podName)
 	}
 	if userInfo != nil && userInfo.AuthType == AuthTypeTokenReview {
+		tc.AuthorizeCodeExecResources = func(ctx context.Context, objects []client.Object) error {
+			for _, obj := range objects {
+				if err := authorizedClient.authorize(ctx, obj, obj.GetNamespace(), "create", ""); err != nil {
+					return err
+				}
+				if err := authorizedClient.authorize(ctx, obj, obj.GetNamespace(), "delete", obj.GetName()); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		tc.AuthorizeAgentInitialTask = func(ctx context.Context, agent *corev1alpha1.Agent) *tools.ChatToolError {
 			for _, resource := range []string{"agents", externalToolTaskResource} {
 				if err := authorization.authorize(ctx, agent.Namespace, "create", corev1alpha1.GroupVersion.Group, resource, ""); err != nil {

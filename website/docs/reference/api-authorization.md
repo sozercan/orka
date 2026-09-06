@@ -256,6 +256,9 @@ permissions above. The editor also covers the listed Orka mutations and their
 secondary permissions. Nested tools that run Kubernetes workloads need separate
 workload grants, including `get` on `pods/log` when reading Pod logs. Neither
 helper grants Secrets or workspace-class use.
+Kubernetes `code_exec` preflights `create` and `delete` on its temporary Secrets,
+ServiceAccounts, Jobs, and optional NetworkPolicies before creating any of them.
+The delete permissions cover cleanup after completion or failed setup.
 The source files in `config/rbac` have unprefixed names when applied directly.
 
 Existing Task helper roles retain session access; Task editor/admin roles also
