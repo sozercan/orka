@@ -11,6 +11,8 @@ fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${root}/scripts/live-acp-runtime-e2e.sh"
+# shellcheck source=scripts/lib/live-acp-release-report.sh
+. "${root}/scripts/lib/live-acp-release-report.sh"
 export ACP_E2E_OPENCODE_CONTEXT_WINDOW=32768
 export ACP_E2E_OPENCODE_MAX_TOKENS=4096
 body="$(awk '/^delete_test_namespace_now\(\) \{/,/^\}$/' "${script}")"

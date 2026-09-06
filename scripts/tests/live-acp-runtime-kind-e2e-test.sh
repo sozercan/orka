@@ -258,7 +258,7 @@ printf '%s\n' 'ok - Vekil preflight requires endpoint metadata and live streamin
 
 fake_bin="$(mktemp -d "${TMPDIR:-/tmp}/live-acp-kind-test.XXXXXX")"
 trap 'rm -rf "${fake_bin}"' EXIT
-for command in curl gh git go jq kind kubectl make python3; do
+for command in curl gh go kind kubectl make python3; do
   cat >"${fake_bin}/${command}" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -349,7 +349,24 @@ if [[ "${cleanup_failure_status}" -ne 23 ]]; then
 fi
 printf '%s\n' 'ok - Kind cleanup failure fails successful validation without masking validator failures'
 
+finish_body="$(awk '/^finish_kind_run\(\) \{/,/^\}$/' "${wrapper}")"
+if (
+  eval "${finish_body}"
+  live_acp_kind_cleanup() { return 1; }
+  acp_report_update() { :; }
+  acp_report_finish() { :; }
+  preflight_only=0
+  LIVE_ACP_KEEP_CLUSTER=0
+  trap finish_kind_run EXIT
+  exit 0
+); then
+  echo 'wrapper EXIT trap discarded a cleanup failure after successful validation' >&2
+  exit 1
+fi
+printf '%s\n' 'ok - wrapper exit status includes cluster cleanup failures'
+
 provider_sentinel='must-not-appear-in-output'
+export ACP_E2E_REPORT_FILE="${fake_bin}/acceptance.json"
 output="$(PATH="${fake_bin}:${PATH}" COPILOT_GITHUB_TOKEN="${provider_sentinel}" "${wrapper}" --preflight-only 2>&1)"
 grep -F 'preflight passed' <<<"${output}" >/dev/null
 if grep -F "${provider_sentinel}" <<<"${output}" >/dev/null; then
@@ -374,6 +391,8 @@ if PATH="${fake_bin}:${PATH}" RELEASE_GATE=1 COPILOT_GITHUB_TOKEN="${provider_se
 fi
 grep -F 'ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN is required when RELEASE_GATE=1' \
   "${fake_bin}/release-missing.out" >/dev/null
+jq -e '.result == "not_qualified" and .bootstrapExitCode == 1
+  and .failure.credential == "ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN"' "${ACP_E2E_REPORT_FILE}" >/dev/null
 
 source_read_sentinel='source-read-value'
 target_read_sentinel='target-read-value'
@@ -400,6 +419,10 @@ for value in "${provider_sentinel}" "${source_read_sentinel}" "${target_read_sen
     "${target_write_sentinel}" "${forge_sentinel}"; do
   if grep -F "${value}" <<<"${release_output}" >/dev/null; then
     echo 'release preflight leaked a provider or publication credential' >&2
+    exit 1
+  fi
+  if grep -F "${value}" "${ACP_E2E_REPORT_FILE}" >/dev/null; then
+    echo 'release report leaked a provider or publication credential' >&2
     exit 1
   fi
 done
