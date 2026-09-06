@@ -2,6 +2,27 @@ package store
 
 import "time"
 
+// ScanTaskIdentity binds ingestion to one Kubernetes Task incarnation and run.
+type ScanTaskIdentity struct {
+	Namespace      string
+	RepositoryScan string
+	ScanRunID      string
+	TaskName       string
+	TaskUID        string
+	Stage          string
+	SliceID        string
+}
+
+// ScanTaskIngestion is committed with the Task's results and run counters.
+// Follow-up work uses this receipt instead of parsing and counting results again.
+type ScanTaskIngestion struct {
+	ScanTaskIdentity
+	FindingIDs          []string
+	DroppedFindingsJSON string
+	Completed           bool
+	IngestedAt          time.Time
+}
+
 // ScanRun represents a single repository security scan execution.
 type ScanRun struct {
 	ID                   string     `json:"id"`

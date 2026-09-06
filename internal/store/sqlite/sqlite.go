@@ -310,6 +310,20 @@ func migrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_security_scan_runs_repo
 			ON security_scan_runs(namespace, repository_scan, started_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS security_scan_task_ingestions (
+			namespace TEXT NOT NULL,
+			repository_scan TEXT NOT NULL,
+			scan_run_id TEXT NOT NULL,
+			task_name TEXT NOT NULL,
+			task_uid TEXT NOT NULL,
+			stage TEXT NOT NULL,
+			slice_id TEXT NOT NULL,
+			finding_ids_json TEXT NOT NULL DEFAULT '[]',
+			dropped_findings_json TEXT NOT NULL DEFAULT '',
+			completed BOOLEAN NOT NULL DEFAULT FALSE,
+			ingested_at TIMESTAMP NOT NULL,
+			PRIMARY KEY (namespace, scan_run_id, task_name, task_uid)
+		)`,
 		`CREATE TABLE IF NOT EXISTS security_threat_models (
 			namespace         TEXT NOT NULL,
 			repository_scan   TEXT NOT NULL,
@@ -1322,6 +1336,7 @@ func sqlitePrimaryKeyColumns(db *sql.DB, table string) ([]string, error) {
 // Store implements both store.ResultStore and store.SessionStore.
 type Store struct {
 	db               *sql.DB
+	securityTx       *sql.Tx
 	dbPath           string
 	processLock      io.Closer
 	executionEventMu sync.Mutex
