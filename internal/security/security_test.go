@@ -494,6 +494,7 @@ func TestGeneratedSecurityTaskNamesStayLabelSafe(t *testing.T) {
 		ScanStageTaskName(scanName, "initial", "discovery", "ci-cd-supply-chain"),
 		ScanStageTaskName(scanName, "initial", "discovery", "ci-cd-supply-chain-4"),
 		ScanStageRetryTaskName(scanName, "scan_1234567890abcdef", StageReview, "ci-cd-supply-chain", 1),
+		AutoValidationTaskName(scanName, "fnd_1234567890abcdef", "scan_1234567890abcdef"),
 		PatchTaskName(scanName, "fnd_1234567890abcdef", "scan_1234567890abcdef"),
 	}
 

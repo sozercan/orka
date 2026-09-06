@@ -2024,9 +2024,9 @@ func (r *RepositoryScanReconciler) shouldAutoValidateFinding(scan *corev1alpha1.
 	}
 }
 
-func (r *RepositoryScanReconciler) hasActiveValidationTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, findingID, scanRunID string) (bool, error) {
+func (r *RepositoryScanReconciler) validationTaskForFinding(ctx context.Context, scan *corev1alpha1.RepositoryScan, findingID, scanRunID string) (*corev1alpha1.Task, error) {
 	if r.Client == nil {
-		return false, nil
+		return nil, nil
 	}
 	selector := map[string]string{
 		labels.LabelSecurityTarget:    labels.SelectorValue(scan.Name),
@@ -2041,17 +2041,19 @@ func (r *RepositoryScanReconciler) hasActiveValidationTask(ctx context.Context, 
 		client.InNamespace(scan.Namespace),
 		client.MatchingLabels(selector),
 	); err != nil {
-		return false, err
+		return nil, err
 	}
+	var latest *corev1alpha1.Task
 	for i := range tasks.Items {
-		if isActiveTaskPhase(tasks.Items[i].Status.Phase) {
-			return true, nil
+		task := &tasks.Items[i]
+		if latest == nil || latest.CreationTimestamp.Before(&task.CreationTimestamp) {
+			latest = task
 		}
 	}
-	return false, nil
+	return latest, nil
 }
 
-func (r *RepositoryScanReconciler) createValidationTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding) error {
+func (r *RepositoryScanReconciler) ensureValidationTask(ctx context.Context, scan *corev1alpha1.RepositoryScan, finding *store.Finding, existing *corev1alpha1.Task) error {
 	if r.Client == nil {
 		return nil
 	}
@@ -2080,11 +2082,7 @@ func (r *RepositoryScanReconciler) createValidationTask(ctx context.Context, sca
 	}
 	timeout := metav1.Duration{Duration: 90 * time.Minute}
 	priority := int32(725)
-	taskScope := finding.ID
-	if scanRunID := strings.TrimSpace(finding.ScanRunID); scanRunID != "" {
-		taskScope += "-" + scanRunID
-	}
-	taskName := security.ScanStageTaskName(scan.Name, "validation", security.StageValidation, taskScope)
+	taskName := security.AutoValidationTaskName(scan.Name, finding.ID, finding.ScanRunID)
 	resultBinding := security.AgentResultBinding{
 		RepositoryScan: scan.Name,
 		ScanID:         finding.ScanRunID,
@@ -2117,17 +2115,23 @@ func (r *RepositoryScanReconciler) createValidationTask(ctx context.Context, sca
 	if err := controllerutil.SetControllerReference(scan, task, r.Scheme); err != nil {
 		return err
 	}
-	if err := r.Create(ctx, task); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return err
+	if existing != nil {
+		// Recover older timestamp-named Tasks and manually requested validation
+		// for this occurrence using the same identity and spec checks.
+		task.Name = existing.Name
+	} else {
+		if err := r.Create(ctx, task); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return err
+			}
+			existing = &corev1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), existing); err != nil {
+				return err
+			}
 		}
-		existing := &corev1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), existing); err != nil {
-			return err
-		}
-		if !matchingRepositoryScanTask(existing, task) {
-			return fmt.Errorf("%w: validation Task does not match the recorded scan finding", store.ErrConflict)
-		}
+	}
+	if existing != nil && !matchingRepositoryScanTask(existing, task) {
+		return fmt.Errorf("%w: validation Task does not match the recorded scan finding", store.ErrConflict)
 	}
 
 	finding.ValidationStatus = findingValidationStatusPending
@@ -3073,7 +3077,8 @@ func (r *RepositoryScanReconciler) validationTaskCountForScanRun(ctx context.Con
 func (r *RepositoryScanReconciler) enqueueAutoValidationTasks(ctx context.Context, scan *corev1alpha1.RepositoryScan, findings []*store.Finding) error {
 	createdByRun := map[string]int{}
 	for _, finding := range findings {
-		if finding == nil {
+		if finding == nil || finding.ValidationStatus == findingValidationStatusValidated ||
+			finding.ValidationStatus == findingValidationStatusPending {
 			continue
 		}
 		created, ok := createdByRun[finding.ScanRunID]
@@ -3083,27 +3088,23 @@ func (r *RepositoryScanReconciler) enqueueAutoValidationTasks(ctx context.Contex
 				return err
 			}
 			created = existing
-		}
-		if !r.shouldAutoValidateFinding(scan, finding, created) {
 			createdByRun[finding.ScanRunID] = created
-			continue
 		}
-		if finding.ValidationStatus == findingValidationStatusValidated ||
-			finding.ValidationStatus == findingValidationStatusPending {
-			continue
-		}
-		active, err := r.hasActiveValidationTask(ctx, scan, finding.ID, finding.ScanRunID)
+		existing, err := r.validationTaskForFinding(ctx, scan, finding.ID, finding.ScanRunID)
 		if err != nil {
 			return err
 		}
-		if active {
+		// Creation may have succeeded before its response or the finding update
+		// was lost. Recover it in any phase, even if it already consumed the cap.
+		if existing == nil && !r.shouldAutoValidateFinding(scan, finding, created) {
 			continue
 		}
-		if err := r.createValidationTask(ctx, scan, finding); err != nil {
+		if err := r.ensureValidationTask(ctx, scan, finding, existing); err != nil {
 			return err
 		}
-		created++
-		createdByRun[finding.ScanRunID] = created
+		if existing == nil {
+			createdByRun[finding.ScanRunID] = created + 1
+		}
 	}
 	return nil
 }
@@ -3503,7 +3504,23 @@ func matchingRepositoryScanTask(existing, desired *corev1alpha1.Task) bool {
 		existingOwner.UID != desiredOwner.UID {
 		return false
 	}
-	return apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec)
+	return apiequality.Semantic.DeepEqual(comparableRepositoryScanTaskSpec(existing.Spec), comparableRepositoryScanTaskSpec(desired.Spec))
+}
+
+func comparableRepositoryScanTaskSpec(spec corev1alpha1.TaskSpec) corev1alpha1.TaskSpec {
+	// Admission owns provenance. Scheduler defaults do not affect these
+	// unscheduled Tasks; retain every execution field for the comparison.
+	spec.RequestedBy = nil
+	spec.Transaction = nil
+	if spec.Schedule == "" {
+		spec.TimeZone = nil
+		spec.ConcurrencyPolicy = ""
+		spec.StartingDeadlineSeconds = nil
+		spec.SuccessfulRunsHistoryLimit = nil
+		spec.FailedRunsHistoryLimit = nil
+		spec.Suspend = nil
+	}
+	return spec
 }
 
 func capAcceptedFindingsForRun(scan *corev1alpha1.RepositoryScan, run *store.ScanRun, accepted []*store.Finding) ([]*store.Finding, []security.DroppedFindingDiagnostic) {

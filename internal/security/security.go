@@ -357,6 +357,17 @@ func ScanStageRetryTaskName(repositoryScanName, scanRunID, stage, scope string, 
 	return boundedTaskName(parts...)
 }
 
+// AutoValidationTaskName binds automatic validation to one finding occurrence
+// so a delayed retry cannot create another Task after a lost creation response.
+func AutoValidationTaskName(repositoryScanName, findingID, scanRunID string) string {
+	return boundedTaskName(
+		sanitizeName(repositoryScanName),
+		"auto-validation",
+		sanitizeName(findingID),
+		sanitizeName(scanRunID),
+	)
+}
+
 // PatchTaskName returns a task name for a patch proposal bound to one finding
 // occurrence.
 func PatchTaskName(repositoryScanName, findingID, scanRunID string) string {

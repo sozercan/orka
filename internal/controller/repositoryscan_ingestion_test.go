@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -323,30 +324,89 @@ func (s *failingScanArtifactStore) SaveArtifact(context.Context, string, string,
 	return errScanIngestionFollowup
 }
 
-type lostValidationCreateResponse struct{ client.Client }
+type lostValidationCreateResponse struct {
+	client.Client
+	legacyName bool
+}
 
 func (c *lostValidationCreateResponse) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if c.legacyName {
+		task := obj.(*corev1alpha1.Task)
+		task.Name = security.ScanStageTaskName(task.Labels[labels.LabelSecurityTarget], "validation", security.StageValidation,
+			task.Labels[labels.LabelSecurityFindingID]+"-"+task.Labels[labels.LabelSecurityScanID])
+	}
 	if err := c.Client.Create(ctx, obj, opts...); err != nil {
 		return err
 	}
 	return errScanIngestionFollowup
 }
 
+type missingValidationTaskList struct{ client.Client }
+
+func (c *missingValidationTaskList) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := c.Client.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if tasks, ok := list.(*corev1alpha1.TaskList); ok {
+		tasks.Items = slices.DeleteFunc(tasks.Items, func(task corev1alpha1.Task) bool {
+			return taskSecurityStage(&task) == security.StageValidation
+		})
+	}
+	return nil
+}
+
+func defaultRecoveredScanTask(task *corev1alpha1.Task) {
+	task.Spec.ConcurrencyPolicy = corev1alpha1.ForbidConcurrent
+	task.Spec.StartingDeadlineSeconds = new(int64(100))
+	task.Spec.SuccessfulRunsHistoryLimit = new(int32(3))
+	task.Spec.FailedRunsHistoryLimit = new(int32(1))
+	task.Spec.RequestedBy = &corev1alpha1.RequestedBy{Subject: "controller"}
+	task.Spec.Transaction = &corev1alpha1.TaskTransaction{ID: "test-transaction-metadata"}
+}
+
 func TestReviewIngestionResumesFollowupWithoutRecounting(t *testing.T) {
-	for _, fault := range []string{"artifact", "validation create response"} {
-		t.Run(fault, func(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		validationMode string
+		phase          corev1alpha1.TaskPhase
+		delayedCache   bool
+		legacyName     bool
+	}{
+		{name: "artifact"},
+		{name: "validation unobserved", validationMode: "full"},
+		{name: "validation pending", validationMode: "full", phase: corev1alpha1.TaskPhasePending},
+		{name: "validation running at cap", validationMode: "light", phase: corev1alpha1.TaskPhaseRunning},
+		{name: "validation succeeded at cap", validationMode: "light", phase: corev1alpha1.TaskPhaseSucceeded},
+		{name: "validation defaulted after delayed cache", validationMode: "full", phase: corev1alpha1.TaskPhaseSucceeded, delayedCache: true},
+		{name: "timestamp-named validation", validationMode: "full", phase: corev1alpha1.TaskPhasePending, legacyName: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
 			f := newReviewIngestionFixture(t)
-			if fault == "artifact" {
+			if tt.validationMode == "" {
 				f.reconciler.ArtifactStore = &failingScanArtifactStore{ArtifactStore: f.store}
 			} else {
-				f.scan.Spec.ValidationMode = "full"
-				f.reconciler.Client = &lostValidationCreateResponse{Client: f.client}
+				f.scan.Spec.ValidationMode = tt.validationMode
+				f.scan.Spec.ValidationMaxFindingsPerRun = new(int32(1))
+				f.reconciler.Client = &lostValidationCreateResponse{Client: f.client, legacyName: tt.legacyName}
 			}
 			require.ErrorIs(t, f.reconciler.ingestScanTask(f.ctx, f.scan, f.sourceTask), errScanIngestionFollowup)
 			identity := scanTaskIngestionIdentity(f.scan, f.sourceTask)
 			receipt, err := f.store.GetScanTaskIngestion(f.ctx, identity)
 			require.NoError(t, err)
 			require.False(t, receipt.Completed)
+			require.Len(t, receipt.FindingIDs, 1)
+			finding, err := f.store.GetFinding(f.ctx, defaultNS, receipt.FindingIDs[0])
+			require.NoError(t, err)
+			require.Equal(t, "unvalidated", finding.ValidationStatus)
+			if tt.validationMode != "" {
+				var tasks corev1alpha1.TaskList
+				require.NoError(t, f.client.List(f.ctx, &tasks, client.MatchingLabels{labels.LabelSecurityStage: security.StageValidation}))
+				require.Len(t, tasks.Items, 1)
+				task := &tasks.Items[0]
+				defaultRecoveredScanTask(task)
+				task.Status.Phase = tt.phase
+				require.NoError(t, f.client.Update(f.ctx, task))
+			}
 			before, err := f.store.GetScanRun(f.ctx, defaultNS, f.run.ID)
 			require.NoError(t, err)
 			require.Equal(t, 1, before.ReviewedSliceCount)
@@ -357,7 +417,13 @@ func TestReviewIngestionResumesFollowupWithoutRecounting(t *testing.T) {
 			require.NoError(t, f.store.DeleteResult(f.ctx, defaultNS, f.sourceTask.Name))
 			f.slice.LastScanRunID = "later-run"
 			require.NoError(t, f.store.UpsertReviewSlice(f.ctx, f.slice))
-			restarted := &RepositoryScanReconciler{Client: f.client, Scheme: f.reconciler.Scheme, SecurityStore: f.store, ArtifactStore: f.store}
+			restarted := &RepositoryScanReconciler{Client: f.client, Scheme: f.reconciler.Scheme, SecurityStore: f.store, ArtifactStore: f.store, ResultStore: f.store}
+			if tt.delayedCache {
+				// Lists can lag a successful creation. Retrying after the old
+				// timestamp name would change must still hit AlreadyExists.
+				restarted.Client = &missingValidationTaskList{Client: f.client}
+				time.Sleep(time.Second)
+			}
 			for range 3 {
 				require.NoError(t, restarted.ingestScanTask(f.ctx, f.scan, f.sourceTask))
 			}
@@ -375,11 +441,69 @@ func TestReviewIngestionResumesFollowupWithoutRecounting(t *testing.T) {
 			require.JSONEq(t, receipt.DroppedFindingsJSON, string(data))
 			var tasks corev1alpha1.TaskList
 			require.NoError(t, f.client.List(f.ctx, &tasks, client.MatchingLabels{labels.LabelSecurityStage: security.StageValidation}))
-			if fault == "validation create response" {
+			if tt.validationMode != "" {
 				require.Len(t, tasks.Items, 1)
+				finding, err = f.store.GetFinding(f.ctx, defaultNS, receipt.FindingIDs[0])
+				require.NoError(t, err)
+				require.Equal(t, findingValidationStatusPending, finding.ValidationStatus)
+				if tt.phase == corev1alpha1.TaskPhaseSucceeded {
+					task := &tasks.Items[0]
+					saveValidationTaskResult(t, f.store, task, f.scan.Name, f.run.ID, f.run.PolicyDigest, security.ValidationArtifact{
+						Version: 1, FindingID: finding.ID, Status: findingValidationStatusValidated,
+						Summary: "Confirmed missing ownership check", ValidationSteps: []string{"Trace the request to the handler"},
+						AttackPathAnalysis: "An authenticated caller supplies another user's record ID to the handler.",
+					})
+					require.NoError(t, restarted.ingestValidationTask(f.ctx, f.scan, task))
+					require.NoError(t, restarted.ingestScanTask(f.ctx, f.scan, f.sourceTask))
+					finding, err = f.store.GetFinding(f.ctx, defaultNS, finding.ID)
+					require.NoError(t, err)
+					require.Equal(t, findingValidationStatusValidated, finding.ValidationStatus)
+				}
 			} else {
 				require.Empty(t, tasks.Items)
 			}
+		})
+	}
+}
+
+func TestReviewIngestionRejectsConflictingValidationTask(t *testing.T) {
+	for name, mutate := range map[string]func(*corev1alpha1.Task){
+		"owner": func(task *corev1alpha1.Task) { task.OwnerReferences[0].UID = "another-scan" },
+		"run": func(task *corev1alpha1.Task) {
+			task.Labels[labels.LabelSecurityScanID] = "another-run"
+		},
+		"prompt":    func(task *corev1alpha1.Task) { task.Spec.Prompt = "different instructions" },
+		"workspace": func(task *corev1alpha1.Task) { task.Spec.Workspace.GitRepo = "https://github.com/example/other" },
+		"agent":     func(task *corev1alpha1.Task) { task.Spec.AgentRef.Name = "other-agent" },
+		"schedule":  func(task *corev1alpha1.Task) { task.Spec.Schedule = "0 * * * *" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newReviewIngestionFixture(t)
+			f.scan.Spec.ValidationMode = "full"
+			f.reconciler.Client = &lostValidationCreateResponse{Client: f.client}
+			require.ErrorIs(t, f.reconciler.ingestScanTask(f.ctx, f.scan, f.sourceTask), errScanIngestionFollowup)
+			var tasks corev1alpha1.TaskList
+			require.NoError(t, f.client.List(f.ctx, &tasks, client.MatchingLabels{labels.LabelSecurityStage: security.StageValidation}))
+			require.Len(t, tasks.Items, 1)
+			task := &tasks.Items[0]
+			defaultRecoveredScanTask(task)
+			mutate(task)
+			require.NoError(t, f.client.Update(f.ctx, task))
+			before, err := f.store.GetScanRun(f.ctx, defaultNS, f.run.ID)
+			require.NoError(t, err)
+			f.reconciler.Client = f.client
+			require.ErrorIs(t, f.reconciler.ingestScanTask(f.ctx, f.scan, f.sourceTask), store.ErrConflict)
+			receipt, err := f.store.GetScanTaskIngestion(f.ctx, scanTaskIngestionIdentity(f.scan, f.sourceTask))
+			require.NoError(t, err)
+			require.False(t, receipt.Completed)
+			finding, err := f.store.GetFinding(f.ctx, defaultNS, receipt.FindingIDs[0])
+			require.NoError(t, err)
+			require.Equal(t, "unvalidated", finding.ValidationStatus)
+			after, err := f.store.GetScanRun(f.ctx, defaultNS, f.run.ID)
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+			require.NoError(t, f.client.List(f.ctx, &tasks, client.MatchingLabels{labels.LabelSecurityStage: security.StageValidation}))
+			require.Len(t, tasks.Items, 1)
 		})
 	}
 }
