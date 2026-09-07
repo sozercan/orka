@@ -57,7 +57,8 @@ for role in controller publisher codex opencode claude copilot; do
   acp_report_update '.builtImages[$role] = $ref' --arg role "${role}" --arg ref "${ref}"
 done
 acp_report_update '
-  .validation = "passed" | .validatorExitCode = 0 | .bootstrapExitCode = 0
+  .validation = "passed" | .validatorStarted = true | .validatorExitCode = 0 | .bootstrapExitCode = 0
+  | .expectedBranch = .task.delivery.branch
   | .checks |= with_entries(.value = true)
   | .canary = {path:"canary.txt",expectedCommitBytesMatched:true,remoteBytesMatched:true,singleAddedFile:true}
   | .cleanup |= with_entries(.value = "passed")
@@ -94,6 +95,7 @@ done <<'MUTATIONS'
 .candidateSHA = "0000000000000000000000000000000000000000"
 .sourceRepository = .publicationRepository
 .validation = "not_started"
+.validatorStarted = false
 .validatorExitCode = 1
 .bootstrapExitCode = 1
 .checks.publication = false
@@ -106,6 +108,7 @@ done <<'MUTATIONS'
 .observations.remoteHead = "0000000000000000000000000000000000000000"
 .observations.pullRequest.number = 43
 .observations.pullRequest.headBranch = "somebody-elses-branch"
+.expectedBranch = "somebody-elses-branch"
 .observations.pullRequest.sourceRepository = .publicationRepository
 .task.delivery.prReceipt = null
 .task.delivery.artifactDigest = null
@@ -210,3 +213,29 @@ done <<'MUTATIONS'
 .conclusion = "failure"
 MUTATIONS
 printf '%s\n' 'ok - workflow reruns and status changes during artifact download invalidate qualification'
+
+awk '
+  $0 == "      - name: Validate trusted dispatch inputs" { step=1; next }
+  step && $0 == "        run: |" { body=1; next }
+  body && /^      - name:/ { exit }
+  body { sub(/^          /, ""); print }
+' "${root}/.github/workflows/live-acp-release-gate.yml" >"${fixture}/dispatch.sh"
+[[ -s "${fixture}/dispatch.sh" ]]
+validate_dispatch() {
+  CHECKED_OUT_SHA="${GITHUB_SHA}" DEFAULT_BRANCH=main PR_BASE=main \
+    CONFIGURED_PUBLICATION_REPOSITORY=https://github.com/sozercan/orka-acp-release-gate.git \
+    SOURCE_REF="${GITHUB_SHA}" SOURCE_REPOSITORY=https://github.com/orka-agents/orka.git \
+    bash "${fixture}/dispatch.sh"
+}
+for publication in https://github.com/sozercan/orka-acp-release-gate.git https://github.com/sozercan/orka-acp-release-gate; do
+  ACP_E2E_WRITE_PUBLICATION_REPO="${publication}" validate_dispatch
+done
+if GITHUB_REF=refs/pull/42/merge validate_dispatch >/dev/null 2>&1; then
+  echo 'trusted dispatch accepted a pull-request ref' >&2
+  exit 1
+fi
+if ACP_E2E_WRITE_PUBLICATION_REPO=https://github.com/other/fork.git validate_dispatch >/dev/null 2>&1; then
+  echo 'trusted dispatch accepted an unconfigured publication target' >&2
+  exit 1
+fi
+printf '%s\n' 'ok - actual dispatch guard accepts the documented .git URL and rejects untrusted refs and targets'

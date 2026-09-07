@@ -187,4 +187,7 @@ validator_args+=(--namespace "${namespace}")
 # namespace cannot contain unrelated RuntimePool consumers.
 export ACP_E2E_ALLOW_SHARED_POOL_MUTATION="${ACP_E2E_ALLOW_SHARED_POOL_MUTATION:-1}"
 live_acp_kind_log "Running canonical live ACP runtime validator"
+# Persist this before launching the child. If it is killed, an absent Task
+# receipt alone cannot establish that publication never started.
+acp_report_update '.validatorStarted = true'
 "${LIVE_ACP_VALIDATOR_SCRIPT}" "${validator_args[@]}"

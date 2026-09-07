@@ -204,6 +204,7 @@ if [[ "${release_gate}" -eq 1 ]]; then
   if [[ "${LIVE_ACP_REPORT_INITIALIZED:-0}" != "1" ]]; then
     acp_report_init "${script_dir}/.."
   fi
+  acp_report_update '.validatorStarted = true'
 fi
 if [[ "${run_id}" != "${run_id_full}" ]]; then
   warn "ACP_E2E_RUN_ID was normalized to 24 characters to preserve unique resource-name suffixes: ${run_id}"
@@ -1042,6 +1043,8 @@ cleanup() {
   if ! cleanup_remote_effects; then
     cleanup_rc=1
     acp_report_update '.cleanup.remote = "preserved"' || true
+  elif [[ "${write_task_started}" -eq 0 ]]; then
+    acp_report_update '.cleanup.remote = "not_required"' || cleanup_rc=1
   fi
 
   if [[ "${keep_resources}" == "1" || "${remote_cleanup_preserve}" == "1" ]]; then
@@ -3254,8 +3257,9 @@ run_write_release_gate() {
   log "Running mandatory Codex clean-room publication and PR reconciliation gate"
   write_task_name="${task}"
   write_task_started=1
-  acp_report_update '.stage = "publication" | .task = {namespace:$ns,name:$task}' \
-    --arg ns "${namespace}" --arg task "${task}"
+  acp_report_update '.stage = "publication" | .expectedBranch = $branch
+    | .task = {namespace:$ns,name:$task}' \
+    --arg ns "${namespace}" --arg task "${task}" --arg branch "${write_branch}"
   apply_write_task "${task}" "${agent}"
   acp_report_task "$(task_json "${task}")"
   wait_until "Task/${task} RuntimePool assignment" "${state_wait_seconds}" wait_task_pool_name_value "${task}"

@@ -46,12 +46,12 @@ acp_report_init() {
         schemaVersion: 1, gate: "live-acp-release-gate", mode: "release",
         candidateSHA: ($candidate | sha), checkoutSHA: ($checkout | sha),
         sourceRepository: ($source | repo), publicationRepository: ($publication | repo),
-        baseBranch: $base, run: $run,
+        baseBranch: $base, expectedBranch: null, run: $run,
         workflow: {repository: $repository, ref: $ref, sha: ($workflowSHA | sha),
           runID: $runID, runAttempt: $attempt, event: $event},
         startedAt: (now | todateiso8601), finishedAt: null,
         result: "not_qualified", stage: "preflight", validation: "not_started",
-        validatorExitCode: null, bootstrapExitCode: null,
+        validatorStarted: false, validatorExitCode: null, bootstrapExitCode: null,
         checks: {publication: false, credentialsFrozen: false,
           publisherSecretReadDenied: false, baseUnchanged: false},
         builtImages: {}, images: {}, task: null, credentials: [],
@@ -118,7 +118,8 @@ acp_report_qualified() {
       and (.candidateSHA | sha) and .candidateSHA == .checkoutSHA
       and .sourceRepository == "https://github.com/orka-agents/orka"
       and (.publicationRepository | present) and .publicationRepository != .sourceRepository
-      and .validation == "passed" and .validatorExitCode == 0 and .bootstrapExitCode == 0
+      and .validation == "passed" and .validatorStarted == true
+      and .validatorExitCode == 0 and .bootstrapExitCode == 0
       and .checks.publication == true and .checks.credentialsFrozen == true
       and .checks.publisherSecretReadDenied == true and .checks.baseUnchanged == true
       and .canary.expectedCommitBytesMatched == true and .canary.remoteBytesMatched == true
@@ -136,6 +137,7 @@ acp_report_qualified() {
       and (.task.delivery.publicationID | present)
       and (.task.delivery.outcome == "VerifiedExact" or .task.delivery.outcome == "DeliveredSuperseded")
       and .task.delivery.startingSHA == .candidateSHA
+      and (.expectedBranch | present) and .task.delivery.branch == .expectedBranch
       and (.task.delivery.expectedCommitSHA | sha) and (.task.delivery.treeSHA | sha)
       and (.task.delivery.artifactDigest | digest)
       and (.observations.remoteHead | sha)

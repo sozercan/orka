@@ -135,6 +135,11 @@ resources, establish writer quiescence and their current identities, and remove
 only confirmed canary effects. Never replace the lease with unconditional branch
 deletion or force-remove Task finalizers to get a passing result.
 
+After the validator starts, cluster teardown requires an explicit completed
+remote-cleanup result, or confirmation that no write Task started. A timeout or
+interrupted cleanup with incomplete evidence preserves the cluster and registry
+and fails qualification, even if the validator could not finish its exit trap.
+
 Local preserved clusters remain available through the run's `kindctl` tag.
 GitHub-hosted runners are disposable, so download the failure artifact for
 inspection; runner disposal does not count as verified cleanup. After resolving

@@ -567,9 +567,22 @@ live_acp_kind_cleanup() {
 # cluster name. It does not repeat or overwrite credential cleanup results.
 live_acp_kind_delete_cluster() {
   local cleanup_status=0
-  if acp_report_enabled && jq -e '.preserved != null' "${ACP_E2E_REPORT_FILE}" >/dev/null; then
-    acp_report_update '.cleanup.cluster = "preserved" | .cleanup.registry = "preserved"' || true
-    return 1
+  if acp_report_enabled; then
+    # A timeout can kill the validator before its EXIT trap records preservation.
+    # Once it was launched, require positive evidence of safe remote cleanup.
+    if ! jq -e '
+        .schemaVersion == 1 and .gate == "live-acp-release-gate" and .mode == "release"
+        and has("task") and has("preserved") and .preserved == null
+        and ((.validatorStarted == false and .task == null) or (.validatorStarted == true
+          and (.cleanup.remote == "passed" or (.cleanup.remote == "not_required" and .task == null))))
+      ' "${ACP_E2E_REPORT_FILE}" >/dev/null; then
+      live_acp_kind_log "Preserving Kind resources: remote cleanup is incomplete or unproven"
+      acp_report_update '.cleanup.cluster = "preserved" | .cleanup.registry = "preserved"
+        | .preserved //= {reason:"remote_cleanup_unproven", namespace:.task.namespace,
+            task:.task.name, publicationRepository:.publicationRepository,
+            branch:.expectedBranch, receiptHead:.task.delivery.verifiedRemoteSHA}' || true
+      return 1
+    fi
   fi
   if [[ "${LIVE_ACP_REGISTRY_STARTED:-0}" == "1" ]]; then
     # shellcheck source=scripts/lib/kind-local-registry.sh
