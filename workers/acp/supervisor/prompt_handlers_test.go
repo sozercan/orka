@@ -1409,6 +1409,40 @@ func TestWorkspaceDeltaRepositoryControlAndContentPolicies(t *testing.T) {
 	}
 }
 
+func TestWorkspaceDeltaContentPolicyRedactsAndBoundsPaths(t *testing.T) {
+	value := strings.Repeat("0a1b2c3d", 5)
+	for _, name := range []string{
+		"config/API_TOKEN=" + value,
+		"config/AWS_SECRET_ACCESS_KEY=" + value,
+		"config/API_TO\u200bKEN=" + value,
+		"config/" + strings.Repeat("long-path", 100) + "/API_TOKEN=" + value,
+	} {
+		for _, binary := range []bool{false, true} {
+			content := []byte("password=" + value)
+			limits := harnessv2.WorkspaceDeltaLimits{MaxBytes: 1 << 20, RejectSecretLikeContent: true}
+			if binary {
+				content = []byte{'a', 0, 'b'}
+				limits.RejectSecretLikeContent = false
+				limits.RejectBinaryFiles = true
+			}
+			artifact := tarBytes(t, tarEntry{name: "files/" + name, body: content})
+			violation, err := workspaceDeltaContentPolicyViolationContext(context.Background(), artifact, limits, nil)
+			if err != nil || violation == "" {
+				t.Fatal("expected a content policy violation")
+			}
+			if strings.Contains(violation, value) || strings.ContainsRune(violation, '\u200b') {
+				t.Fatal("policy diagnostic exposed credential or control text from a path")
+			}
+			if len(violation) > 600 {
+				t.Fatal("policy diagnostic did not bound the path")
+			}
+		}
+	}
+	if got := workspaceDeltaDiagnosticPath("files/config/settings.yml"); got != "config/settings.yml" {
+		t.Fatalf("ordinary diagnostic path = %q", got)
+	}
+}
+
 type baselineExemptionFixture struct {
 	t          *testing.T
 	root       string

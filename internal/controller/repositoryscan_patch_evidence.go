@@ -121,13 +121,9 @@ func (r *RepositoryScanReconciler) verifyPatchTaskEvidence(
 	if err != nil {
 		return patchVerificationResult{}, repositoryScanNonCanonicalTargetReason, nil
 	}
-	files, reason, err := r.fetchRepositoryScanPublishedCommit(ctx, owner, repository, publication.publication.ExpectedCommitSHA, token)
+	diff, commitPaths, reason, err := r.fetchRepositoryScanPublishedDiff(ctx, owner, repository, publication.publication.ExpectedCommitSHA, token)
 	if err != nil || reason != "" {
 		return patchVerificationResult{}, reason, err
-	}
-	diff, commitPaths, reason := repositoryScanDiffFromPublishedCommit(files)
-	if reason != "" {
-		return patchVerificationResult{}, reason, nil
 	}
 	if _, err := repositoryMonitorPathsFromPatch(diff); err != nil {
 		return patchVerificationResult{}, "published commit diff is not a canonical git diff: " + err.Error(), nil
@@ -219,13 +215,9 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	if err != nil {
 		return repositoryScanNonCanonicalTargetReason, nil
 	}
-	files, reason, err := r.fetchRepositoryScanPublishedCommit(ctx, owner, repository, publication.publication.ExpectedCommitSHA, token)
+	commitDiff, commitPaths, reason, err := r.fetchRepositoryScanPublishedDiff(ctx, owner, repository, publication.publication.ExpectedCommitSHA, token)
 	if err != nil || reason != "" {
 		return reason, err
-	}
-	commitDiff, commitPaths, reason := repositoryScanDiffFromPublishedCommit(files)
-	if reason != "" {
-		return reason, nil
 	}
 	diffData, _, err := r.ArtifactStore.GetArtifact(ctx, task.Namespace, task.Name, diffName)
 	if err != nil {
@@ -244,8 +236,8 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 	// line, however it is prefixed) must be identical to the published
 	// commit's. Index headers, which legitimately vary between diff generators
 	// without changing the represented patch, are excluded.
-	// Mode, rename, copy, similarity, and binary metadata is rejected because
-	// the commit-files response does not provide enough data to verify it.
+	// File-mode transitions must match the commit's full Git diff. Rename,
+	// copy, similarity, and binary metadata remains unsupported.
 	// Stored artifacts come in two provenances: the result-contract path
 	// persists the commit diff credential-redacted, while legacy
 	// harness-written artifacts are raw — so the stored diff must match the
@@ -264,13 +256,21 @@ func (r *RepositoryScanReconciler) verifyArtifactDiffMatchesPublishedCommit(
 // patchHunksByFile binds each file's canonical old/new path headers to its
 // verbatim hunk body, from the first "@@" line to the next file header.
 var recognizedDiffMetadataPattern = regexp.MustCompile(`^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|--- .+|\+\+\+ .+)$`)
+var patchModeMetadataPattern = regexp.MustCompile(`^(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}$`)
 
-func patchHunksByFile(diff string) (map[string]string, bool) {
+type repositoryScanFilePatch struct {
+	content string
+	modes   string
+}
+
+//nolint:gocyclo // Keep the diff-block states explicit for the evidence comparison.
+func patchHunksByFile(diff string) (map[string]repositoryScanFilePatch, bool) {
 	const nullPath = "/dev/null"
 
-	hunks := map[string]string{}
+	hunks := map[string]repositoryScanFilePatch{}
 	seenPaths := map[string]struct{}{}
 	var body []string
+	var modes []string
 	current := ""
 	oldHeader := ""
 	newHeader := ""
@@ -287,10 +287,14 @@ func patchHunksByFile(diff string) (map[string]string, bool) {
 			if !headersValid || len(body) == 0 {
 				invalidBlock = true
 			} else {
-				hunks[current] = oldHeader + "\n" + newHeader + "\n" + strings.TrimRight(strings.Join(body, "\n"), "\n")
+				hunks[current] = repositoryScanFilePatch{
+					content: oldHeader + "\n" + newHeader + "\n" + strings.TrimRight(strings.Join(body, "\n"), "\n"),
+					modes:   strings.Join(modes, "\n"),
+				}
 			}
 		}
 		body = nil
+		modes = nil
 		oldHeader = ""
 		newHeader = ""
 		inHunk = false
@@ -329,6 +333,10 @@ func patchHunksByFile(diff string) (map[string]string, bool) {
 		if strings.HasPrefix(line, "@@") {
 			inHunk = true
 			body = append(body, line)
+			continue
+		}
+		if patchModeMetadataPattern.MatchString(line) && current != "" {
+			modes = append(modes, line)
 			continue
 		}
 		if strings.HasPrefix(line, "--- ") {
@@ -449,6 +457,60 @@ func repositoryScanGitHubStatusTransient(status int) bool {
 	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
 }
 
+// fetchRepositoryScanPublishedDiff binds GitHub's full diff, including file
+// modes, to the complete paginated file list and line counts for the same SHA.
+// The JSON file patches alone cannot prove executable-bit changes.
+func (r *RepositoryScanReconciler) fetchRepositoryScanPublishedDiff(ctx context.Context, owner, repository, sha, token string) (string, []string, string, error) {
+	files, reason, err := r.fetchRepositoryScanPublishedCommit(ctx, owner, repository, sha, token)
+	if err != nil || reason != "" {
+		return "", nil, reason, err
+	}
+	textDiff, paths, reason := repositoryScanDiffFromPublishedCommit(files)
+	if reason != "" {
+		return "", nil, reason, nil
+	}
+	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
+	if baseURL == "" {
+		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s", baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(sha))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", nil, "", err
+	}
+	repositoryMonitorSetGitHubHeaders(req, token)
+	req.Header.Set("Accept", "application/vnd.github.diff")
+	resp, err := r.repositoryScanHTTPClient().Do(req)
+	if err != nil {
+		return "", nil, "", errRepositoryScanPublishedCommitTransient
+	}
+	body, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
+	_ = resp.Body.Close()
+	if err != nil {
+		return "", nil, "published patch diff response exceeded the read limit", nil
+	}
+	if repositoryScanGitHubStatusTransient(resp.StatusCode) {
+		return "", nil, "", fmt.Errorf("%w (HTTP %d)", errRepositoryScanPublishedCommitTransient, resp.StatusCode)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", nil, fmt.Sprintf("published patch diff could not be read from GitHub (HTTP %d)", resp.StatusCode), nil
+	}
+	diff := string(body)
+	actual, actualOK := patchHunksByFile(diff)
+	expected, expectedOK := patchHunksByFile(textDiff)
+	if !actualOK || !expectedOK || len(actual) != len(expected) {
+		return "", nil, "published patch diff does not match the commit file listing", nil
+	}
+	for path, patch := range expected {
+		// Only the full diff has mode metadata. Its paths and text must
+		// still match the independently checked JSON representation.
+		if got, ok := actual[path]; !ok || got.content != patch.content {
+			return "", nil, "published patch diff does not match the commit file listing", nil
+		}
+	}
+	return diff, paths, "", nil
+}
+
 func (r *RepositoryScanReconciler) fetchRepositoryScanPublishedCommit(ctx context.Context, owner, repository, sha, token string) ([]repositoryScanCommitFileResponse, string, error) {
 	if store.ValidateGitObjectID("published patch commit", sha) != nil {
 		return nil, "verified patch publication commit is invalid", nil
@@ -551,9 +613,8 @@ func repositoryScanDiffFromPublishedCommit(files []repositoryScanCommitFileRespo
 			return "", nil, "published patch commit contains an inconsistent file patch: " + path
 		}
 		fmt.Fprintf(&diff, "diff --git a/%s b/%s\n", path, path)
-		// Mode lines are intentionally omitted: the commit file listing does
-		// not carry file modes, and fabricating "100644" would misrepresent
-		// an executable-bit change to reviewers.
+		// This JSON representation binds text and change kind. The full
+		// Git diff supplies mode metadata before evidence is accepted.
 		switch strings.ToLower(strings.TrimSpace(file.Status)) {
 		case "added":
 			fmt.Fprintf(&diff, "--- /dev/null\n+++ b/%s\n", path)
@@ -635,6 +696,12 @@ func (r *RepositoryScanReconciler) decorateSecurityPatchPullRequest(ctx context.
 	}
 	if marker == "" {
 		logger.Info("skipping remediation pull request decoration", "reason", "publisher intent marker missing")
+		return
+	}
+	generation := strings.TrimPrefix(strings.TrimSpace(current.Title), repositoryScanGenericPublicationTitlePrefix)
+	publisherBody := "Created by the Orka clean-room workspace publisher.\n\nPublication generation: " + generation + "\n\n" + marker
+	if strings.TrimSpace(current.Body) != publisherBody {
+		logger.Info("skipping remediation pull request decoration", "reason", "publisher body has been edited")
 		return
 	}
 	title := security.RemediationPullRequestTitle(finding)

@@ -667,7 +667,6 @@ func repositoryMonitorUpdateBranchTimedOut(mutation *store.GitHubMutationRecord)
 }
 
 func (r *RepositoryMonitorReconciler) completeRepositoryMonitorUpdateBranch(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, run *store.MonitorRun, command *store.CommandEvent, item *store.MonitorItem, mutation *store.GitHubMutationRecord, pr repositoryMonitorPullRequest) error {
-	alreadySucceeded := mutation.Status == repositoryMonitorRunPhaseSucceeded
 	mutation.Status = repositoryMonitorRunPhaseSucceeded
 	mutation.Error = ""
 	if err := r.updateRepositoryMonitorGitHubMutation(ctx, monitor, mutation); err != nil {
@@ -681,15 +680,34 @@ func (r *RepositoryMonitorReconciler) completeRepositoryMonitorUpdateBranch(ctx 
 	item.RepairState = repositoryMonitorRepairPhaseSucceeded
 	item.SkipReason = ""
 	if err := r.Store.UpsertMonitorItem(ctx, item); err != nil {
-		return err
+		return pendingMutationProjectionError("monitor item", err)
+	}
+	// The terminal work action stops command reconciliation. Persist its
+	// success event first, using the mutation identity to make retries safe
+	// even if the event committed but its response or the next write failed.
+	eventID := "mevt-" + mutation.ID + "-succeeded"
+	events, _, err := r.Store.ListMonitorEvents(ctx, store.MonitorEventFilter{Namespace: monitor.Namespace, ID: eventID, Limit: 1})
+	if err != nil {
+		return pendingMutationProjectionError("event lookup", err)
+	}
+	if len(events) == 0 {
+		metadata, err := json.Marshal(map[string]string{repositoryMonitorFieldBaseSHA: pr.BaseSHA, repositoryMonitorFieldHeadSHA: pr.HeadSHA})
+		if err != nil {
+			return pendingMutationProjectionError("event metadata", err)
+		}
+		if err := r.Store.CreateMonitorEvent(ctx, &store.MonitorEvent{
+			ID: eventID, MonitorNamespace: monitor.Namespace, MonitorName: monitor.Name, RunID: run.ID,
+			ItemKind: repositoryMonitorPullRequestKind, ItemNumber: pr.Number, ItemSHA: pr.HeadSHA,
+			EventType: "update_branch_succeeded", Actor: "controller", //nolint:goconst // Audit actors are independent of workspace namespace strategies.
+			Summary: fmt.Sprintf("Pull request #%d branch updated", pr.Number), MetadataJSON: string(metadata),
+		}); err != nil {
+			return pendingMutationProjectionError("event", err)
+		}
 	}
 	if err := r.recordRepositoryMonitorWorkActionState(ctx, monitor, run, command, repositoryMonitorPullRequestKind, pr.Number, command.HeadSHA, "", command.Intent, repositoryMonitorWorkActionStatusSucceeded, repositoryMonitorRepairPhaseSucceeded, "", ""); err != nil {
-		return err
+		return pendingMutationProjectionError("work action", err)
 	}
-	if alreadySucceeded {
-		return nil
-	}
-	return r.createMonitorEvent(ctx, monitor, run.ID, repositoryMonitorPullRequestKind, pr.Number, pr.HeadSHA, "update_branch_succeeded", fmt.Sprintf("Pull request #%d branch updated", pr.Number), map[string]any{repositoryMonitorFieldBaseSHA: pr.BaseSHA, repositoryMonitorFieldHeadSHA: pr.HeadSHA})
+	return nil
 }
 
 func (r *RepositoryMonitorReconciler) failRepositoryMonitorUpdateBranch(ctx context.Context, monitor *corev1alpha1.RepositoryMonitor, run *store.MonitorRun, command *store.CommandEvent, item *store.MonitorItem, mutation *store.GitHubMutationRecord, reason string) error {

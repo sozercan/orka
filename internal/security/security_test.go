@@ -571,6 +571,8 @@ var looksLikeSecretNegatives = []string{
 	"Authorization: Bearer {{ .Token }}",
 	"password=changeme",
 	"api_key=${OPENAI_API_KEY}",
+	"AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}",
+	"secretAccessKey = config.Credentials.SecretAccessKey",
 	"The token is validated by the proxy; set TOKEN=xxxx in .env",
 	"Txn-Token: <transaction token>",
 	"runtime.apiKey = strings.TrimSpace(cfg.APIKey)",
@@ -672,6 +674,12 @@ var looksLikeSecretPositives = []string{
 	"api_key: |\n    " + strings.Repeat("0a1b2c3d", 3),
 	"password: |2-\n  correct-horse-battery-staple",
 	"SECRET=correct-horse-battery-staple",
+	"AWS_SECRET_ACCESS_KEY=" + strings.Repeat("0a1b2c3d", 5),
+	"DATABASE_SECRET=" + strings.Repeat("0a1b2c3d", 3),
+	"DATABASE_CREDENTIAL=" + strings.Repeat("0a1b2c3d", 3),
+	"secretAccessKey: " + strings.Repeat("0a1b2c3d", 5),
+	"secret_key: |\n  " + strings.Repeat("0a1b2c3d", 5),
+	"AWS_SECRET_ACCESS_KEY:\n  " + strings.Repeat("0a1b2c3d", 5),
 	"credential: correct-horse-battery-staple-value",
 	// Dotted values in credential-keyed config scalars are attacker-
 	// controllable literal shapes; only '=' code assignments are exempt.

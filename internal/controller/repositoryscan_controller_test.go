@@ -6326,9 +6326,11 @@ func repositoryScanPatchResultEnvelope(fixture patchIngestFixture, changedFiles 
 // patchPullRequestDecoration records the publisher-created PR as GitHub
 // would return it and the PATCH the controller sends to decorate it.
 type patchPullRequestDecoration struct {
-	title   string
-	body    string
-	patched map[string]string
+	title      string
+	body       string
+	patched    map[string]string
+	commitDiff string
+	diffStatus int
 }
 
 func newPatchCommitServer(t *testing.T, files []repositoryScanCommitFileResponse, seenToken *string) *httptest.Server {
@@ -6341,11 +6343,33 @@ func newPatchCommitServerWithPullRequest(t *testing.T, files []repositoryScanCom
 	headSHA := strings.Repeat("b", 40)
 	marker := "<!-- orka.publisher.pr-intent.v1 key=sha256:" + strings.Repeat("c", 64) + " -->"
 	pr := &patchPullRequestDecoration{title: "Orka publication generation 1", body: "Created by the Orka clean-room workspace publisher.\n\nPublication generation: 1\n\n" + marker}
+	pr.commitDiff, _, _ = repositoryScanDiffFromPublishedCommit(files)
+	for _, file := range files {
+		mode := ""
+		switch file.Status {
+		case "added":
+			mode = "new file mode 100644\n"
+		case "removed":
+			mode = "deleted file mode 100644\n"
+		}
+		if mode != "" {
+			header := fmt.Sprintf("diff --git a/%s b/%s\n", file.Filename, file.Filename)
+			pr.commitDiff = strings.Replace(pr.commitDiff, header, header+mode, 1)
+		}
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/example/kaset/commits/"+headSHA:
 			*seenToken = r.Header.Get("Authorization")
+			if r.Header.Get("Accept") == "application/vnd.github.diff" {
+				w.Header().Set("Content-Type", "text/plain")
+				if pr.diffStatus != 0 {
+					w.WriteHeader(pr.diffStatus)
+				}
+				_, _ = w.Write([]byte(pr.commitDiff))
+				return
+			}
 			_ = json.NewEncoder(w).Encode(repositoryScanCommitResponse{SHA: headSHA, Files: files})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/example/kaset/pulls/42":
 			_ = json.NewEncoder(w).Encode(map[string]string{repositoryScanPullRequestTitleField: pr.title, repositoryScanPullRequestBodyField: pr.body})
@@ -6414,7 +6438,7 @@ func TestIngestPatchTaskDerivesArtifactsFromV2ResultAndPublishedCommit(t *testin
 		t.Fatalf("GetArtifact(diff) error = %v", err)
 	}
 	if !strings.Contains(string(diff), "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-unsafe()\n+safe()\n") ||
-		!strings.Contains(string(diff), "diff --git a/tests/test_app.py b/tests/test_app.py\n--- /dev/null\n+++ b/tests/test_app.py\n") {
+		!strings.Contains(string(diff), "diff --git a/tests/test_app.py b/tests/test_app.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_app.py\n") {
 		t.Fatalf("derived diff = %q", diff)
 	}
 	summaryData, _, err := fixture.store.GetArtifact(ctx, fixture.proposal.Namespace, fixture.proposal.TaskName, summaryName)
