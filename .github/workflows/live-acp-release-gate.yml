@@ -9,8 +9,8 @@ on:
         default: https://github.com/orka-agents/orka.git
         type: string
       publication_repository:
-        description: HTTPS URL of a distinct GitHub fork used for publication
-        required: true
+        description: Optional fork URL; must match the protected environment canary setting
+        required: false
         type: string
       source_ref:
         description: Full SHA of the dispatched workflow commit; must equal the selected base branch head
@@ -36,17 +36,47 @@ jobs:
     timeout-minutes: 240
     environment: live-acp-release-gate
     env:
+      RELEASE_GATE: "1"
+      ACP_E2E_REPO: ${{ inputs.source_repository }}
+      ACP_E2E_REF: ${{ inputs.source_ref }}
+      ACP_E2E_WRITE_SOURCE_REPO: ${{ inputs.source_repository }}
+      ACP_E2E_WRITE_SOURCE_REF: ${{ inputs.source_ref }}
+      ACP_E2E_WRITE_PUBLICATION_REPO: ${{ inputs.publication_repository || vars.ACP_E2E_WRITE_PUBLICATION_REPO }}
+      ACP_E2E_WRITE_PR_BASE: ${{ inputs.pr_base }}
+      ACP_E2E_WRITE_CREATE_PR: "1"
       ACP_E2E_OPENCODE_CONTEXT_WINDOW: "32768"
       ACP_E2E_OPENCODE_MAX_TOKENS: "4096"
       ACP_E2E_OPENCODE_MODEL: "openai/gpt-5.4"
       ACP_E2E_KIND_TAG: acp-release-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      # This seed survives invalid dispatches, checkout failures, and missing
+      # credentials. Do not copy arbitrary dispatch inputs into the artifact.
+      - name: Initialize acceptance evidence
+        env:
+          ACP_E2E_REPORT_FILE: ${{ runner.temp }}/live-acp-release-gate/acceptance.json
+        run: |
+          set -Eeuo pipefail
+          printf 'ACP_E2E_REPORT_FILE=%s\n' "${ACP_E2E_REPORT_FILE}" >>"${GITHUB_ENV}"
+          mkdir -p "$(dirname "${ACP_E2E_REPORT_FILE}")"
+          candidate=""
+          if [[ "${ACP_E2E_WRITE_SOURCE_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            candidate="${ACP_E2E_WRITE_SOURCE_REF,,}"
+          fi
+          jq -n --arg candidate "${candidate}" --arg sha "${GITHUB_SHA}" \
+            --arg repository "${GITHUB_REPOSITORY}" --arg ref "${GITHUB_REF}" \
+            --arg run "${GITHUB_RUN_ID}" --arg attempt "${GITHUB_RUN_ATTEMPT}" \
+            '{schemaVersion:1, gate:"live-acp-release-gate", mode:"release",
+              candidateSHA:$candidate, checkoutSHA:$sha, result:"not_qualified",
+              stage:"trusted_dispatch", workflow:{repository:$repository, ref:$ref,
+                sha:$sha, runID:$run, runAttempt:$attempt, event:"workflow_dispatch"}}' \
+            >"${ACP_E2E_REPORT_FILE}"
+
       - name: Validate trusted dispatch inputs
         env:
           CHECKED_OUT_SHA: ${{ github.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PR_BASE: ${{ inputs.pr_base }}
-          PUBLICATION_REPOSITORY: ${{ inputs.publication_repository }}
+          CONFIGURED_PUBLICATION_REPOSITORY: ${{ vars.ACP_E2E_WRITE_PUBLICATION_REPO }}
           SOURCE_REF: ${{ inputs.source_ref }}
           SOURCE_REPOSITORY: ${{ inputs.source_repository }}
         run: |
@@ -69,11 +99,16 @@ jobs:
             echo "source_repository must identify this repository: ${expected_source}.git" >&2
             exit 1
           fi
-          if [[ ! "${PUBLICATION_REPOSITORY}" =~ ^https://github\.com/[^/?#]+/[^/?#]+(\.git)?$ ]]; then
+          if [[ ! "${ACP_E2E_WRITE_PUBLICATION_REPO}" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
             echo "publication_repository must be an HTTPS github.com repository URL." >&2
             exit 1
           fi
-          normalized_publication="${PUBLICATION_REPOSITORY%.git}"
+          normalized_publication="${ACP_E2E_WRITE_PUBLICATION_REPO%.git}"
+          configured_publication="${CONFIGURED_PUBLICATION_REPOSITORY%.git}"
+          if [[ -z "${configured_publication}" || "${normalized_publication,,}" != "${configured_publication,,}" ]]; then
+            echo "Configure ACP_E2E_WRITE_PUBLICATION_REPO in the environment; dispatch must use that canary fork." >&2
+            exit 1
+          fi
           if [[ "${normalized_source,,}" == "${normalized_publication,,}" ]]; then
             echo "publication_repository must be a distinct fork." >&2
             exit 1
@@ -116,36 +151,67 @@ jobs:
           kubectl version --client=true
 
       - name: Run destructive canonical ACP release gate in Kind
+        id: gate
+        # Leave time for failure evidence and cleanup before the job deadline.
+        timeout-minutes: 210
         env:
-          ACP_E2E_REF: ${{ inputs.source_ref }}
-          ACP_E2E_REPO: ${{ inputs.source_repository }}
-          ACP_E2E_WRITE_CREATE_PR: "1"
+          # Transfer cluster teardown to the post-upload step below.
+          ACP_E2E_KEEP_CLUSTER: "1"
           ACP_E2E_WRITE_CREDENTIAL_TOKEN: ${{ secrets.ACP_E2E_WRITE_CREDENTIAL_TOKEN }}
           ACP_E2E_WRITE_FORGE_CREDENTIAL_TOKEN: ${{ secrets.ACP_E2E_WRITE_FORGE_CREDENTIAL_TOKEN }}
-          ACP_E2E_WRITE_PR_BASE: ${{ inputs.pr_base }}
-          ACP_E2E_WRITE_PUBLICATION_REPO: ${{ inputs.publication_repository }}
           ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN: ${{ secrets.ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN }}
-          ACP_E2E_WRITE_SOURCE_REF: ${{ inputs.source_ref }}
-          ACP_E2E_WRITE_SOURCE_REPO: ${{ inputs.source_repository }}
           ACP_E2E_WRITE_TARGET_READ_CREDENTIAL_TOKEN: ${{ secrets.ACP_E2E_WRITE_TARGET_READ_CREDENTIAL_TOKEN }}
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.ACP_E2E_WRITE_FORGE_CREDENTIAL_TOKEN }}
-          RELEASE_GATE: "1"
+        run: bash scripts/live-acp-runtime-kind-e2e.sh
+
+      - name: Upload evidence before cluster teardown
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-acp-release-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-acp-release-gate/acceptance.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove the disposable cluster and registry
+        if: always() && steps.gate.outcome != 'skipped'
         run: |
           set -Eeuo pipefail
+          source scripts/lib/live-acp-runtime-kind-bootstrap.sh
+          if ! jq -e '.cluster.creationAttempted == true' "${ACP_E2E_REPORT_FILE}" >/dev/null; then
+            exit 0
+          fi
+          jq -e --arg tag "${ACP_E2E_KIND_TAG}" '.cluster.tag == $tag' "${ACP_E2E_REPORT_FILE}" >/dev/null
+          LIVE_ACP_REPO_ROOT="${GITHUB_WORKSPACE}"
+          LIVE_ACP_KINDCTL_BIN="${GITHUB_WORKSPACE}/.agents/skills/kindctl/bin/kindctl"
+          LIVE_ACP_KIND_TAG="${ACP_E2E_KIND_TAG}"
+          LIVE_ACP_KIND_CREATED=1
+          LIVE_ACP_KIND_CLUSTER="$(jq -r '.cluster.name // ""' "${ACP_E2E_REPORT_FILE}")"
+          LIVE_ACP_REGISTRY_STARTED="$(jq -r 'if .cluster.registryStarted then 1 else 0 end' "${ACP_E2E_REPORT_FILE}")"
+          live_acp_kind_delete_cluster
 
-          required_secrets=(
-            COPILOT_GITHUB_TOKEN
-            ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN
-            ACP_E2E_WRITE_TARGET_READ_CREDENTIAL_TOKEN
-            ACP_E2E_WRITE_CREDENTIAL_TOKEN
-            ACP_E2E_WRITE_FORGE_CREDENTIAL_TOKEN
-          )
-          for name in "${required_secrets[@]}"; do
-            if [[ -z "${!name}" ]]; then
-              echo "${name} must be configured in the live-acp-release-gate environment." >&2
-              exit 1
-            fi
-          done
+      - name: Qualify the candidate from complete evidence
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          if [[ ! -f scripts/lib/live-acp-release-report.sh ]]; then
+            echo "Candidate is not qualified: trusted checkout never completed." >&2
+            exit 1
+          fi
+          source scripts/lib/live-acp-release-report.sh
+          base_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${ACP_E2E_WRITE_PR_BASE}" --jq '.sha')"
+          # shellcheck disable=SC2016 # This is a jq program.
+          acp_report_update '.observations.baseHeads.completion = $sha' --arg sha "${base_sha}"
+          acp_report_finish
 
-          bash scripts/live-acp-runtime-kind-e2e.sh
+      - name: Upload final acceptance report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-acp-release-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-acp-release-gate/acceptance.json
+          if-no-files-found: error
+          retention-days: 90

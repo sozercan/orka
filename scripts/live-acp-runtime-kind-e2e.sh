@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # acp_report_update arguments are jq programs.
 set -Eeuo pipefail
 umask 077
 
@@ -26,6 +27,7 @@ Environment:
   ACP_E2E_OPENCODE_MAX_TOKENS reviewed OpenCode output limit (required)
   ACP_E2E_ROLLOUT_TIMEOUT rollout timeout (default: 10m)
   RELEASE_GATE=1          forwarded to the canonical validator
+  ACP_E2E_REPORT_FILE     redacted acceptance JSON (release mode only)
 USAGE
 }
 
@@ -94,6 +96,29 @@ export LIVE_ACP_CONTROLLER_IMAGE LIVE_ACP_CODEX_IMAGE LIVE_ACP_CLAUDE_IMAGE LIVE
 export LIVE_ACP_OPENCODE_IMAGE LIVE_ACP_PUBLISHER_IMAGE LIVE_ACP_GENERAL_WORKER_IMAGE
 export LIVE_ACP_SECRET_DIR
 
+finish_kind_run() {
+  local status=$? cleanup_status=0
+  trap - EXIT
+  set +e
+  live_acp_kind_cleanup "${status}" || cleanup_status=$?
+  if (( status == 0 && cleanup_status != 0 )); then status="${cleanup_status}"; fi
+  acp_report_update '.bootstrapExitCode = $status' --argjson status "${status}" || status=1
+  if (( preflight_only == 0 )) && [[ "${LIVE_ACP_KEEP_CLUSTER}" != "1" ]]; then
+    acp_report_finish || status=1
+  fi
+  exit "${status}"
+}
+
+if live_acp_kind_enabled "${RELEASE_GATE:-0}"; then
+  export RELEASE_GATE=1
+  export ACP_E2E_REPORT_FILE="${ACP_E2E_REPORT_FILE:-${repo_root}/bin/acp-release-${image_tag}/acceptance.json}"
+  acp_report_init "${repo_root}"
+  export LIVE_ACP_REPORT_INITIALIZED=1
+fi
+trap finish_kind_run EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 if live_acp_kind_enabled "${RELEASE_GATE:-0}"; then
   [[ -n "${ACP_E2E_WRITE_SOURCE_REPO:-}" ]] || \
     live_acp_kind_die "ACP_E2E_WRITE_SOURCE_REPO is required when RELEASE_GATE=1"
@@ -139,9 +164,16 @@ if (( preflight_only )); then
   exit 0
 fi
 
+if live_acp_kind_enabled "${RELEASE_GATE:-0}"; then
+  [[ "$(git -C "${repo_root}" rev-parse HEAD)" == "${write_ref_lower}" ]] || \
+    live_acp_kind_die "release candidate must equal the image build checkout HEAD"
+  [[ -z "$(git -C "${repo_root}" status --porcelain --untracked-files=normal)" ]] || \
+    live_acp_kind_die "release images must be built from a clean candidate checkout"
+fi
+
 LIVE_ACP_SECRET_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/live-acp-kind-secrets.XXXXXX")"
 export LIVE_ACP_SECRET_DIR
-trap 'status=$?; live_acp_kind_cleanup "${status}"; exit "${status}"' EXIT
+acp_report_update '.stage = "bootstrap"'
 live_acp_kind_bootstrap
 
 validator_args=(--context "${LIVE_ACP_CONTEXT}")
@@ -155,4 +187,7 @@ validator_args+=(--namespace "${namespace}")
 # namespace cannot contain unrelated RuntimePool consumers.
 export ACP_E2E_ALLOW_SHARED_POOL_MUTATION="${ACP_E2E_ALLOW_SHARED_POOL_MUTATION:-1}"
 live_acp_kind_log "Running canonical live ACP runtime validator"
+# Persist this before launching the child. If it is killed, an absent Task
+# receipt alone cannot establish that publication never started.
+acp_report_update '.validatorStarted = true'
 "${LIVE_ACP_VALIDATOR_SCRIPT}" "${validator_args[@]}"

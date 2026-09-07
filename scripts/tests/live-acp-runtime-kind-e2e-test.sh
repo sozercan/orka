@@ -258,7 +258,7 @@ printf '%s\n' 'ok - Vekil preflight requires endpoint metadata and live streamin
 
 fake_bin="$(mktemp -d "${TMPDIR:-/tmp}/live-acp-kind-test.XXXXXX")"
 trap 'rm -rf "${fake_bin}"' EXIT
-for command in curl gh git go jq kind kubectl make python3; do
+for command in curl gh go kind kubectl make python3; do
   cat >"${fake_bin}/${command}" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -349,7 +349,24 @@ if [[ "${cleanup_failure_status}" -ne 23 ]]; then
 fi
 printf '%s\n' 'ok - Kind cleanup failure fails successful validation without masking validator failures'
 
+finish_body="$(awk '/^finish_kind_run\(\) \{/,/^\}$/' "${wrapper}")"
+if (
+  eval "${finish_body}"
+  live_acp_kind_cleanup() { return 1; }
+  acp_report_update() { :; }
+  acp_report_finish() { :; }
+  preflight_only=0
+  LIVE_ACP_KEEP_CLUSTER=0
+  trap finish_kind_run EXIT
+  exit 0
+); then
+  echo 'wrapper EXIT trap discarded a cleanup failure after successful validation' >&2
+  exit 1
+fi
+printf '%s\n' 'ok - wrapper exit status includes cluster cleanup failures'
+
 provider_sentinel='must-not-appear-in-output'
+export ACP_E2E_REPORT_FILE="${fake_bin}/acceptance.json"
 output="$(PATH="${fake_bin}:${PATH}" COPILOT_GITHUB_TOKEN="${provider_sentinel}" "${wrapper}" --preflight-only 2>&1)"
 grep -F 'preflight passed' <<<"${output}" >/dev/null
 if grep -F "${provider_sentinel}" <<<"${output}" >/dev/null; then
@@ -374,6 +391,8 @@ if PATH="${fake_bin}:${PATH}" RELEASE_GATE=1 COPILOT_GITHUB_TOKEN="${provider_se
 fi
 grep -F 'ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN is required when RELEASE_GATE=1' \
   "${fake_bin}/release-missing.out" >/dev/null
+jq -e '.result == "not_qualified" and .bootstrapExitCode == 1
+  and .failure.credential == "ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN"' "${ACP_E2E_REPORT_FILE}" >/dev/null
 
 source_read_sentinel='source-read-value'
 target_read_sentinel='target-read-value'
@@ -402,6 +421,10 @@ for value in "${provider_sentinel}" "${source_read_sentinel}" "${target_read_sen
     echo 'release preflight leaked a provider or publication credential' >&2
     exit 1
   fi
+  if grep -F "${value}" "${ACP_E2E_REPORT_FILE}" >/dev/null; then
+    echo 'release report leaked a provider or publication credential' >&2
+    exit 1
+  fi
 done
 
 if PATH="${fake_bin}:${PATH}" RELEASE_GATE=1 COPILOT_GITHUB_TOKEN="${provider_sentinel}" \
@@ -418,3 +441,55 @@ grep -F 'ACP_E2E_REPO must equal ACP_E2E_WRITE_SOURCE_REPO' \
   "${fake_bin}/release-mismatch.out" >/dev/null
 
 printf '%s\n' 'ok - live ACP Kind bootstrap is noninteractive, secret-safe, and delegates to the canonical validator'
+
+cat >"${fake_bin}/record-kindctl" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == delete ]] || exit 2
+printf '%s\n' "$*" >>"${CLEANUP_CALLS}"
+STUB
+chmod +x "${fake_bin}/record-kindctl"
+export RELEASE_GATE=1 CLEANUP_CALLS="${fake_bin}/cleanup-calls"
+LIVE_ACP_KINDCTL_BIN="${fake_bin}/record-kindctl"
+LIVE_ACP_KIND_TAG=interrupted-report-test
+LIVE_ACP_KIND_CREATED=1
+LIVE_ACP_REGISTRY_STARTED=0
+cat >"${fake_bin}/cleanup-base.json" <<'JSON'
+{
+  "schemaVersion": 1, "gate": "live-acp-release-gate", "mode": "release",
+  "validatorStarted": true, "task": {"namespace":"test", "name":"canary"},
+  "expectedBranch": "orka/acp-release-gate-test", "preserved": null,
+  "cleanup": {"remote":"running"}
+}
+JSON
+while IFS= read -r mutation; do
+  jq "${mutation}" "${fake_bin}/cleanup-base.json" >"${ACP_E2E_REPORT_FILE}"
+  : >"${CLEANUP_CALLS}"
+  if live_acp_kind_delete_cluster >"${fake_bin}/interrupted-cleanup.out" 2>&1; then
+    echo "cluster teardown accepted incomplete cleanup evidence: ${mutation}" >&2
+    exit 1
+  fi
+  [[ ! -s "${CLEANUP_CALLS}" ]]
+  jq -e '.cleanup.cluster == "preserved" and .cleanup.registry == "preserved"
+    and .preserved != null' "${ACP_E2E_REPORT_FILE}" >/dev/null
+done <<'MUTATIONS'
+.
+.cleanup.remote = "not_started"
+del(.cleanup.remote)
+del(.validatorStarted)
+.validatorStarted = false
+.cleanup.remote = "not_required"
+.cleanup.remote = "passed" | .preserved = {reason:"inspect"}
+MUTATIONS
+
+while IFS= read -r mutation; do
+  jq "${mutation}" "${fake_bin}/cleanup-base.json" >"${ACP_E2E_REPORT_FILE}"
+  : >"${CLEANUP_CALLS}"
+  live_acp_kind_delete_cluster
+  grep -Fx 'delete --tag interrupted-report-test' "${CLEANUP_CALLS}" >/dev/null
+  jq -e '.cleanup.cluster == "passed" and .preserved == null' "${ACP_E2E_REPORT_FILE}" >/dev/null
+done <<'MUTATIONS'
+.validatorStarted = false | .task = null
+.cleanup.remote = "passed"
+.cleanup.remote = "not_required" | .task = null
+MUTATIONS
+printf '%s\n' 'ok - interrupted validators preserve clusters until remote cleanup is explicitly proven safe'

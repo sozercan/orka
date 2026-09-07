@@ -147,8 +147,8 @@ missing or mismatched artifacts staying not ready.
   environment to the default branch; do not require reviewers if scheduled runs
   must proceed unattended.
 - `.github/workflows/live-acp-release-gate.yml` is manual-only and serialized.
-  Protect the `live-acp-release-gate` environment with required reviewers and a
-  default-branch deployment rule. It accepts explicit source/fork URLs, a full
+  Restrict the `live-acp-release-gate` environment to the default branch. It
+  accepts the configured canary fork, a full
   source SHA that must equal the dispatched workflow commit and default-branch
   head, and the default branch as the PR base. It requires these environment
   secrets:
@@ -158,6 +158,10 @@ missing or mismatched artifacts staying not ready.
   `ACP_E2E_WRITE_FORGE_CREDENTIAL_TOKEN`. Configure the four publication
   credentials as distinct, least-privilege GitHub credentials for source read,
   target read, target write, and forge/verification cleanup respectively.
+  [ACP publication release qualification](acp-release-gate.md) documents the
+  dedicated fork, exact permissions, trusted dispatch, report verification,
+  and recovery from a moved base or preserved canary. Release qualification
+  requires that report for the exact candidate; smoke success is insufficient.
 - Neither live ACP workflow runs for `pull_request`, so PR-controlled code never
   receives provider or publication credentials. Both check out with persisted
   credentials disabled and expose secrets only to the final local script step.
@@ -221,7 +225,7 @@ set `ACP_E2E_WRITE_SOURCE_REPO`, `ACP_E2E_WRITE_PUBLICATION_REPO`,
 export RELEASE_GATE=1
 export ACP_E2E_WRITE_CREATE_PR=1
 export ACP_E2E_WRITE_SOURCE_REPO=https://github.com/orka-agents/orka.git
-export ACP_E2E_WRITE_PUBLICATION_REPO=https://github.com/OWNER/orka.git
+export ACP_E2E_WRITE_PUBLICATION_REPO=https://github.com/sozercan/orka-acp-release-gate.git
 export ACP_E2E_WRITE_SOURCE_REF="$(git rev-parse HEAD)"
 export ACP_E2E_WRITE_PR_BASE=main
 read -rsp 'Source-read token: ' ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN && echo
@@ -237,7 +241,11 @@ bash scripts/live-acp-runtime-kind-e2e.sh
 In release mode the Kind wrapper binds `ACP_E2E_REPO` and `ACP_E2E_REF` to the
 write source repository and SHA, and rejects explicitly supplied read values
 that differ. The read/runtime phases and publication phase therefore validate
-the same immutable source.
+the same immutable source. The image build requires a clean checkout at that
+commit. Local reports are saved under `bin/acp-release-*/acceptance.json`, or
+`ACP_E2E_REPORT_FILE` when set. `--keep-cluster` leaves cleanup pending and cannot
+qualify a release; use the trusted workflow and report verifier above for release
+records.
 
 Do not enable shell xtrace for either invocation. The scripts create Kubernetes
 Secrets without printing their values and redact provider/GitHub token patterns

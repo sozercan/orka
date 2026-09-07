@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # acp_report_update arguments are jq programs.
 set -Eeuo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -6,6 +7,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${script_dir}/lib/e2e-common.sh"
 # shellcheck source=scripts/lib/redact.sh
 . "${script_dir}/lib/redact.sh"
+# shellcheck source=scripts/lib/live-acp-release-report.sh
+. "${script_dir}/lib/live-acp-release-report.sh"
 
 usage() {
   cat <<'USAGE'
@@ -71,6 +74,7 @@ Release-gate write settings:
   ACP_E2E_WRITE_BRANCH               Unique branch; default includes the run ID
   ACP_E2E_WRITE_PR_BASE              Base branch (default: main)
   ACP_E2E_WRITE_PROMPT               Override the exact-one-file publication prompt
+  ACP_E2E_REPORT_FILE                Redacted acceptance JSON, retained after cleanup
   ACP_E2E_API_LOCAL_PORT             Local controller port-forward port (default: run-scoped)
 
 Workload discovery overrides:
@@ -190,10 +194,18 @@ done
 release_gate=0
 if bool_env "${RELEASE_GATE:-0}"; then
   release_gate=1
+  export RELEASE_GATE=1
 fi
 
 run_id_full="$(sanitize_name "${ACP_E2E_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$}")"
 run_id="$(printf '%s' "${run_id_full}" | cut -c1-24)"
+if [[ "${release_gate}" -eq 1 ]]; then
+  export ACP_E2E_REPORT_FILE="${ACP_E2E_REPORT_FILE:-${script_dir}/../bin/acp-release-${run_id}/acceptance.json}"
+  if [[ "${LIVE_ACP_REPORT_INITIALIZED:-0}" != "1" ]]; then
+    acp_report_init "${script_dir}/.."
+  fi
+  acp_report_update '.validatorStarted = true'
+fi
 if [[ "${run_id}" != "${run_id_full}" ]]; then
   warn "ACP_E2E_RUN_ID was normalized to 24 characters to preserve unique resource-name suffixes: ${run_id}"
 fi
@@ -634,6 +646,7 @@ release_write_task_observer() {
 
 cleanup_remote_effects() {
   [[ "${release_gate}" -eq 1 && "${remote_cleanup_required}" -eq 1 ]] || return 0
+  acp_report_update '.stage = "remote_cleanup" | .cleanup.remote = "running"' || return 1
   log "Cleaning release-gate remote effects with exact-head guards"
 
   if ! settle_write_task_for_remote_cleanup; then
@@ -646,6 +659,7 @@ cleanup_remote_effects() {
     remote_cleanup_preserve=1
     return 1
   fi
+  acp_report_update '.observations.cleanupHead = $head' --arg head "${github_ref_lookup_sha}" || return 1
 
   if [[ "${github_ref_lookup_state}" == "absent" && -z "${remote_cleanup_head}" ]]; then
     sleep 3
@@ -660,7 +674,8 @@ cleanup_remote_effects() {
       remote_cleanup_preserve=1
       return 1
     fi
-    release_write_task_observer
+    release_write_task_observer || return 1
+    acp_report_update '.cleanup.remote = "passed"'
     return $?
   fi
 
@@ -710,6 +725,7 @@ cleanup_remote_effects() {
     return 1
   fi
   log "Remote PR/branch cleanup completed"
+  acp_report_update '.cleanup.remote = "passed"'
 }
 
 task_cleanup_settled() {
@@ -1014,21 +1030,40 @@ cleanup() {
   trap '' INT TERM
   set +e
 
+  if [[ "${write_task_started}" -eq 1 ]]; then
+    local last_task
+    if last_task="$(task_json "${write_task_name}" 2>/dev/null)"; then
+      acp_report_task "${last_task}" || cleanup_rc=1
+    fi
+  fi
   if ! recover_namespace_ownership; then
     cleanup_rc=1
     remote_cleanup_preserve=1
   fi
   if ! cleanup_remote_effects; then
     cleanup_rc=1
+    acp_report_update '.cleanup.remote = "preserved"' || true
+  elif [[ "${write_task_started}" -eq 0 ]]; then
+    acp_report_update '.cleanup.remote = "not_required"' || cleanup_rc=1
   fi
 
   if [[ "${keep_resources}" == "1" || "${remote_cleanup_preserve}" == "1" ]]; then
+    [[ "${release_gate}" -ne 1 ]] || cleanup_rc=1
+    acp_report_update '.cleanup.kubernetes = "preserved" | .preserved = {
+      namespace:$namespace, task:$task, publicationRepository:.publicationRepository,
+      branch:$branch, verifiedHead:$head, pullRequestNumber:$pr
+    }' --arg namespace "${namespace}" --arg task "${write_task_name}" \
+      --arg branch "${remote_cleanup_branch}" --arg head "${remote_cleanup_head}" \
+      --arg pr "${remote_cleanup_pr_number}" || cleanup_rc=1
     if [[ "${namespace_created}" -eq 1 || "${namespace_shared}" -eq 1 ]]; then
       warn "preserving namespace ${namespace}"
     fi
   elif [[ "${namespace_created}" -eq 1 || "${namespace_shared}" -eq 1 ]]; then
     if ! delete_test_namespace_now; then
       cleanup_rc=1
+      acp_report_update '.cleanup.kubernetes = "failed"' || true
+    else
+      acp_report_update '.cleanup.kubernetes = "passed"' || cleanup_rc=1
     fi
   fi
 
@@ -1039,10 +1074,14 @@ cleanup() {
   if ! rm -rf "${temp_root}"; then
     warn "failed to remove temporary credential directory ${temp_root}"
     cleanup_rc=1
+    acp_report_update '.cleanup.validatorCredentials = "failed"' || true
+  else
+    acp_report_update '.cleanup.validatorCredentials = "passed"' || cleanup_rc=1
   fi
   if [[ "${rc}" -eq 0 && "${cleanup_rc}" -ne 0 ]]; then
     rc="${cleanup_rc}"
   fi
+  acp_report_update '.validatorExitCode = $rc' --argjson rc "${rc}" || rc=1
   exit "${rc}"
 }
 trap cleanup EXIT
@@ -1443,6 +1482,15 @@ assert_deployment_digest() {
   assert_pod_matches_deployment_images "${deployment_json}" "${pod_json}" || \
     die "Deployment/${deployment} Pod images do not match the current Deployment template"
   assert_all_pod_images "${orka_namespace}" "${pod}"
+  local report_role
+  case "${deployment}" in
+    "${controller_deployment}") report_role=controller ;;
+    "${publisher_deployment}") report_role=publisher ;;
+    "${provider_proxy_deployment}") report_role=providerProxy ;;
+    "${scm_proxy_deployment}") report_role=scmProxy ;;
+    *) return 0 ;;
+  esac
+  acp_report_image "${report_role}" "${pod_json}" "${container}"
 }
 
 publisher_service_account=""
@@ -2126,6 +2174,7 @@ capture_pool_snapshot() {
     podAddress:$pool[0].status.activeInstance.podAddress,
     podImageID:($pod[0].status.containerStatuses[] | select(.name == "runtime") | .imageID)
   }' >"${output_file}"
+  acp_report_image "${provider}" "$(cat "${pod_file}")" runtime
 }
 
 assert_task_fence() {
@@ -2919,6 +2968,7 @@ prepare_release_gate_environment() {
   base_json="$(gh api "repos/${write_source_slug}/branches/${write_pr_base}")" || \
     die "PR base branch ${write_pr_base} does not exist in ${write_source_slug}"
   base_sha="$(jq -r '.commit.sha // ""' <<<"${base_json}")"
+  acp_report_update '.observations.baseHeads.preflight = $sha' --arg sha "${base_sha}"
   [[ "$(lower "${write_source_commit}")" == "$(lower "${base_sha}")" ]] || \
     die "ACP_E2E_WRITE_SOURCE_REF must equal the current ${write_pr_base} base-branch head for an isolated one-file PR"
   github_content_lookup "${write_source_slug}" "${write_expected_file}" "${write_source_commit}" || \
@@ -3039,12 +3089,15 @@ verify_remote_publication() {
     ' <<<"${delivery}" >/dev/null || die "publication repository/branch identity tuple is incomplete or incorrect"
 
   github_ref_lookup "${write_publication_slug}" "${write_branch}" || die "independent observer could not read publication branch"
+  acp_report_update '.observations.remoteHead = $head' --arg head "${github_ref_lookup_sha}"
   [[ "${github_ref_lookup_state}" == "present" && "${github_ref_lookup_sha}" == "${remote}" ]] || \
     die "independent remote branch head does not match the Task delivery receipt"
 
   commit_json="$(gh api "repos/${write_publication_slug}/git/commits/${expected}")"
-  [[ "$(jq -r '.tree.sha // ""' <<<"${commit_json}")" == "${tree}" ]] || \
-    die "Task treeSHA does not match the independently observed expected commit tree"
+  acp_report_update '.observations.expectedCommit = $commit' \
+    --argjson commit "$(jq -c '{sha, treeSHA:.tree.sha}' <<<"${commit_json}")"
+  jq -e --arg sha "${expected}" --arg tree "${tree}" '.sha == $sha and .tree.sha == $tree' \
+    <<<"${commit_json}" >/dev/null || die "Task commit/tree receipt does not match the independently observed expected commit"
   jq -e --arg parent "${starting}" '.parents | length == 1 and .[0].sha == $parent' \
     <<<"${commit_json}" >/dev/null || die "expected publication commit is not based exactly on startingSHA"
   expected_compare_json="$(gh api "repos/${write_publication_slug}/compare/${starting}...${expected}")"
@@ -3093,7 +3146,16 @@ verify_remote_publication() {
     die "PR receipt is missing a numeric pull request number"
   fi
   pr_json="$(gh api "repos/${write_source_slug}/pulls/${pr_number}")"
+  local pr_observation
+  pr_observation="$(jq -c '{number, state, headSHA:.head.sha, baseSHA:.base.sha,
+    baseBranch:.base.ref, headBranch:.head.ref,
+    sourceRepository:("https://github.com/" + (.base.repo.full_name | ascii_downcase)),
+    publicationRepository:("https://github.com/" + (.head.repo.full_name | ascii_downcase))
+  }' <<<"${pr_json}")"
+  acp_report_update '.observations.pullRequest = $pr' --argjson pr "${pr_observation}"
   base_now_json="$(gh api "repos/${write_source_slug}/branches/${write_pr_base}")"
+  acp_report_update '.observations.baseHeads.publication = $sha' \
+    --arg sha "$(jq -r '.commit.sha // ""' <<<"${base_now_json}")"
   [[ "$(jq -r '.commit.sha // ""' <<<"${base_now_json}")" == "${starting}" ]] || \
     die "PR base branch moved after release-gate source resolution"
   pr_files_json="$(gh api --paginate --slurp "repos/${write_source_slug}/pulls/${pr_number}/files?per_page=100")"
@@ -3138,6 +3200,10 @@ verify_remote_publication() {
 
   remote_cleanup_head="${remote}"
   remote_cleanup_pr_number="${pr_number}"
+  acp_report_update '.checks.publication = true | .canary = {
+    path:$path, content:($content + "\n"), expectedCommitBytesMatched:true,
+    remoteBytesMatched:true, singleAddedFile:true
+  }' --arg path "${write_expected_file}" --arg content "${write_expected_content}"
 }
 
 run_write_release_gate() {
@@ -3174,22 +3240,37 @@ run_write_release_gate() {
   expected_forge_rv="$(k -n "${namespace}" get secret "${write_forge_credential_target}" -o jsonpath='{.metadata.resourceVersion}')"
   [[ -n "${expected_read_rv}" && -n "${expected_target_read_rv}" && -n "${expected_forge_rv}" ]] || \
     die "one or more role-separated credential Secrets have no resourceVersion"
+  acp_report_update '.checks.publisherSecretReadDenied = true | .credentials = [
+    {role:"sourceRead",namespace:$ns,name:$read,resourceVersion:$readRV},
+    {role:"targetRead",namespace:$ns,name:$targetRead,resourceVersion:$targetReadRV},
+    {role:"targetWrite",namespace:$ns,name:$write,resourceVersion:$writeRV},
+    {role:"forge",namespace:$ns,name:$forge,resourceVersion:$forgeRV}
+  ]' --arg ns "${namespace}" --arg read "${write_read_credential_target}" --arg readRV "${expected_read_rv}" \
+    --arg targetRead "${write_target_read_credential_target}" --arg targetReadRV "${expected_target_read_rv}" \
+    --arg write "${write_credential_target}" --arg writeRV "${expected_credential_rv}" \
+    --arg forge "${write_forge_credential_target}" --arg forgeRV "${expected_forge_rv}"
 
   local base_now_sha
   base_now_sha="$(gh api "repos/${write_source_slug}/branches/${write_pr_base}" --jq '.commit.sha')"
+  acp_report_update '.observations.baseHeads.submission = $sha' --arg sha "${base_now_sha}"
   [[ "${base_now_sha}" == "${write_source_commit}" ]] || \
     die "PR base branch moved before write Task submission"
 
   log "Running mandatory Codex clean-room publication and PR reconciliation gate"
   write_task_name="${task}"
   write_task_started=1
+  acp_report_update '.stage = "publication" | .expectedBranch = $branch
+    | .task = {namespace:$ns,name:$task}' \
+    --arg ns "${namespace}" --arg task "${task}" --arg branch "${write_branch}"
   apply_write_task "${task}" "${agent}"
+  acp_report_task "$(task_json "${task}")"
   wait_until "Task/${task} RuntimePool assignment" "${state_wait_seconds}" wait_task_pool_name_value "${task}"
   pool="$(wait_task_pool_name_value "${task}")"
   snapshot="${temp_root}/${task}-write-pool.json"
   capture_pool_snapshot "${pool}" codex "${codex_model}" write "${snapshot}"
   wait_task_terminal "${task}"
   payload="$(task_json "${task}")"
+  acp_report_task "${payload}"
   if ! jq -e '
     .status.phase == "Succeeded"
     and .status.execution.state == "Succeeded"
@@ -3218,6 +3299,7 @@ run_write_release_gate() {
     die "write Task did not freeze the target-read credential resourceVersion"
   [[ "$(jq -r '.status.execution.forgeCredentialResourceVersion // ""' <<<"${payload}")" == "${expected_forge_rv}" ]] || \
     die "write Task did not freeze the forge credential resourceVersion"
+  acp_report_update '.checks.credentialsFrozen = true'
 
   verify_remote_publication "${payload}"
   mark_task_validated "${task}"
@@ -3297,6 +3379,7 @@ settle_write_task_for_remote_cleanup() {
   [[ "${task_probe_state}" == "present" ]] || return 1
 
   pool="$(jq -r '.status.execution.runtimePoolName // ""' "${task_probe_file}")" || return 1
+  acp_report_task "$(cat "${task_probe_file}")" || return 1
   if [[ -n "${pool}" ]]; then
     require_runtimepool_mutation_scope || return 1
     probe_runtimepool "${pool}" || return 1
@@ -3398,6 +3481,7 @@ preflight_release_workloads() {
 }
 
 prepare_release_gate_environment
+acp_report_update '.stage = "validation" | .validation = "running"'
 
 log "Preflight for context ${context}"
 k config get-contexts "${context}" -o name | grep -Fxq "${context}" || die "kubectl context ${context} was not found"
@@ -3558,10 +3642,16 @@ if [[ "${release_gate}" -eq 1 ]]; then
   if [[ "${keep_resources}" != "1" ]]; then
     stop_api_forward || die "failed to stop controller API port-forward before final cleanup"
     delete_test_namespace_now || die "release-gate Kubernetes cleanup did not complete safely"
+    acp_report_update '.cleanup.kubernetes = "passed"'
   else
-    warn "ACP_E2E_KEEP_RESOURCES=1; release-gate Kubernetes resources are intentionally preserved"
+    die "ACP_E2E_KEEP_RESOURCES=1 preserves evidence but cannot qualify a release"
   fi
-  log "ACP v2 RELEASE GATE PASSED on context ${context}"
+  completion_base_sha="$(gh api "repos/${write_source_slug}/branches/${write_pr_base}" --jq '.commit.sha')"
+  acp_report_update '.observations.baseHeads.completion = $sha' --arg sha "${completion_base_sha}"
+  [[ "${completion_base_sha}" == "${write_source_commit}" ]] || \
+    die "PR base branch moved before release-gate completion; candidate is not qualified"
+  acp_report_update '.checks.baseUnchanged = true | .validation = "passed" | .stage = "cleanup"'
+  log "ACP v2 release checks passed on context ${context}; final qualification requires the cleanup report"
 else
   if [[ "${shared_mutation_checks_skipped}" -eq 1 ]]; then
     log "ACP v2 shared-namespace smoke validation passed on context ${context}; controller restart and RuntimePool lifecycle/replacement checks were skipped. Use an isolated namespace for complete smoke acceptance."

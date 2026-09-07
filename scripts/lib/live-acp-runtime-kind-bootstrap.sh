@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # acp_report_update arguments are jq programs.
 # Shared, source-only bootstrap for the live ACP runtime validator on Kind.
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
@@ -9,6 +10,8 @@ fi
 live_acp_kind_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/e2e-admission-tls.sh
 . "${live_acp_kind_lib_dir}/e2e-admission-tls.sh"
+# shellcheck source=scripts/lib/live-acp-release-report.sh
+. "${live_acp_kind_lib_dir}/live-acp-release-report.sh"
 unset live_acp_kind_lib_dir
 
 # Internal port-forward state is process-local. Reset inherited values so a
@@ -59,7 +62,20 @@ live_acp_kind_preflight() {
       ACP_E2E_WRITE_TARGET_READ_CREDENTIAL_TOKEN \
       ACP_E2E_WRITE_CREDENTIAL_TOKEN \
       ACP_E2E_WRITE_FORGE_CREDENTIAL_TOKEN; do
-      [[ -n "${!token_var:-}" ]] || live_acp_kind_die "${token_var} is required when RELEASE_GATE=1" || return 1
+      if [[ -z "${!token_var:-}" ]]; then
+        acp_report_update '.failure = {reason:"missing_credential", credential:$name}' --arg name "${token_var}" || return 1
+        live_acp_kind_die "${token_var} is required when RELEASE_GATE=1"
+        return 1
+      fi
+    done
+    local left right
+    local -a role_tokens=("${ACP_E2E_WRITE_READ_CREDENTIAL_TOKEN}" "${ACP_E2E_WRITE_TARGET_READ_CREDENTIAL_TOKEN}"
+      "${ACP_E2E_WRITE_CREDENTIAL_TOKEN}" "${ACP_E2E_WRITE_FORGE_CREDENTIAL_TOKEN}")
+    for ((left=0; left<4; left++)); do
+      for ((right=left+1; right<4; right++)); do
+        [[ "${role_tokens[$left]}" != "${role_tokens[$right]}" ]] || \
+          live_acp_kind_die "release-gate credentials must use four distinct values" || return 1
+      done
     done
   fi
   [[ -x "${LIVE_ACP_KINDCTL_BIN}" ]] || live_acp_kind_die "kindctl is not executable: ${LIVE_ACP_KINDCTL_BIN}" || return 1
@@ -95,6 +111,8 @@ live_acp_kind_create_cluster() {
   # Arm exact-tag deletion before create: Kind can leave a partial cluster even
   # when its create command returns non-zero.
   LIVE_ACP_KIND_CREATED=1
+  acp_report_update '.cluster = {tag:$tag, creationAttempted:true, registryStarted:false}' \
+    --arg tag "${LIVE_ACP_KIND_TAG}" || return 1
   live_acp_kind_run "${LIVE_ACP_KINDCTL_BIN}" "${args[@]}" || return $?
   LIVE_ACP_KUBECONFIG="$("${LIVE_ACP_KINDCTL_BIN}" path --tag "${LIVE_ACP_KIND_TAG}")"
   export KUBECONFIG="${LIVE_ACP_KUBECONFIG}"
@@ -102,14 +120,16 @@ live_acp_kind_create_cluster() {
   [[ "${LIVE_ACP_CONTEXT}" == kind-* ]] || live_acp_kind_die "scoped context is not a Kind context: ${LIVE_ACP_CONTEXT}" || return 1
   LIVE_ACP_KIND_CLUSTER="${LIVE_ACP_CONTEXT#kind-}"
   export LIVE_ACP_CONTEXT LIVE_ACP_KIND_CLUSTER LIVE_ACP_KUBECONFIG
+  acp_report_update '.cluster.name = $name' --arg name "${LIVE_ACP_KIND_CLUSTER}"
 }
 
 live_acp_kind_start_registry() {
   # shellcheck source=scripts/lib/kind-local-registry.sh
   . "${LIVE_ACP_REPO_ROOT}/scripts/lib/kind-local-registry.sh"
 
-  orka_kind_registry_start "${LIVE_ACP_KIND_CLUSTER}"
   LIVE_ACP_REGISTRY_STARTED=1
+  acp_report_update '.cluster.registryStarted = true'
+  orka_kind_registry_start "${LIVE_ACP_KIND_CLUSTER}"
 
   if [[ -n "${LIVE_ACP_VEKIL_LOCAL_IMAGE:-}" ]]; then
     # Publish the development Vekil before the Vekil deploy step so the
@@ -141,6 +161,11 @@ live_acp_kind_build_and_publish_images() {
   LIVE_ACP_GENERAL_WORKER_REF="$(orka_kind_registry_push "${LIVE_ACP_GENERAL_WORKER_IMAGE}" orka/general-worker)"
   export LIVE_ACP_CONTROLLER_REF LIVE_ACP_CODEX_REF LIVE_ACP_CLAUDE_REF LIVE_ACP_COPILOT_REF
   export LIVE_ACP_OPENCODE_REF LIVE_ACP_PUBLISHER_REF LIVE_ACP_GENERAL_WORKER_REF
+  acp_report_update '.builtImages = {controller:$controller, publisher:$publisher,
+    codex:$codex, claude:$claude, copilot:$copilot, opencode:$opencode}' \
+    --arg controller "${LIVE_ACP_CONTROLLER_REF}" --arg publisher "${LIVE_ACP_PUBLISHER_REF}" \
+    --arg codex "${LIVE_ACP_CODEX_REF}" --arg claude "${LIVE_ACP_CLAUDE_REF}" \
+    --arg copilot "${LIVE_ACP_COPILOT_REF}" --arg opencode "${LIVE_ACP_OPENCODE_REF}"
 }
 
 live_acp_kind_catalog_model_supports_endpoint() {
@@ -515,20 +540,67 @@ live_acp_kind_cleanup() {
   if [[ -n "${LIVE_ACP_SECRET_DIR:-}" ]]; then
     rm -rf -- "${LIVE_ACP_SECRET_DIR}" >/dev/null 2>&1 || cleanup_status=1
   fi
+  if (( cleanup_status == 0 )); then
+    acp_report_update '.cleanup.bootstrapCredentials = "passed"' || cleanup_status=1
+  else
+    acp_report_update '.cleanup.bootstrapCredentials = "failed"' || true
+  fi
+  if acp_report_enabled && jq -e '.preserved != null' "${ACP_E2E_REPORT_FILE}" >/dev/null; then
+    live_acp_kind_log "Preserving Kind resources because remote cleanup could not be proven safe"
+    acp_report_update '.cleanup.cluster = "preserved" | .cleanup.registry = "preserved"' || true
+    return 1
+  fi
   if [[ "${LIVE_ACP_KEEP_CLUSTER:-0}" == "1" ]]; then
     live_acp_kind_log "Keeping Kind cluster ${LIVE_ACP_KIND_CLUSTER:-<not-created>} (ACP_E2E_KEEP_CLUSTER=1)"
+    acp_report_update '.cleanup.cluster = "pending" | .cleanup.registry = "pending"' || cleanup_status=1
+    if (( status != 0 )); then return "${status}"; fi
+    return "${cleanup_status}"
+  fi
+  live_acp_kind_delete_cluster || cleanup_status=1
+  if (( status != 0 )); then
     return "${status}"
+  fi
+  return "${cleanup_status}"
+}
+
+# CI calls this after uploading the report, using only the recorded run tag and
+# cluster name. It does not repeat or overwrite credential cleanup results.
+live_acp_kind_delete_cluster() {
+  local cleanup_status=0
+  if acp_report_enabled; then
+    # A timeout can kill the validator before its EXIT trap records preservation.
+    # Once it was launched, require positive evidence of safe remote cleanup.
+    if ! jq -e '
+        .schemaVersion == 1 and .gate == "live-acp-release-gate" and .mode == "release"
+        and has("task") and has("preserved") and .preserved == null
+        and ((.validatorStarted == false and .task == null) or (.validatorStarted == true
+          and (.cleanup.remote == "passed" or (.cleanup.remote == "not_required" and .task == null))))
+      ' "${ACP_E2E_REPORT_FILE}" >/dev/null; then
+      live_acp_kind_log "Preserving Kind resources: remote cleanup is incomplete or unproven"
+      acp_report_update '.cleanup.cluster = "preserved" | .cleanup.registry = "preserved"
+        | .preserved //= {reason:"remote_cleanup_unproven", namespace:.task.namespace,
+            task:.task.name, publicationRepository:.publicationRepository,
+            branch:.expectedBranch, receiptHead:.task.delivery.verifiedRemoteSHA}' || true
+      return 1
+    fi
   fi
   if [[ "${LIVE_ACP_REGISTRY_STARTED:-0}" == "1" ]]; then
     # shellcheck source=scripts/lib/kind-local-registry.sh
     . "${LIVE_ACP_REPO_ROOT}/scripts/lib/kind-local-registry.sh"
-    orka_kind_registry_stop "${LIVE_ACP_KIND_CLUSTER:-}" || cleanup_status=1
+    if orka_kind_registry_stop "${LIVE_ACP_KIND_CLUSTER:-}"; then
+      acp_report_update '.cleanup.registry = "passed"' || cleanup_status=1
+    else
+      cleanup_status=1
+      acp_report_update '.cleanup.registry = "failed"' || true
+    fi
   fi
   if [[ "${LIVE_ACP_KIND_CREATED:-0}" == "1" ]]; then
-    "${LIVE_ACP_KINDCTL_BIN}" delete --tag "${LIVE_ACP_KIND_TAG}" || cleanup_status=1
-  fi
-  if (( status != 0 )); then
-    return "${status}"
+    if "${LIVE_ACP_KINDCTL_BIN}" delete --tag "${LIVE_ACP_KIND_TAG}"; then
+      acp_report_update '.cleanup.cluster = "passed"' || cleanup_status=1
+    else
+      cleanup_status=1
+      acp_report_update '.cleanup.cluster = "failed"' || true
+    fi
   fi
   return "${cleanup_status}"
 }
