@@ -111,6 +111,11 @@ Task prompts/results, free-form messages, Pod environment values, and Secret
 contents. A failure before deployment records the candidate and failed stage;
 unobserved fields remain absent or incomplete.
 
+The report also retains GitHub's independently observed publication commit and
+tree. The final Task receipt must match both; `VerifiedExact` additionally
+requires the remote head to equal that commit. Cleanup cannot replace this
+evidence with a different receipt and retain a qualified result.
+
 One Codex Task must create exactly the requested new file. The gate compares its
 bytes at the expected commit and independently observed remote head, verifies
 the commit parent/tree and one-file diff, and reads the open PR from GitHub.

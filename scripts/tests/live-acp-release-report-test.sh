@@ -70,10 +70,11 @@ acp_report_update '
   | .observations = {
     baseHeads:{preflight:.candidateSHA,submission:.candidateSHA,publication:.candidateSHA,completion:.candidateSHA},
     remoteHead:$head,
+    expectedCommit:{sha:$head,treeSHA:$tree},
     pullRequest:{number:42,state:"open",headSHA:$head,baseSHA:.candidateSHA,
       baseBranch:"main",headBranch:.task.delivery.branch,
       sourceRepository:.sourceRepository,publicationRepository:.publicationRepository}}
-' --arg head "${commit}"
+' --arg head "${commit}" --arg tree "${tree}"
 if grep -F "${sentinel}" "${ACP_E2E_REPORT_FILE}" >/dev/null; then
   echo 'acceptance report copied excluded Task or Pod content' >&2
   exit 1
@@ -82,6 +83,19 @@ acp_report_finish
 jq -e '.result == "qualified" and .finishedAt != null' "${ACP_E2E_REPORT_FILE}" >/dev/null
 cp "${ACP_E2E_REPORT_FILE}" "${fixture}/qualified.json"
 printf '%s\n' 'ok - complete publication evidence qualifies without Task content or credentials'
+
+jq --arg head 3333333333333333333333333333333333333333 '
+  .task.delivery.state = "DeliveredSuperseded" | .task.delivery.outcome = "DeliveredSuperseded"
+  | .task.delivery.supersedingRemoteSHA = $head | .task.delivery.prReceipt.headSHA = $head
+  | .observations.remoteHead = $head | .observations.pullRequest.headSHA = $head
+' "${fixture}/qualified.json" >"${ACP_E2E_REPORT_FILE}"
+acp_report_finish
+acp_report_update '.task.delivery.state = "VerifiedExact" | .task.delivery.outcome = "VerifiedExact"'
+if acp_report_finish 2>/dev/null; then
+  echo 'VerifiedExact qualified with a distinct superseding remote head' >&2
+  exit 1
+fi
+printf '%s\n' 'ok - a superseding head requires DeliveredSuperseded and preserves the observed commit receipt'
 
 while IFS= read -r mutation; do
   jq "${mutation}" "${fixture}/qualified.json" >"${ACP_E2E_REPORT_FILE}"
@@ -106,12 +120,19 @@ done <<'MUTATIONS'
 .observations.baseHeads.submission = "0000000000000000000000000000000000000000"
 .observations.baseHeads.completion = "0000000000000000000000000000000000000000"
 .observations.remoteHead = "0000000000000000000000000000000000000000"
+.observations.expectedCommit.sha = "3333333333333333333333333333333333333333"
+.observations.expectedCommit.treeSHA = "3333333333333333333333333333333333333333"
+del(.observations.expectedCommit)
 .observations.pullRequest.number = 43
 .observations.pullRequest.headBranch = "somebody-elses-branch"
 .expectedBranch = "somebody-elses-branch"
 .observations.pullRequest.sourceRepository = .publicationRepository
 .task.delivery.prReceipt = null
 .task.delivery.artifactDigest = null
+.task.delivery.expectedCommitSHA = "3333333333333333333333333333333333333333"
+.task.delivery.treeSHA = "3333333333333333333333333333333333333333"
+.task.delivery.expectedCommitSHA = "3333333333333333333333333333333333333333" | .observations.expectedCommit.sha = .task.delivery.expectedCommitSHA
+.task.delivery.outcome = "DeliveredSuperseded"
 .task.execution.attempt = 2
 .task.execution.forgeCredentialResourceVersion = "rotated"
 .credentials = []

@@ -3094,8 +3094,10 @@ verify_remote_publication() {
     die "independent remote branch head does not match the Task delivery receipt"
 
   commit_json="$(gh api "repos/${write_publication_slug}/git/commits/${expected}")"
-  [[ "$(jq -r '.tree.sha // ""' <<<"${commit_json}")" == "${tree}" ]] || \
-    die "Task treeSHA does not match the independently observed expected commit tree"
+  acp_report_update '.observations.expectedCommit = $commit' \
+    --argjson commit "$(jq -c '{sha, treeSHA:.tree.sha}' <<<"${commit_json}")"
+  jq -e --arg sha "${expected}" --arg tree "${tree}" '.sha == $sha and .tree.sha == $tree' \
+    <<<"${commit_json}" >/dev/null || die "Task commit/tree receipt does not match the independently observed expected commit"
   jq -e --arg parent "${starting}" '.parents | length == 1 and .[0].sha == $parent' \
     <<<"${commit_json}" >/dev/null || die "expected publication commit is not based exactly on startingSHA"
   expected_compare_json="$(gh api "repos/${write_publication_slug}/compare/${starting}...${expected}")"

@@ -139,9 +139,14 @@ acp_report_qualified() {
       and .task.delivery.startingSHA == .candidateSHA
       and (.expectedBranch | present) and .task.delivery.branch == .expectedBranch
       and (.task.delivery.expectedCommitSHA | sha) and (.task.delivery.treeSHA | sha)
+      and .task.delivery.expectedCommitSHA == .observations.expectedCommit.sha
+      and .task.delivery.treeSHA == .observations.expectedCommit.treeSHA
       and (.task.delivery.artifactDigest | digest)
       and (.observations.remoteHead | sha)
       and .observations.remoteHead == (.task.delivery.supersedingRemoteSHA | select(. != null and . != "") // $r.task.delivery.verifiedRemoteSHA)
+      and (if .task.delivery.outcome == "VerifiedExact"
+        then .observations.remoteHead == .task.delivery.expectedCommitSHA
+        else .observations.remoteHead != .task.delivery.expectedCommitSHA end)
       and .observations.pullRequest.number == .task.delivery.prReceipt.number
       and (.observations.pullRequest.number | type == "number" and . > 0)
       and .observations.pullRequest.state == "open"

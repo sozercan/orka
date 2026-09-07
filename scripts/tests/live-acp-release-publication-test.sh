@@ -55,6 +55,7 @@ gh_raw_file() {
 }
 gh() {
   local endpoint="${*: -1}" parent="${write_source_commit}" observed_tree="${tree}"
+  local observed_commit="${head}"
   local base="${write_source_commit}" branch="${write_branch}" number=42 merged=null
   if [[ "$*" == *'--method PATCH'* ]]; then
     printf 'close_pr\n' >>"${temp_root}/events"
@@ -63,9 +64,11 @@ gh() {
   fi
   case "${endpoint}" in
     "repos/${write_publication_slug}/git/commits/${head}")
+      [[ "${fault}" != wrong_commit ]] || observed_commit="${other}"
       [[ "${fault}" != wrong_parent ]] || parent="${other}"
       [[ "${fault}" != wrong_tree ]] || observed_tree="${other}"
-      jq -n --arg parent "${parent}" --arg tree "${observed_tree}" '{parents:[{sha:$parent}],tree:{sha:$tree}}'
+      jq -n --arg sha "${observed_commit}" --arg parent "${parent}" --arg tree "${observed_tree}" \
+        '{sha:$sha,parents:[{sha:$parent}],tree:{sha:$tree}}'
       ;;
     "repos/${write_publication_slug}/compare/${write_source_commit}...${head}")
       jq -n --arg path "${write_expected_file}" '{status:"ahead",files:[{filename:$path,status:"added"}]}'
@@ -106,8 +109,11 @@ payload="$(jq -n --arg base "${write_source_commit}" --arg head "${head}" --arg 
   }')"
 acp_report_init "${root}"
 verify_remote_publication "${payload}"
-jq -e '.checks.publication == true and .canary.remoteBytesMatched == true' "${ACP_E2E_REPORT_FILE}" >/dev/null
-for fault in wrong_content wrong_parent wrong_tree wrong_head wrong_branch wrong_pr moved_base read_failure; do
+jq -e --arg sha "${head}" --arg tree "${tree}" '
+  .checks.publication == true and .canary.remoteBytesMatched == true
+  and .observations.expectedCommit == {sha:$sha,treeSHA:$tree}
+' "${ACP_E2E_REPORT_FILE}" >/dev/null
+for fault in wrong_content wrong_commit wrong_parent wrong_tree wrong_head wrong_branch wrong_pr moved_base read_failure; do
   acp_report_init "${root}"
   if (verify_remote_publication "${payload}") >"${temp_root}/failure.log" 2>&1; then
     printf 'publication accepted invalid independent evidence: %s\n' "${fault}" >&2
