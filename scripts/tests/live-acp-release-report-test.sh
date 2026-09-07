@@ -150,13 +150,20 @@ set -Eeuo pipefail
 if [[ "$1" == api ]]; then
   case "$*" in
     *'/artifacts?'*) cat "${QUALIFICATION_FIXTURE}/artifacts.json" ;;
-    *'/actions/runs/'*) cat "${QUALIFICATION_FIXTURE}/run.json" ;;
+    *'/actions/runs/'*)
+      if [[ -f "${QUALIFICATION_FIXTURE}/download-complete" && -f "${QUALIFICATION_FIXTURE}/run-after-download.json" ]]; then
+        cat "${QUALIFICATION_FIXTURE}/run-after-download.json"
+      else
+        cat "${QUALIFICATION_FIXTURE}/run.json"
+      fi
+      ;;
     *) printf 'main\n' ;;
   esac
 elif [[ "$1 $2" == 'run download' ]]; then
   while [[ "$1" != --dir ]]; do shift; done
   mkdir -p "$2"
   cp "${QUALIFICATION_FIXTURE}/qualified.json" "$2/acceptance.json"
+  touch "${QUALIFICATION_FIXTURE}/download-complete"
 else
   exit 99
 fi
@@ -185,3 +192,21 @@ done <<'MUTATIONS'
 .run_attempt = 2
 MUTATIONS
 printf '%s\n' 'ok - qualification requires the exact trusted workflow, commit, successful run and current attempt artifact'
+
+cp "${fixture}/run-original.json" "${fixture}/run.json"
+while IFS= read -r mutation; do
+  jq "${mutation}" "${fixture}/run-original.json" >"${fixture}/run-after-download.json"
+  rm -f "${fixture}/download-complete"
+  if PATH="${fixture}/bin:${PATH}" bash "${root}/scripts/verify-acp-release-qualification.sh" \
+      "${GITHUB_SHA}" "${GITHUB_RUN_ID}" >/dev/null 2>&1; then
+    rm -rf "${root}/bin/acp-release-qualification-${GITHUB_RUN_ID}-1"
+    printf 'workflow change during artifact download qualified: %s\n' "${mutation}" >&2
+    exit 1
+  fi
+done <<'MUTATIONS'
+.run_attempt = 2 | .status = "in_progress" | .conclusion = null
+.run_attempt = 2
+.status = "queued" | .conclusion = null
+.conclusion = "failure"
+MUTATIONS
+printf '%s\n' 'ok - workflow reruns and status changes during artifact download invalidate qualification'

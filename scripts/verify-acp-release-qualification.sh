@@ -51,6 +51,18 @@ if ! acp_report_qualified "${report}" || ! jq -e \
   exit 1
 fi
 
+# Reruns reuse the run ID. Require the same completed attempt after downloading
+# and validating its report, before accepting or retaining that evidence.
+gh api "repos/${repository}/actions/runs/${run_id}" >"${report_dir}/run-after-download.json"
+if ! jq -e --slurpfile initial "${report_dir}/run.json" '
+    def identity: {run_attempt, status, conclusion, event, head_sha, head_branch, path,
+      repository:.repository.full_name, head_repository:.head_repository.full_name};
+    identity == ($initial[0] | identity)
+  ' "${report_dir}/run-after-download.json" >/dev/null; then
+  echo 'Not qualified: the workflow attempt or outcome changed while its report was being verified.' >&2
+  exit 1
+fi
+
 destination="${script_dir}/../bin/acp-release-qualification-${run_id}-${attempt}"
 mkdir -p "${destination}"
 cp "${report}" "${destination}/acceptance.json"
