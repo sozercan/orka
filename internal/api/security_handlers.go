@@ -355,7 +355,11 @@ func (h *Handlers) createSecurityValidationTask(ctx context.Context, ui *UserInf
 	}
 	timeout := metav1.Duration{Duration: 90 * time.Minute}
 	priority := int32(725)
-	taskName := security.ScanStageTaskName(scan.Name, "validation", security.StageValidation, finding.ID)
+	taskScope := finding.ID
+	if scanRunID := strings.TrimSpace(finding.ScanRunID); scanRunID != "" {
+		taskScope += "-" + scanRunID
+	}
+	taskName := security.ScanStageTaskName(scan.Name, "validation", security.StageValidation, taskScope)
 	resultBinding := security.AgentResultBinding{
 		RepositoryScan: scan.Name,
 		ScanID:         finding.ScanRunID,
@@ -427,7 +431,7 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 
 	agentRef := securityPatchAgentRef(scan)
 
-	taskName := security.PatchTaskName(scan.Name, finding.ID)
+	taskName := security.PatchTaskName(scan.Name, finding.ID, finding.ScanRunID)
 	proposalID := security.PatchProposalID(taskName)
 	branch := security.PatchBranch(finding.ID, taskName)
 	timeout := metav1.Duration{Duration: 2 * time.Hour}
@@ -441,7 +445,7 @@ func (h *Handlers) createSecurityPatchTask(ctx context.Context, ui *UserInfo, sc
 				labels.LabelManaged:           "true",
 				labels.LabelCreatedBy:         "repository-security",
 				labels.LabelSecurityTarget:    labels.SelectorValue(scan.Name),
-				labels.LabelSecurityScanID:    proposalID,
+				labels.LabelSecurityScanID:    finding.ScanRunID,
 				labels.LabelSecurityMode:      "patch",
 				labels.LabelSecurityStage:     security.StagePatch,
 				labels.LabelSecurityFindingID: finding.ID,
@@ -663,6 +667,9 @@ func (h *Handlers) UpdateRepositoryScan(c fiber.Ctx) error {
 	}
 	if req.Spec.AnalysisAgentRef.Name == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "spec.analysisAgentRef.name is required")
+	}
+	if req.Spec.RepoURL != scan.Spec.RepoURL {
+		return fiber.NewError(fiber.StatusConflict, "spec.repoURL is immutable; create a new repository scan for a different repository")
 	}
 
 	h.normalizeRepositoryScanSpec(&req.Spec)
@@ -1072,6 +1079,10 @@ func (h *Handlers) DismissSecurityFinding(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
 	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
+	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {
 		return err
@@ -1079,7 +1090,7 @@ func (h *Handlers) DismissSecurityFinding(c fiber.Ctx) error {
 	if err := h.authorizeContextTokenSecurityScanTask(c, "dismissSecurityFinding", scan, scan.Spec.AnalysisAgentRef); err != nil {
 		return err
 	}
-	if err := h.securityStore.UpdateFindingState(c.Context(), namespace, c.Params("id"), "dismissed"); err != nil {
+	if err := h.securityStore.UpdateFindingState(c.Context(), namespace, finding.ID, "dismissed"); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
@@ -1107,6 +1118,10 @@ func (h *Handlers) ReopenSecurityFinding(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
 	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
+	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {
 		return err
@@ -1114,7 +1129,7 @@ func (h *Handlers) ReopenSecurityFinding(c fiber.Ctx) error {
 	if err := h.authorizeContextTokenSecurityScanTask(c, "reopenSecurityFinding", scan, scan.Spec.AnalysisAgentRef); err != nil {
 		return err
 	}
-	if err := h.securityStore.UpdateFindingState(c.Context(), namespace, c.Params("id"), "open"); err != nil {
+	if err := h.securityStore.UpdateFindingState(c.Context(), namespace, finding.ID, "open"); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
@@ -1141,6 +1156,10 @@ func (h *Handlers) ValidateSecurityFinding(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
+	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
 	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {
@@ -1174,6 +1193,10 @@ func (h *Handlers) GenerateSecurityPatch(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "finding not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
+	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
 	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {
@@ -1301,6 +1324,26 @@ func (h *Handlers) authorizeContextTokenSecurityScanTask(c fiber.Ctx, action str
 	return h.handleContextTokenAuthorizationFailures(token, action, failures)
 }
 
+func (h *Handlers) canonicalSecurityFinding(ctx context.Context, namespace string, finding *store.Finding) (*store.Finding, error) {
+	repositoryScan := finding.RepositoryScan
+	seen := map[string]struct{}{finding.ID: {}}
+	for duplicateID := strings.TrimSpace(finding.DuplicateOf); duplicateID != ""; duplicateID = strings.TrimSpace(finding.DuplicateOf) {
+		if _, ok := seen[duplicateID]; ok {
+			return nil, fmt.Errorf("finding duplicate chain contains a cycle at %s", duplicateID)
+		}
+		seen[duplicateID] = struct{}{}
+		canonical, err := h.securityStore.GetFinding(ctx, namespace, duplicateID)
+		if err != nil {
+			return nil, err
+		}
+		if canonical.RepositoryScan != repositoryScan {
+			return nil, fmt.Errorf("finding duplicate %s points outside repository scan %s", finding.ID, repositoryScan)
+		}
+		finding = canonical
+	}
+	return finding, nil
+}
+
 // CreateSecurityPullRequest returns the pull request reconciled by the governed patch Task.
 func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 	if err := h.ensureSecurityStore(); err != nil {
@@ -1320,6 +1363,10 @@ func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to get finding: %v", err))
 	}
+	finding, err = h.canonicalSecurityFinding(c.Context(), namespace, finding)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to resolve canonical finding: %v", err))
+	}
 	scan, err := h.fetchRepositoryScan(c.Context(), namespace, finding.RepositoryScan)
 	if err != nil {
 		return err
@@ -1332,9 +1379,13 @@ func (h *Handlers) CreateSecurityPullRequest(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to list patch proposals: %v", err))
 	}
+	currentProposalID := strings.TrimSpace(finding.PatchProposalID)
+	if currentProposalID == "" {
+		return fiber.NewError(fiber.StatusConflict, "governed pull request receipt is not available yet")
+	}
 	var proposal *store.PatchProposal
 	for i := range proposals {
-		if proposals[i].Status == "pr_opened" && proposals[i].PRNumber != nil && proposals[i].PRURL != "" {
+		if proposals[i].ID == currentProposalID && proposals[i].Status == "pr_opened" && proposals[i].PRNumber != nil && proposals[i].PRURL != "" {
 			proposal = &proposals[i]
 			break
 		}

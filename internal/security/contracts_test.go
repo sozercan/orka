@@ -429,6 +429,24 @@ func TestFindingV2FingerprintCanonicalizesEquivalentEvidence(t *testing.T) {
 	}
 }
 
+func TestFindingV2TargetKeyCanonicalizesInputAndSeparatesBranches(t *testing.T) {
+	canonical := FindingV2TargetKey("https://github.com/example/app", "main", "services/api")
+	equivalent := FindingV2TargetKey(" https://github.com/example/app ", " main ", "/services/api/")
+	sshEquivalent := FindingV2TargetKey("git@github.com:example/app.git", "main", "services/api")
+	dotGitEquivalent := FindingV2TargetKey("https://github.com/example/app.git", "main", "services/api")
+	otherBranch := FindingV2TargetKey("https://github.com/example/app", "release", "services/api")
+
+	if canonical != equivalent {
+		t.Fatalf("equivalent target keys differ: %q vs %q", canonical, equivalent)
+	}
+	if canonical != sshEquivalent || canonical != dotGitEquivalent {
+		t.Fatalf("canonical repository target keys differ: HTTPS %q, SSH %q, HTTPS .git %q", canonical, sshEquivalent, dotGitEquivalent)
+	}
+	if canonical == otherBranch {
+		t.Fatalf("target key %q does not distinguish branches", canonical)
+	}
+}
+
 func TestBuildReviewContextBoundsPromptAndManifest(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "app.go", strings.Repeat("line\n", 20))

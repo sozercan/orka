@@ -301,6 +301,7 @@ func ToFindingV2(
 		ScanTaskName:                  taskName,
 		SliceID:                       sliceID,
 		Fingerprint:                   fingerprint,
+		TargetKey:                     FindingV2TargetKey(repo.RepoURL, repo.Branch, repo.SubPath),
 		Title:                         item.Title,
 		Category:                      item.Category,
 		Summary:                       item.Summary,

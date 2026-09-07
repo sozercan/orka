@@ -1065,6 +1065,9 @@ func (h *Handlers) CreateRepositoryMonitorCommandEvent(c fiber.Ctx) error {
 	if err := validateRepositoryMonitorCommandTargetEnabled(monitor.Spec, req.Kind); err != nil {
 		return err
 	}
+	if req.Intent == commandIntentUpdateBranch && (monitor.Spec.ForgeCredentialRef == nil || strings.TrimSpace(monitor.Spec.ForgeCredentialRef.Name) == "") {
+		return fiber.NewError(fiber.StatusBadRequest, "spec.forgeCredentialRef is required for update_branch commands")
+	}
 	item, err := h.repositoryMonitorStore.GetMonitorItem(c.Context(), namespace, monitor.Name, req.Kind, strconv.FormatInt(req.Number, 10))
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to inspect monitor target: %v", err))

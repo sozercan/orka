@@ -369,6 +369,8 @@ func TestExternalAPIAuthorizedSecurityActions(t *testing.T) {
 	require.NoError(t, f.kube.Get(t.Context(), client.ObjectKey{Namespace: "default", Name: proposals[0].TaskName}, &corev1alpha1.Task{}))
 	prNumber := 42
 	require.NoError(t, f.store.CreatePatchProposal(t.Context(), &store.PatchProposal{ID: "receipt", Namespace: "default", RepositoryScan: "protected", FindingID: "protected", Status: "pr_opened", PRNumber: &prNumber, PRURL: "https://github.com/orka-agents/orka/pull/42"}))
+	finding.PatchProposalID = "receipt"
+	require.NoError(t, f.store.UpsertFinding(t.Context(), finding))
 	f.allowRoute(t, "POST /api/v1/security/findings/:id/pull-request")
 	before := f.changes(t)
 	status, body = f.request(t, http.MethodPost, "/api/v1/security/findings/protected/pull-request", `{}`)

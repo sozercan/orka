@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"strings"
@@ -47,11 +48,14 @@ const (
 	repositoryMonitorRunPhaseFailed            = "failed"
 	repositoryMonitorRunRetryScheduled         = "retry_scheduled"
 	repositoryMonitorRunFailurePermanent       = "run_failed"
+	repositoryMonitorCommandIntentReview       = "review"
+	repositoryMonitorCommandIntentFixCI        = "fix_ci"
 	repositoryMonitorCommandIntentUpdateBranch = "update_branch"
 	repositoryMonitorCommandIntentDecompose    = "decompose"
 
 	repositoryMonitorRunningRunTimeout = 30 * time.Minute
 	repositoryMonitorValidationRetry   = time.Minute
+	repositoryMonitorStaleRunError     = "[retry_scheduled] repository monitor run did not complete within "
 
 	repositoryMonitorReasonReviewerCredentialsInvalid = "ReviewerCredentialsInvalid"
 	repositoryMonitorReasonGitSecretInvalid           = "GitSecretInvalid"
@@ -260,7 +264,7 @@ func validateRepositoryMonitorCommandLabels(spec corev1alpha1.RepositoryMonitorS
 	labels := spec.Triggers.GitHub.Labels
 	groups := [][]struct{ intent, label string }{
 		{{"triage", labels.Issues.Triage}, {"research", labels.Issues.Research}, {"plan", labels.Issues.Plan}, {"approve_plan", labels.Issues.ApprovePlan}, {"implement", labels.Issues.Implement}, {repositoryMonitorCommandIntentDecompose, labels.Issues.Decompose}, {"stop", labels.Issues.Stop}, {"resume", labels.Issues.Resume}},
-		{{"review", labels.PullRequests.Review}, {"fix", labels.PullRequests.Fix}, {"fix_ci", labels.PullRequests.FixCI}, {repositoryMonitorCommandIntentUpdateBranch, labels.PullRequests.UpdateBranch}, {"automerge", labels.PullRequests.Automerge}, {"stop", labels.PullRequests.Stop}, {"resume", labels.PullRequests.Resume}},
+		{{repositoryMonitorCommandIntentReview, labels.PullRequests.Review}, {"fix", labels.PullRequests.Fix}, {repositoryMonitorCommandIntentFixCI, labels.PullRequests.FixCI}, {repositoryMonitorCommandIntentUpdateBranch, labels.PullRequests.UpdateBranch}, {repositoryMonitorCommandIntentAutomerge, labels.PullRequests.Automerge}, {"stop", labels.PullRequests.Stop}, {"resume", labels.PullRequests.Resume}},
 	}
 	for _, group := range groups {
 		seen := map[string]string{}
@@ -282,7 +286,7 @@ func defaultRepositoryMonitorCommandLabel(intent string) string {
 	switch intent {
 	case "approve_plan":
 		return "orka:approve-plan"
-	case "fix_ci":
+	case repositoryMonitorCommandIntentFixCI:
 		return "orka:fix-ci"
 	case repositoryMonitorCommandIntentUpdateBranch:
 		return "orka:update-branch"
@@ -849,7 +853,7 @@ func (r *RepositoryMonitorReconciler) failStaleRunningMonitorRun(ctx context.Con
 
 	run.Phase = repositoryMonitorRunPhaseFailed
 	run.CompletedAt = &now
-	run.Error = fmt.Sprintf("[retry_scheduled] repository monitor run did not complete within %s and was marked failed", repositoryMonitorRunningRunTimeout)
+	run.Error = fmt.Sprintf("%s%s and was marked failed", repositoryMonitorStaleRunError, repositoryMonitorRunningRunTimeout)
 	if err := r.Store.UpdateMonitorRun(ctx, &run); err != nil {
 		return nil, 0, err
 	}
@@ -865,6 +869,9 @@ func (r *RepositoryMonitorReconciler) failStaleRunningMonitorRun(ctx context.Con
 func repositoryMonitorRunFailureState(err error) string {
 	if err == nil {
 		return ""
+	}
+	if _, ok := errors.AsType[*repositoryMonitorPendingMutationProjectionError](err); ok {
+		return repositoryMonitorRunRetryScheduled
 	}
 	if ghErr, ok := errors.AsType[*repositoryMonitorGitHubAPIError](err); ok {
 		if ghErr.StatusCode == http.StatusTooManyRequests || (ghErr.StatusCode == http.StatusForbidden && repositoryMonitorGitHubErrorLooksRateLimited(ghErr.Body)) {
@@ -882,6 +889,9 @@ func repositoryMonitorRunFailureState(err error) string {
 		if ghErr.StatusCode >= 400 && ghErr.StatusCode < 500 {
 			return "run_failed"
 		}
+	}
+	if errors.Is(err, io.EOF) {
+		return repositoryMonitorRunRetryScheduled
 	}
 	lower := strings.ToLower(err.Error())
 	if apierrors.IsTooManyRequests(err) || strings.Contains(lower, "insufficient quota") || strings.Contains(lower, "cluster capacity") {

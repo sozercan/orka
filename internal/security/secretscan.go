@@ -64,7 +64,7 @@ const (
 )
 
 var (
-	// credentialKeywords are the suffixes of every alternative in the
+	// credentialKeywords occur within every alternative in the
 	// credential-key alternation shared by the assignment and YAML patterns
 	// (api/private key, *token, password, *secret, credential(s)).
 	credentialKeywords = &keywordSet{needles: []string{

@@ -359,3 +359,27 @@ func TestParsePatchResultRejectsInvalidEnvelopes(t *testing.T) {
 		})
 	}
 }
+
+func TestParsePatchResultRejectsGenericCredentialAssignments(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"AWS_SECRET_ACCESS_KEY", "DATABASE_SECRET", "SERVICE_CREDENTIALS"} {
+		for _, field := range []string{"summary", "test command"} {
+			t.Run(name+"/"+field, func(t *testing.T) {
+				payload := map[string]any{
+					"schemaVersion": 1, "kind": "orka.security.patch.v1", "repositoryScan": "kaset",
+					"findingId": testPatchFindingID, "summary": "Removed the credential.", "changedFiles": []string{"config.yml"}, "risk": "low",
+				}
+				assignment := name + "=" + strings.Repeat("0a1b2c3d", 5)
+				if field == "summary" {
+					payload["summary"] = "Removed " + assignment + " from config."
+				} else {
+					payload["testsRun"] = []map[string]any{{"command": assignment + " npm test", "exitCode": 0}}
+				}
+				_, err := ParsePatchResult(mustMarshalSecurityResult(t, payload), PatchResultExpectation{RepositoryScan: "kaset", FindingID: testPatchFindingID})
+				if err == nil {
+					t.Fatal("patch result accepted a credential assignment")
+				}
+			})
+		}
+	}
+}

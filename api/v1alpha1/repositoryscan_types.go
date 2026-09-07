@@ -23,6 +23,7 @@ type PolicyConfigMapKeyRef struct {
 }
 
 // RepositoryScanSpec defines the desired state of RepositoryScan.
+// +kubebuilder:validation:XValidation:rule="self.repoURL == oldSelf.repoURL",message="repoURL is immutable; create a new RepositoryScan for a different repository"
 type RepositoryScanSpec struct {
 	// Provider is the source control provider. GitHub is the only supported v1 provider.
 	// +kubebuilder:validation:Enum=github

@@ -1067,6 +1067,35 @@ func TestCreateRepositoryMonitorCommandEventRequiresPRTargetSHA(t *testing.T) {
 	require.Empty(t, runs)
 }
 
+func TestCreateRepositoryMonitorCommandEventRequiresForgeCredentialForUpdateBranch(t *testing.T) {
+	app, handlers := setupRepositoryMonitorHandlers(t, ContextTokenConfig{}, ContextTokenAuthorizationModeOff)
+	body := fmt.Sprintf(`{"name":"repo-monitor","namespace":"demo","spec":{"repoURL":%q,"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL)
+	createReq := httptest.NewRequest(http.MethodPost, "/monitors/repositories", strings.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := app.Test(createReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, createResp.StatusCode)
+	require.NoError(t, handlers.repositoryMonitorStore.UpsertMonitorItem(t.Context(), &store.MonitorItem{
+		MonitorNamespace: "demo",
+		MonitorName:      "repo-monitor",
+		Kind:             repositoryMonitorTargetKindPullRequest,
+		ItemKey:          "12",
+		Number:           12,
+		State:            "open",
+		HeadSHA:          "current-head",
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/monitors/repositories/repo-monitor/commands?namespace=demo", strings.NewReader(`{"kind":"pull_request","number":12,"intent":"update_branch","targetSHA":"current-head"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Contains(t, readRespBody(t, resp), "spec.forgeCredentialRef is required")
+	runs, _, err := handlers.repositoryMonitorStore.ListMonitorRuns(t.Context(), store.MonitorRunFilter{Namespace: "demo", MonitorName: "repo-monitor", TargetKind: repositoryMonitorTargetKindPullRequest, TargetNumber: 12, Limit: 10})
+	require.NoError(t, err)
+	require.Empty(t, runs)
+}
+
 func TestCreateRepositoryMonitorCommandEventRejectsStalePRTargetSHA(t *testing.T) {
 	app, handlers := setupRepositoryMonitorHandlers(t, ContextTokenConfig{}, ContextTokenAuthorizationModeOff)
 	body := fmt.Sprintf(`{"name":"repo-monitor","namespace":"demo","spec":{"repoURL":%q,"agents":{"reviewer":{"name":"reviewer"}}}}`, monitorTestRepoURL)

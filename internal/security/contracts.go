@@ -351,6 +351,25 @@ func FindingV2Fingerprint(namespace, repositoryScan, repoURL, branch, subPath, s
 	return "v2:" + hex.EncodeToString(sum[:])
 }
 
+// FindingV2TargetKey identifies the repository branch or ref and subpath that
+// produced a finding without exposing those values through the store API.
+func FindingV2TargetKey(repoURL, branch, subPath string) string {
+	payload := struct {
+		Version int    `json:"version"`
+		RepoURL string `json:"repoURL"`
+		Branch  string `json:"branch"`
+		SubPath string `json:"subPath"`
+	}{
+		Version: 1,
+		RepoURL: CanonicalRepositoryCloneURL(repoURL),
+		Branch:  strings.TrimSpace(branch),
+		SubPath: strings.Trim(strings.TrimSpace(subPath), "/"),
+	}
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return "v1:" + hex.EncodeToString(sum[:])
+}
+
 type findingV2FingerprintEvidenceRef struct {
 	Path      string  `json:"path"`
 	StartLine int     `json:"startLine"`

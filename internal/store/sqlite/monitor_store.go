@@ -1043,12 +1043,12 @@ func (s *Store) CreateRepairJob(ctx context.Context, job *store.RepairJob) error
 	job.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO repair_jobs
-		 (id, monitor_namespace, monitor_name, repo, pr_number, intent, source, head_sha, base_sha,
+		 (id, monitor_namespace, monitor_name, repo, pr_number, intent, source, head_sha, base_sha, base_branch,
 		  phase, repair_count_pr, repair_count_head, validation_attempts, review_fix_attempts,
 		  task_name, branch, pushed_sha, last_error, created_at, updated_at, completed_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		job.ID, job.MonitorNamespace, job.MonitorName, job.Repo, job.PRNumber, job.Intent, job.Source,
-		job.HeadSHA, job.BaseSHA, job.Phase, job.RepairCountPR, job.RepairCountHead,
+		job.HeadSHA, job.BaseSHA, job.BaseBranch, job.Phase, job.RepairCountPR, job.RepairCountHead,
 		job.ValidationAttempts, job.ReviewFixAttempts, job.TaskName, job.Branch, job.PushedSHA,
 		job.LastError, job.CreatedAt, job.UpdatedAt, job.CompletedAt,
 	)
@@ -1060,11 +1060,11 @@ func (s *Store) UpdateRepairJob(ctx context.Context, job *store.RepairJob) error
 	job.UpdatedAt = time.Now()
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE repair_jobs
-		 SET repo = ?, pr_number = ?, intent = ?, source = ?, head_sha = ?, base_sha = ?, phase = ?,
+		 SET repo = ?, pr_number = ?, intent = ?, source = ?, head_sha = ?, base_sha = ?, base_branch = ?, phase = ?,
 		     repair_count_pr = ?, repair_count_head = ?, validation_attempts = ?, review_fix_attempts = ?,
 		     task_name = ?, branch = ?, pushed_sha = ?, last_error = ?, updated_at = ?, completed_at = ?
 		 WHERE monitor_namespace = ? AND id = ?`,
-		job.Repo, job.PRNumber, job.Intent, job.Source, job.HeadSHA, job.BaseSHA, job.Phase,
+		job.Repo, job.PRNumber, job.Intent, job.Source, job.HeadSHA, job.BaseSHA, job.BaseBranch, job.Phase,
 		job.RepairCountPR, job.RepairCountHead, job.ValidationAttempts, job.ReviewFixAttempts,
 		job.TaskName, job.Branch, job.PushedSHA, job.LastError, job.UpdatedAt, job.CompletedAt,
 		job.MonitorNamespace, job.ID,
@@ -1092,14 +1092,14 @@ func (s *Store) GetRepairJob(ctx context.Context, namespace, id string) (*store.
 
 func repairJobSelectSQL() string {
 	return `SELECT id, monitor_namespace, monitor_name, repo, pr_number, intent, source, head_sha,
-	        base_sha, phase, repair_count_pr, repair_count_head, validation_attempts, review_fix_attempts,
+	        base_sha, base_branch, phase, repair_count_pr, repair_count_head, validation_attempts, review_fix_attempts,
 	        task_name, branch, pushed_sha, last_error, created_at, updated_at, completed_at FROM repair_jobs`
 }
 
 func repairJobScanDest(job *store.RepairJob, completedAt *sql.NullTime) []any {
 	return []any{
 		&job.ID, &job.MonitorNamespace, &job.MonitorName, &job.Repo, &job.PRNumber, &job.Intent,
-		&job.Source, &job.HeadSHA, &job.BaseSHA, &job.Phase, &job.RepairCountPR, &job.RepairCountHead,
+		&job.Source, &job.HeadSHA, &job.BaseSHA, &job.BaseBranch, &job.Phase, &job.RepairCountPR, &job.RepairCountHead,
 		&job.ValidationAttempts, &job.ReviewFixAttempts, &job.TaskName, &job.Branch, &job.PushedSHA,
 		&job.LastError, &job.CreatedAt, &job.UpdatedAt, completedAt,
 	}
@@ -1663,13 +1663,13 @@ func (s *Store) CreateGitHubMutationRecord(ctx context.Context, record *store.Gi
 		`INSERT INTO github_mutation_records
 		 (id, monitor_namespace, monitor_name, run_id, command_event_id, work_action_id, monitor_generation,
 		  operation, target_kind, target_number, target_sha, actor, reason, request_digest, github_url,
-		  github_request_id, external_id, status, error, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  github_request_id, external_id, status, error, pending_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.ID, record.MonitorNamespace, record.MonitorName, record.RunID, record.CommandEventID,
 		record.WorkActionID, record.MonitorGeneration, record.Operation, record.TargetKind,
 		record.TargetNumber, record.TargetSHA, record.Actor, record.Reason, record.RequestDigest,
 		record.GitHubURL, record.GitHubRequestID, record.ExternalID, record.Status, record.Error,
-		record.CreatedAt,
+		record.PendingAt, record.CreatedAt,
 	)
 	return err
 }
@@ -1686,11 +1686,13 @@ func (s *Store) UpdateGitHubMutationRecord(ctx context.Context, record *store.Gi
 		`UPDATE github_mutation_records
 		 SET monitor_name = ?, run_id = ?, command_event_id = ?, work_action_id = ?, monitor_generation = ?,
 		     operation = ?, target_kind = ?, target_number = ?, target_sha = ?, actor = ?, reason = ?,
-		     request_digest = ?, github_url = ?, github_request_id = ?, external_id = ?, status = ?, error = ?
+		     request_digest = ?, github_url = ?, github_request_id = ?, external_id = ?, status = ?, error = ?,
+		     pending_at = ?
 		 WHERE monitor_namespace = ? AND id = ?`,
 		record.MonitorName, record.RunID, record.CommandEventID, record.WorkActionID, record.MonitorGeneration,
 		record.Operation, record.TargetKind, record.TargetNumber, record.TargetSHA, record.Actor, record.Reason,
 		record.RequestDigest, record.GitHubURL, record.GitHubRequestID, record.ExternalID, record.Status, record.Error,
+		record.PendingAt,
 		record.MonitorNamespace, record.ID,
 	)
 	if err != nil {
@@ -1705,28 +1707,37 @@ func (s *Store) UpdateGitHubMutationRecord(ctx context.Context, record *store.Gi
 func githubMutationRecordSelectSQL() string {
 	return `SELECT id, monitor_namespace, monitor_name, run_id, command_event_id, work_action_id,
 	        monitor_generation, operation, target_kind, target_number, target_sha, actor, reason,
-	        request_digest, github_url, github_request_id, external_id, status, error, created_at
+	        request_digest, github_url, github_request_id, external_id, status, error, pending_at, created_at
 	        FROM github_mutation_records`
 }
 
-func githubMutationRecordScanDest(record *store.GitHubMutationRecord) []any {
+func githubMutationRecordScanDest(record *store.GitHubMutationRecord, pendingAt *sql.NullTime) []any {
 	return []any{&record.ID, &record.MonitorNamespace, &record.MonitorName, &record.RunID,
 		&record.CommandEventID, &record.WorkActionID, &record.MonitorGeneration, &record.Operation,
 		&record.TargetKind, &record.TargetNumber, &record.TargetSHA, &record.Actor, &record.Reason,
 		&record.RequestDigest, &record.GitHubURL, &record.GitHubRequestID, &record.ExternalID,
-		&record.Status, &record.Error, &record.CreatedAt}
+		&record.Status, &record.Error, pendingAt, &record.CreatedAt}
+}
+
+func applyGitHubMutationRecordPendingAt(record *store.GitHubMutationRecord, pendingAt sql.NullTime) {
+	if pendingAt.Valid {
+		value := pendingAt.Time
+		record.PendingAt = &value
+	}
 }
 
 // GetGitHubMutationRecord fetches one mutation record.
 func (s *Store) GetGitHubMutationRecord(ctx context.Context, namespace, id string) (*store.GitHubMutationRecord, error) {
 	var record store.GitHubMutationRecord
-	err := s.db.QueryRowContext(ctx, githubMutationRecordSelectSQL()+` WHERE monitor_namespace = ? AND id = ?`, namespace, id).Scan(githubMutationRecordScanDest(&record)...)
+	var pendingAt sql.NullTime
+	err := s.db.QueryRowContext(ctx, githubMutationRecordSelectSQL()+` WHERE monitor_namespace = ? AND id = ?`, namespace, id).Scan(githubMutationRecordScanDest(&record, &pendingAt)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	applyGitHubMutationRecordPendingAt(&record, pendingAt)
 	return &record, nil
 }
 
@@ -1771,9 +1782,11 @@ func (s *Store) ListGitHubMutationRecords(ctx context.Context, filter store.GitH
 	var records []store.GitHubMutationRecord
 	for rows.Next() {
 		var record store.GitHubMutationRecord
-		if err := rows.Scan(githubMutationRecordScanDest(&record)...); err != nil {
+		var pendingAt sql.NullTime
+		if err := rows.Scan(githubMutationRecordScanDest(&record, &pendingAt)...); err != nil {
 			return nil, "", err
 		}
+		applyGitHubMutationRecordPendingAt(&record, pendingAt)
 		records = append(records, record)
 	}
 	if err := rows.Err(); err != nil {

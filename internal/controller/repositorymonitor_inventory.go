@@ -108,6 +108,12 @@ func (r *RepositoryMonitorReconciler) processPullRequestInventoryRun(ctx context
 		}
 		return 1, 0, 0, nil
 	}
+	if handled, err := r.reconcileRepositoryMonitorCompletedUpdateBranch(ctx, monitor, run, pullRequests); handled || err != nil {
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		return 1, 0, 0, nil
+	}
 	if reason := repositoryMonitorTargetPullRequestCommandBlockReason(pullRequests, baseBranch, run); reason != "" {
 		return 0, 0, 1, r.blockRepositoryMonitorTargetCommand(ctx, monitor, run, reason)
 	}
@@ -1038,8 +1044,11 @@ func (r *RepositoryMonitorReconciler) listRepositoryMonitorPullRequestsForRun(ct
 				return nil, nil
 			}
 			command, commandErr := r.Store.GetCommandEvent(ctx, run.MonitorNamespace, run.CommandEventID)
-			if commandErr != nil || command.Intent != repositoryMonitorCommandIntentAutomerge {
+			if commandErr != nil {
 				return nil, commandErr
+			}
+			if command.Intent != repositoryMonitorCommandIntentAutomerge && command.Intent != repositoryMonitorCommandIntentUpdateBranch {
+				return nil, nil
 			}
 		}
 		return []repositoryMonitorPullRequest{*pr}, nil
@@ -1133,6 +1142,46 @@ func (r *RepositoryMonitorReconciler) fetchRepositoryMonitorPullRequest(ctx cont
 	}
 	pr := repositoryMonitorPullRequestFromGitHub(response)
 	return &pr, nil
+}
+
+func (r *RepositoryMonitorReconciler) fetchRepositoryMonitorBranchHead(ctx context.Context, owner, repository, token, branch string) (string, error) {
+	baseURL := strings.TrimRight(r.GitHubAPIBaseURL, "/")
+	if baseURL == "" {
+		baseURL = repositoryMonitorDefaultGitHubAPIBaseURL
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/commits/%s", baseURL, url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(strings.TrimSpace(branch)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := repositoryMonitorHTTPClient(r).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("GitHub base branch request failed: %w", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	respBody, err := readRepositoryMonitorGitHubResponse(resp.Body, repositoryMonitorGitHubResponseLimit)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", &repositoryMonitorGitHubAPIError{Operation: "base branch request", StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+	var response struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(respBody, &response); err != nil {
+		return "", fmt.Errorf("failed to parse GitHub base branch response: %w", err)
+	}
+	if strings.TrimSpace(response.SHA) == "" {
+		return "", fmt.Errorf("GitHub base branch response omitted the commit SHA")
+	}
+	return strings.TrimSpace(response.SHA), nil
 }
 
 type repositoryMonitorPullRequestResponse struct {

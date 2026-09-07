@@ -285,6 +285,10 @@ spec:
             - analysisAgentRef
             - repoURL
             type: object
+            x-kubernetes-validations:
+            - message: repoURL is immutable; create a new RepositoryScan for a different
+                repository
+              rule: self.repoURL == oldSelf.repoURL
           status:
             description: RepositoryScanStatus defines the observed state of RepositoryScan.
             properties:

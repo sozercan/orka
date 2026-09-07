@@ -879,6 +879,14 @@ func TestIntegration_MigrateSecurityScanLegacySchema(t *testing.T) {
 		);
 		INSERT INTO security_review_slices (id, namespace, repository_scan, source, title)
 		VALUES ('slice_api', 'ns1', 'repo1', 'legacy', 'Legacy API slice');
+		INSERT INTO security_findings (
+			id, namespace, repository_scan, scan_run_id, fingerprint, title, summary,
+			severity, confidence, validation_status, state, created_at, updated_at
+		) VALUES (
+			'fnd_legacy_dismissed', 'ns1', 'repo1', 'scan_legacy', 'legacy-fingerprint',
+			'Legacy dismissed finding', 'Legacy summary', 'high', 'high', 'validated', 'dismissed',
+			'2026-08-01T00:00:00Z', '2026-08-03T00:00:00Z'
+		);
 	`); err != nil {
 		_ = legacyDB.Close()
 		t.Fatalf("seed legacy schema error = %v", err)
@@ -897,10 +905,17 @@ func TestIntegration_MigrateSecurityScanLegacySchema(t *testing.T) {
 	if _, err := secStore.GetReviewSlice(context.Background(), "ns1", "repo1", "slice_api"); err != nil {
 		t.Fatalf("GetReviewSlice() after migration error = %v", err)
 	}
-	for _, column := range []string{"slice_id", "category", "triage", "reproduction", "minimum_fix_scope"} {
+	for _, column := range []string{"slice_id", "target_key", "category", "triage", "reproduction", "minimum_fix_scope", "duplicate_of", "decision_at"} {
 		if !sqliteTableHasColumn(t, db, "security_findings", column) {
 			t.Fatalf("security_findings missing migrated column %q", column)
 		}
+	}
+	migratedFinding, err := secStore.GetFinding(context.Background(), "ns1", "fnd_legacy_dismissed")
+	if err != nil {
+		t.Fatalf("GetFinding() migrated legacy decision error = %v", err)
+	}
+	if !migratedFinding.DecisionAt.IsZero() {
+		t.Fatalf("migrated decisionAt = %v, want unknown legacy decision time", migratedFinding.DecisionAt)
 	}
 
 	ctx := context.Background()

@@ -1621,19 +1621,27 @@ func workspaceDeltaContentPolicyViolationContext(ctx context.Context, artifact [
 		if int64(len(content)) != header.Size {
 			return "", fmt.Errorf("workspace delta file content is incomplete")
 		}
-		// The violating path is safe to surface: it names the file, never
-		// the content, and lets the operator or agent fix the right file.
+		// Paths are agent-controlled too. Redact and bound them even when
+		// only the binary-file policy is enabled.
 		if fileContent && limits.RejectBinaryFiles && (bytes.IndexByte(content, 0) >= 0 || !utf8.Valid(content)) {
-			return "workspace delta contains binary file content: " + strings.TrimPrefix(header.Name, "files/"), nil
+			return "workspace delta contains binary file content: " + workspaceDeltaDiagnosticPath(header.Name), nil
 		}
 		if limits.RejectSecretLikeContent && security.LooksLikeSecret(string(content)) {
 			changedPath := strings.TrimPrefix(header.Name, "files/")
 			if fileContent && baselineExempts != nil && baselineExempts(changedPath, content) {
 				continue
 			}
-			return "workspace delta contains secret-like file content: " + changedPath, nil
+			return "workspace delta contains secret-like file content: " + workspaceDeltaDiagnosticPath(header.Name), nil
 		}
 	}
+}
+
+func workspaceDeltaDiagnosticPath(name string) string {
+	value := redactedPromptErrorDetail(errors.New(strings.TrimPrefix(name, "files/")))
+	if security.LooksLikeSecret(value) {
+		return "[REDACTED]"
+	}
+	return value
 }
 
 type workspaceDeltaContextReader struct {

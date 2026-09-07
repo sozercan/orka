@@ -188,6 +188,13 @@ type ArtifactStore interface {
 
 // SecurityStore handles repository security scanning persistence.
 type SecurityStore interface {
+	GetScanTaskIngestion(ctx context.Context, task ScanTaskIdentity) (*ScanTaskIngestion, error)
+	// ApplyScanTaskIngestion atomically applies results, updates the current run,
+	// and records the receipt. It skips already ingested Tasks and terminal runs.
+	// The callback must use the supplied store and must not perform external mutations.
+	ApplyScanTaskIngestion(ctx context.Context, ingestion *ScanTaskIngestion, apply func(SecurityStore, *ScanRun) error) (bool, error)
+	CompleteScanTaskIngestion(ctx context.Context, task ScanTaskIdentity) error
+
 	CreateScanRun(ctx context.Context, run *ScanRun) error
 	UpdateScanRun(ctx context.Context, run *ScanRun) error
 	GetScanRun(ctx context.Context, namespace, id string) (*ScanRun, error)
@@ -202,10 +209,13 @@ type SecurityStore interface {
 	SaveThreatModel(ctx context.Context, model *ThreatModel) error
 
 	UpsertFinding(ctx context.Context, finding *Finding) error
+	UpsertObservedFinding(ctx context.Context, finding *Finding) error
 	GetFinding(ctx context.Context, namespace, id string) (*Finding, error)
 	ListFindings(ctx context.Context, filter FindingFilter) ([]Finding, string, error)
 	GetFindingCounts(ctx context.Context, namespace, repositoryScan string) (FindingCounts, error)
 	UpdateFindingState(ctx context.Context, namespace, id, state string) error
+	ResolveFindingIfCurrent(ctx context.Context, namespace, id, scanRunID string, prNumber int) (bool, error)
+	MarkFindingDuplicate(ctx context.Context, namespace, id, canonicalID string) error
 
 	CreatePatchProposal(ctx context.Context, proposal *PatchProposal) error
 	UpdatePatchProposal(ctx context.Context, proposal *PatchProposal) error

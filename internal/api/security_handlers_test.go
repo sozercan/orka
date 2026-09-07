@@ -826,6 +826,33 @@ func TestUpdateRepositoryScan_ContextTokenAuthorizesExistingScanBeforeRequestBod
 	require.Equal(t, "https://github.com/sozercan/other", got.Spec.RepoURL)
 }
 
+func TestUpdateRepositoryScanRejectsRepositoryChange(t *testing.T) {
+	provider := newTestOIDCProvider(t)
+	ctxTokenConfig := testContextTokenConfig(t, provider, "")
+	existing := securityAuthzTestRepositoryScan("scan-1", securityTestRepoURL)
+	app, handlers := setupSecurityHandlersWithAuthzFixture(t, ctxTokenConfig, ContextTokenAuthorizationModeOff, existing)
+
+	bodyBytes, err := json.Marshal(UpdateRepositoryScanRequest{
+		Spec: corev1alpha1.RepositoryScanSpec{
+			RepoURL:          "https://github.com/sozercan/other",
+			Branch:           "main",
+			AnalysisAgentRef: corev1alpha1.AgentReference{Name: "analysis"},
+		},
+	})
+	require.NoError(t, err)
+	token := issueTestContextToken(t, provider, nil, map[string]any{"scope": ContextTokenScopeSecurityWrite})
+	req := httptest.NewRequest(http.MethodPut, "/security/repositories/scan-1?namespace=demo", strings.NewReader(string(bodyBytes)))
+	req.Header.Set(TransactionTokenHeaderName, token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, resp.StatusCode)
+
+	var got corev1alpha1.RepositoryScan
+	require.NoError(t, handlers.client.Get(context.Background(), clientObjectKey("scan-1"), &got))
+	require.Equal(t, securityTestRepoURL, got.Spec.RepoURL)
+}
+
 func TestListRepositoryScans_ContextTokenFiltersMismatchedScansInEnforceMode(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")
@@ -1283,6 +1310,149 @@ func TestSecurityFindingMutations_ContextTokenTransactionContextAuthorizationDen
 	}
 }
 
+func TestSecurityFindingMutationsResolveCanonicalAlias(t *testing.T) {
+	setup := func(t *testing.T, canonicalState, aliasState string) (*fiber.App, *Handlers) {
+		t.Helper()
+
+		scheme := runtime.NewScheme()
+		require.NoError(t, corev1alpha1.AddToScheme(scheme))
+		require.NoError(t, corev1.AddToScheme(scheme))
+		scan := &corev1alpha1.RepositoryScan{
+			ObjectMeta: metav1.ObjectMeta{Name: "scan-1", Namespace: "demo"},
+			Spec: corev1alpha1.RepositoryScanSpec{
+				RepoURL:                      securityTestRepoURL,
+				Branch:                       "main",
+				ReadCredentialRef:            &corev1.LocalObjectReference{Name: "source-read"},
+				PublicationReadCredentialRef: &corev1.LocalObjectReference{Name: "target-read"},
+				PublicationCredentialRef:     &corev1.LocalObjectReference{Name: "target-write"},
+				ForgeCredentialRef:           &corev1.LocalObjectReference{Name: "forge"},
+				AnalysisAgentRef:             corev1alpha1.AgentReference{Name: "analysis"},
+				PatchAgentRef:                &corev1alpha1.AgentReference{Name: "patch"},
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(scan).Build()
+		db, err := sqlite.NewDB(":memory:")
+		require.NoError(t, err)
+		securityStore := sqlite.NewStore(db, ":memory:")
+		handlers := NewHandlers(HandlersConfig{Client: fakeClient, SecurityStore: securityStore})
+
+		ctx := context.Background()
+		require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
+			ID:             "finding-1",
+			Namespace:      "demo",
+			RepositoryScan: "scan-1",
+			ScanRunID:      "scan-run-1",
+			Fingerprint:    "fp-1",
+			Title:          "Command injection",
+			Summary:        "Unsanitized user input reaches shell execution.",
+			Severity:       "critical",
+			Confidence:     "high",
+			State:          canonicalState,
+		}))
+		require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
+			ID:               "finding-alias",
+			Namespace:        "demo",
+			RepositoryScan:   "scan-1",
+			ScanRunID:        "scan-run-2",
+			Fingerprint:      "fp-alias",
+			Title:            "Command injection alias",
+			Summary:          "A duplicate observation of the command injection finding.",
+			Severity:         "critical",
+			Confidence:       "high",
+			State:            aliasState,
+			DuplicateOf:      "finding-1",
+			ValidationStatus: "failed",
+		}))
+
+		app := fiber.New()
+		app.Post("/security/findings/:id/dismiss", handlers.DismissSecurityFinding)
+		app.Post("/security/findings/:id/reopen", handlers.ReopenSecurityFinding)
+		app.Post("/security/findings/:id/validate", handlers.ValidateSecurityFinding)
+		app.Post("/security/findings/:id/patch", handlers.GenerateSecurityPatch)
+		return app, handlers
+	}
+
+	t.Run("dismiss", func(t *testing.T) {
+		app, handlers := setup(t, "open", "open")
+		resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/dismiss?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+		canonical, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Equal(t, "dismissed", canonical.State)
+		alias, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-alias")
+		require.NoError(t, err)
+		require.Equal(t, "open", alias.State)
+	})
+
+	t.Run("reopen", func(t *testing.T) {
+		app, handlers := setup(t, "dismissed", "dismissed")
+		resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/reopen?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+		canonical, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Equal(t, "open", canonical.State)
+		alias, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-alias")
+		require.NoError(t, err)
+		require.Equal(t, "dismissed", alias.State)
+	})
+
+	t.Run("validate", func(t *testing.T) {
+		app, handlers := setup(t, "open", "open")
+		resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/validate?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+		canonical, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Equal(t, "pending", canonical.ValidationStatus)
+		alias, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-alias")
+		require.NoError(t, err)
+		require.Equal(t, "failed", alias.ValidationStatus)
+		var tasks corev1alpha1.TaskList
+		require.NoError(t, handlers.client.List(context.Background(), &tasks, client.InNamespace("demo")))
+		require.Len(t, tasks.Items, 1)
+		require.Equal(t, "finding-1", tasks.Items[0].Labels[labels.LabelSecurityFindingID])
+
+		canonical.ScanRunID = "scan-run-3"
+		require.NoError(t, handlers.securityStore.UpsertFinding(context.Background(), canonical))
+		resp, err = app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/validate?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusAccepted, resp.StatusCode)
+		require.NoError(t, handlers.client.List(context.Background(), &tasks, client.InNamespace("demo")))
+		require.Len(t, tasks.Items, 2)
+		names := map[string]bool{}
+		for i := range tasks.Items {
+			names[tasks.Items[i].Name] = true
+		}
+		require.True(t, names[security.ScanStageTaskName("scan-1", "validation", security.StageValidation, "finding-1-scan-run-1")])
+		require.True(t, names[security.ScanStageTaskName("scan-1", "validation", security.StageValidation, "finding-1-scan-run-3")])
+	})
+
+	t.Run("generate patch", func(t *testing.T) {
+		app, handlers := setup(t, "validated", "open")
+		resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/patch?namespace=demo", nil))
+		require.NoError(t, err)
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+		canonical, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Equal(t, "patch_pending", canonical.State)
+		require.NotEmpty(t, canonical.PatchProposalID)
+		alias, err := handlers.securityStore.GetFinding(context.Background(), "demo", "finding-alias")
+		require.NoError(t, err)
+		require.Equal(t, "open", alias.State)
+		require.Empty(t, alias.PatchProposalID)
+		proposals, err := handlers.securityStore.ListPatchProposals(context.Background(), "demo", "finding-1")
+		require.NoError(t, err)
+		require.Len(t, proposals, 1)
+		require.Equal(t, "finding-1", proposals[0].FindingID)
+	})
+}
+
 func TestCreateSecurityPullRequest_ContextTokenTransactionContextAuthorizationDenied(t *testing.T) {
 	provider := newTestOIDCProvider(t)
 	ctxTokenConfig := testContextTokenConfig(t, provider, "")
@@ -1533,20 +1703,21 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 	prNumber := 99
 	prURL := server.URL + "/pull/99"
 	require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
-		ID:             "finding-1",
-		Namespace:      "demo",
-		RepositoryScan: "scan-1",
-		ScanRunID:      "scan-run-1",
-		Fingerprint:    "fp-1",
-		Title:          "Command injection",
-		Summary:        "Unsanitized user input reaches shell execution.",
-		Severity:       "critical",
-		Confidence:     "high",
-		State:          "pr_open",
-		RootCause:      "Shell command arguments are concatenated directly.",
-		Remediation:    "Use argument arrays and validate inputs.",
-		PRNumber:       &prNumber,
-		PRURL:          prURL,
+		ID:              "finding-1",
+		Namespace:       "demo",
+		RepositoryScan:  "scan-1",
+		ScanRunID:       "scan-run-1",
+		Fingerprint:     "fp-1",
+		Title:           "Command injection",
+		Summary:         "Unsanitized user input reaches shell execution.",
+		Severity:        "critical",
+		Confidence:      "high",
+		State:           "pr_open",
+		RootCause:       "Shell command arguments are concatenated directly.",
+		Remediation:     "Use argument arrays and validate inputs.",
+		PatchProposalID: "patch-1",
+		PRNumber:        &prNumber,
+		PRURL:           prURL,
 	}))
 	require.NoError(t, securityStore.CreatePatchProposal(ctx, &store.PatchProposal{
 		ID:             "patch-1",
@@ -1558,6 +1729,21 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 		Status:         "pr_opened",
 		PRNumber:       &prNumber,
 		PRURL:          prURL,
+	}))
+	require.NoError(t, securityStore.UpsertFinding(ctx, &store.Finding{
+		ID:               "finding-alias",
+		Namespace:        "demo",
+		RepositoryScan:   "scan-1",
+		ScanRunID:        "scan-run-2",
+		Fingerprint:      "fp-alias",
+		Title:            "Command injection alias",
+		Summary:          "A duplicate observation of the command injection finding.",
+		Severity:         "critical",
+		Confidence:       "high",
+		State:            "open",
+		DuplicateOf:      "finding-1",
+		PatchProposalID:  "",
+		ValidationStatus: "validated",
 	}))
 
 	app := fiber.New()
@@ -1578,6 +1764,20 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 	require.Equal(t, "Open", body.Status)
 	require.False(t, githubCalled)
 
+	aliasReq := httptest.NewRequest(http.MethodPost, "/security/findings/finding-alias/pull-request?namespace=demo", nil)
+	aliasResp, err := app.Test(aliasReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, aliasResp.StatusCode)
+	var aliasBody struct {
+		PRNumber int    `json:"prNumber"`
+		PRURL    string `json:"prURL"`
+		Status   string `json:"status"`
+	}
+	require.NoError(t, json.NewDecoder(aliasResp.Body).Decode(&aliasBody))
+	require.Equal(t, prNumber, aliasBody.PRNumber)
+	require.Equal(t, prURL, aliasBody.PRURL)
+	require.Equal(t, "Open", aliasBody.Status)
+
 	proposals, err := securityStore.ListPatchProposals(ctx, "demo", "finding-1")
 	require.NoError(t, err)
 	require.Len(t, proposals, 1)
@@ -1588,8 +1788,29 @@ func TestCreateSecurityPullRequestReturnsGovernedReceiptWithoutGitHubMutation(t 
 	finding, err := securityStore.GetFinding(ctx, "demo", "finding-1")
 	require.NoError(t, err)
 	require.Equal(t, "pr_open", finding.State)
+	require.Equal(t, "patch-1", finding.PatchProposalID)
 	require.Equal(t, prURL, finding.PRURL)
 	require.Equal(t, prNumber, *finding.PRNumber)
+
+	require.NoError(t, securityStore.UpdateFindingState(ctx, "demo", finding.ID, "resolved"))
+	reobserved, err := securityStore.GetFinding(ctx, "demo", finding.ID)
+	require.NoError(t, err)
+	reobserved.State = "open"
+	reobserved.PatchProposalID = ""
+	reobserved.PRNumber = nil
+	reobserved.PRURL = ""
+	require.NoError(t, securityStore.UpsertObservedFinding(ctx, reobserved))
+
+	staleReq := httptest.NewRequest(http.MethodPost, "/security/findings/finding-1/pull-request?namespace=demo", nil)
+	staleResp, err := app.Test(staleReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, staleResp.StatusCode)
+	reopened, err := securityStore.GetFinding(ctx, "demo", finding.ID)
+	require.NoError(t, err)
+	require.Equal(t, "open", reopened.State)
+	require.Empty(t, reopened.PatchProposalID)
+	require.Nil(t, reopened.PRNumber)
+	require.Empty(t, reopened.PRURL)
 }
 
 func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
@@ -1629,6 +1850,7 @@ func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
 	finding := &store.Finding{
 		ID:         "fnd_123",
 		Namespace:  "demo",
+		ScanRunID:  "scan-run-123",
 		Title:      "Command injection",
 		Severity:   "high",
 		Confidence: "high",
@@ -1645,6 +1867,7 @@ func TestCreateSecurityPatchTaskRequestsGovernedPublication(t *testing.T) {
 	require.Len(t, tasks.Items, 1)
 	task := tasks.Items[0]
 	require.Equal(t, proposal.TaskName, task.Name)
+	require.Equal(t, finding.ScanRunID, task.Labels[labels.LabelSecurityScanID])
 	require.Equal(t, corev1alpha1.TaskTypeAgent, task.Spec.Type)
 	require.Equal(t, "patch", task.Spec.AgentRef.Name)
 	require.Empty(t, task.Spec.Env)

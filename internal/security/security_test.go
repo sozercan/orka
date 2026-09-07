@@ -494,7 +494,8 @@ func TestGeneratedSecurityTaskNamesStayLabelSafe(t *testing.T) {
 		ScanStageTaskName(scanName, "initial", "discovery", "ci-cd-supply-chain"),
 		ScanStageTaskName(scanName, "initial", "discovery", "ci-cd-supply-chain-4"),
 		ScanStageRetryTaskName(scanName, "scan_1234567890abcdef", StageReview, "ci-cd-supply-chain", 1),
-		PatchTaskName(scanName, "fnd_1234567890abcdef"),
+		AutoValidationTaskName(scanName, "fnd_1234567890abcdef", "scan_1234567890abcdef"),
+		PatchTaskName(scanName, "fnd_1234567890abcdef", "scan_1234567890abcdef"),
 	}
 
 	for _, name := range names {
@@ -504,6 +505,18 @@ func TestGeneratedSecurityTaskNamesStayLabelSafe(t *testing.T) {
 		if strings.Contains(name, "--") {
 			t.Fatalf("generated task name %q should not contain duplicate separators", name)
 		}
+	}
+}
+
+func TestPatchTaskNameSeparatesFindingOccurrences(t *testing.T) {
+	first := PatchTaskName("demo-security-repository", "fnd_1234567890abcdef", "scan_first")
+	second := PatchTaskName("demo-security-repository", "fnd_1234567890abcdef", "scan_second")
+
+	if first == second {
+		t.Fatalf("PatchTaskName() reused %q across finding occurrences", first)
+	}
+	if PatchProposalID(first) == PatchProposalID(second) {
+		t.Fatal("PatchProposalID() reused an ID across finding occurrences")
 	}
 }
 
@@ -558,6 +571,8 @@ var looksLikeSecretNegatives = []string{
 	"Authorization: Bearer {{ .Token }}",
 	"password=changeme",
 	"api_key=${OPENAI_API_KEY}",
+	"AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}",
+	"secretAccessKey = config.Credentials.SecretAccessKey",
 	"The token is validated by the proxy; set TOKEN=xxxx in .env",
 	"Txn-Token: <transaction token>",
 	"runtime.apiKey = strings.TrimSpace(cfg.APIKey)",
@@ -659,6 +674,12 @@ var looksLikeSecretPositives = []string{
 	"api_key: |\n    " + strings.Repeat("0a1b2c3d", 3),
 	"password: |2-\n  correct-horse-battery-staple",
 	"SECRET=correct-horse-battery-staple",
+	"AWS_SECRET_ACCESS_KEY=" + strings.Repeat("0a1b2c3d", 5),
+	"DATABASE_SECRET=" + strings.Repeat("0a1b2c3d", 3),
+	"DATABASE_CREDENTIAL=" + strings.Repeat("0a1b2c3d", 3),
+	"secretAccessKey: " + strings.Repeat("0a1b2c3d", 5),
+	"secret_key: |\n  " + strings.Repeat("0a1b2c3d", 5),
+	"AWS_SECRET_ACCESS_KEY:\n  " + strings.Repeat("0a1b2c3d", 5),
 	"credential: correct-horse-battery-staple-value",
 	// Dotted values in credential-keyed config scalars are attacker-
 	// controllable literal shapes; only '=' code assignments are exempt.
